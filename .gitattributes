@@ -1,0 +1,3 @@
+# patches/rexglue.patch must stay byte-for-byte as generated (LF line endings),
+# or git apply cannot match ReXGlue's LF sources: never convert line endings.
+*.patch -text

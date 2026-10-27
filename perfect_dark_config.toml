@@ -1,0 +1,255 @@
+# Perfect Dark XBLA PC Recomp: the port's changes to the game's code, as codegen hooks.
+#
+# The recompiled code in generated/ is made from the player's own default.xex and is
+# never committed, so every change to the game's behaviour is a hook here: ReXGlue's
+# codegen inserts a call at the given guest address, and the function lives in
+# src/perfect_dark_hooks.cpp. A hook runs before the instruction at `address`
+# (after it with after_instruction = true); the registers listed are passed by
+# reference; `return`, `return_on_true` and `jump_address(_on_true)` end the guest
+# function or branch after the call. HANDOVER.md has the history of each change.
+
+# ---- Start-up -----------------------------------------------------------------------
+
+# No Xbox LIVE Arcade logo while the game loads (pd_skip_arcade_logo): its three draws
+# (sub_82332DF0) are skipped; the loading loop around them is untouched.
+[[midasm_hook]]
+address = 0x822512DC
+name = "PdHookSkipArcadeLogo"
+jump_address_on_true = 0x822512E0
+
+[[midasm_hook]]
+address = 0x822515B0
+name = "PdHookSkipArcadeLogo"
+jump_address_on_true = 0x822515B4
+
+[[midasm_hook]]
+address = 0x82251670
+name = "PdHookSkipArcadeLogo"
+jump_address_on_true = 0x82251674
+
+# Product Identification screen length (pd_legal_screen_ticks): titleTickLegal's
+# `cmpwi cr6,r11,180` compares with the setting instead.
+[[midasm_hook]]
+address = 0x8224A444
+name = "PdHookLegalScreenCompare"
+registers = ["r11", "cr6", "xer"]
+after_instruction = true
+
+# ---- Game clock and CPU use ---------------------------------------------------------
+
+# osGetCount (sub_8224FB60), once a frame: the stutter log's game steps, and the
+# smoothed frame step (pd_smooth_game_clock) that keeps the clock from running fast.
+[[midasm_hook]]
+address = 0x8224FC18
+name = "PdHookOsGetCount"
+registers = ["r9", "r10", "r11"]
+after_instruction = true
+jump_address_on_true = 0x8224FC44
+
+# The game's timer at the real guest tick rate (pd_exact_timer): seconds,
+# milliseconds and microseconds (sub_822B7700 / 7750 / 7790).
+[[midasm_hook]]
+address = 0x822B7724
+name = "PdHookTimerR3FromR9"
+registers = ["r3", "r9"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822B7778
+name = "PdHookTimerR7FromR9"
+registers = ["r7", "r9"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822B77B4
+name = "PdHookTimerR3FromR10"
+registers = ["r3", "r10"]
+after_instruction = true
+
+# GPU-completion poll (sub_82329E08): yield, then sleep 0.5 ms while still waiting
+# (pd_sleep_in_waits).
+[[midasm_hook]]
+address = 0x82329EB4
+name = "PdHookGpuWaitBackoff"
+after_instruction = true
+
+# Sleep(0) in the 10 ms timer thread and its worker (sub_8226D308, sub_8226D520):
+# a 0.5 ms sleep instead (pd_sleep_in_waits).
+[[midasm_hook]]
+address = 0x8226D368
+name = "PdHookIdleSleep"
+registers = ["r3"]
+jump_address_on_true = 0x8226D36C
+
+[[midasm_hook]]
+address = 0x8226D588
+name = "PdHookIdleSleep"
+registers = ["r3"]
+jump_address_on_true = 0x8226D58C
+
+# ---- Controls -----------------------------------------------------------------------
+
+# Auto-Aim off in new and restored control settings (PC aims with the mouse).
+[[midasm_hook]]
+address = 0x8225FCBC
+name = "PdHookAutoAimOffR9"
+registers = ["r9", "r11"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8225FD2C
+name = "PdHookAutoAimOffR4"
+registers = ["r4"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822605EC
+name = "PdHookAutoAimOffProfile"
+registers = ["r11", "r29"]
+after_instruction = true
+
+# No storage device on PC: X does not open the selector, and the "Change storage
+# device" legend never shows.
+[[midasm_hook]]
+address = 0x82282990
+name = "PdHookNoStorageSelector"
+registers = ["r3"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82282A60
+name = "PdHookNoStorageLegend"
+jump_address = 0x82282A70
+
+# ---- Menus --------------------------------------------------------------------------
+
+# The dialog tick (sub_821C7198): tell the PC menu code which rows it would skip.
+[[midasm_hook]]
+address = 0x821C7198
+name = "PdHookMenuSkipScan"
+registers = ["r3"]
+
+# Setup extras: every multiplayer feature (sub_8219C168) and every cheat
+# (sub_8219D1E0) counts as unlocked while ticked.
+[[midasm_hook]]
+address = 0x8219C168
+name = "PdHookAllMultiplayer"
+registers = ["r3"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x8219D1E0
+name = "PdHookAllCheats"
+registers = ["r3"]
+return_on_true = true
+
+# ---- Graphics -----------------------------------------------------------------------
+
+# Dark rooms: the room brightness floor (lights_set_for_room, sub_821519C8) and the
+# objects' shade alpha (FogCol.a written by sub_822653B8).
+[[midasm_hook]]
+address = 0x821519EC
+name = "PdHookRoomBrightness"
+registers = ["r3"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822672C4
+name = "PdHookShadeAlpha"
+registers = ["r9", "f9", "f10", "f11", "f12"]
+after_instruction = true
+
+# ---- Multiplayer --------------------------------------------------------------------
+
+# LIVE name verification of the lobby's names (sub_8226CCB0): reported as checked and
+# fine, never sent (the request leaked memory every frame and crashed hosted lobbies).
+[[midasm_hook]]
+address = 0x8226CCB0
+name = "PdHookNameVerification"
+registers = ["r3"]
+return = true
+
+# Player update rate and its floor (pd_mp_update_rate, pd_mp_rate_floor).
+[[midasm_hook]]
+address = 0x82284938
+name = "PdHookUpdateRateMinR4"
+registers = ["r4"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8228493C
+name = "PdHookUpdateRateR5"
+registers = ["r5"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822CBE48
+name = "PdHookUpdateRateMinR8"
+registers = ["r8"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822CBE50
+name = "PdHookUpdateRateR7"
+registers = ["r7"]
+after_instruction = true
+
+# How far behind their newest update other players' facing is drawn
+# (pd_mp_facing_delay_ms; the game's `addi r6,r10,-200`).
+[[midasm_hook]]
+address = 0x822BA8B0
+name = "PdHookFacingDelay"
+registers = ["r6", "r10"]
+after_instruction = true
+
+# Mouse look in network matches: the local input sent, the look received.
+[[midasm_hook]]
+address = 0x8225E790
+name = "PdHookNetLocalInput"
+registers = ["r4"]
+
+[[midasm_hook]]
+address = 0x8225E7DC
+name = "PdHookNetLookReceive"
+registers = ["r3", "r4"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8225E864
+name = "PdHookNetLookReceive"
+registers = ["r3", "r4"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8225EA8C
+name = "PdHookNetLookReceive"
+registers = ["r3", "r4"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82294F78
+name = "PdHookNetLookSend"
+registers = ["r4", "r5"]
+
+[[midasm_hook]]
+address = 0x82187984
+name = "PdHookNetLookApply"
+registers = ["r4"]
+after_instruction = true
+
+# Multiplayer music follows the host (pd_mp_music_sync): sub_82242648's three
+# tail calls to mpChooseTrack go through PdMpChooseTrack.
+[[midasm_hook]]
+address = 0x8224265C
+name = "PdHookChooseTrack"
+return = true
+
+[[midasm_hook]]
+address = 0x822426A0
+name = "PdHookChooseTrack"
+return = true
+
+[[midasm_hook]]
+address = 0x822426B8
+name = "PdHookChooseTrack"
+return = true

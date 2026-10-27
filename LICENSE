@@ -1,0 +1,61 @@
+Perfect Dark XBLA PC Recomp
+===========================
+
+Scope
+-----
+
+This project's own code is released under The Unlicense, below: src/,
+tools/ (except as noted below), packaging/ (except as noted below), cmake/,
+the build files, perfect_dark_config.toml, and this project's changes to
+ReXGlue in patches/rexglue.patch (the ReXGlue code it modifies stays under
+ReXGlue's licence).
+
+It does NOT cover, and grants no rights in:
+
+  - Perfect Dark, its game program (default.xex), game data and assets, and
+    the Perfect Dark, Rare, Xbox and Xbox 360 names and marks, which belong
+    to their respective rights holders. None of these are included in this
+    repository; players supply their own copy of the game.
+  - Code that the ReXGlue code generator produces in generated/ from a
+    player's own default.xex (a translation of the original game program).
+    It is not part of this repository.
+  - ReXGlue (the rexglue-sdk submodule) and the ReXGlue code that
+    patches/rexglue.patch modifies, which remain under ReXGlue's own
+    BSD-3-Clause licence (rexglue-sdk/LICENSE). ReXGlue includes code derived
+    from Xenia (BSD-3-Clause).
+  - Third-party libraries used by ReXGlue, which remain under their own
+    licences (see packaging/licenses/THIRD_PARTY_NOTICES.txt).
+  - packaging/launcher/stfs.cpp and tools/Extract-STFS.ps1, which are
+    derived from Velocity and licensed under the GNU General Public License
+    version 3 (packaging/licenses/LICENSE-Extract-STFS.txt). The launcher
+    built from packaging/launcher includes stfs.cpp, so the compiled
+    launcher is distributed under the GPL version 3. The other launcher
+    source files are released under The Unlicense below.
+
+The Unlicense
+-------------
+
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <https://unlicense.org>

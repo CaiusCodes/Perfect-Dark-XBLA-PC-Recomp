@@ -1,0 +1,50 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "windows-base",
+            "hidden": true,
+            "description": "Clang and Ninja; ReXGlue built from the rexglue-sdk submodule (upstream v0.9.0 plus patches/rexglue.patch) with Vulkan as well as D3D12, for the x86-64-v3 CPU level (AVX2, 2013 and later).",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_C_FLAGS": "-march=x86-64-v3",
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v3",
+                "REXSDK_DIR": "${sourceDir}/rexglue-sdk",
+                "REXGLUE_USE_VULKAN": "ON",
+                "REXGLUE_ENABLE_TRACY": "OFF"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "win-amd64-debug",
+            "displayName": "Windows AMD64 Debug",
+            "inherits": "windows-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "win-amd64-release",
+            "displayName": "Windows AMD64 Release",
+            "inherits": "windows-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "win-amd64-relwithdebinfo",
+            "displayName": "Windows AMD64 RelWithDebInfo",
+            "inherits": "windows-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+        }
+    ],
+    "buildPresets": [
+        { "name": "win-amd64-debug", "configurePreset": "win-amd64-debug" },
+        { "name": "win-amd64-release", "configurePreset": "win-amd64-release" },
+        { "name": "win-amd64-relwithdebinfo", "configurePreset": "win-amd64-relwithdebinfo" }
+    ]
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Perfect Dark",
+  "project": "Perfect Dark XBLA PC Recomp",
+  "system": "Xbox 360",
+  "type": "recomp",
+  "status": "released",
+  "targets": ["Windows"],
+  "toolchain": "ReXGlue",
+  "original": {
+    "serial": "584109C2"
+  },
+  "notes": "Native Windows PC port of the Perfect Dark XBLA remaster. Supports up to 4K, keyboard and mouse, Xbox controllers, and LAN and Direct Connect multiplayer for up to 8 players. Requires your own game package."
+}

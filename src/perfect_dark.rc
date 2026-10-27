@@ -1,0 +1,34 @@
+// Gives perfect_dark.exe its icon: the one Windows shows for the program, in
+// the taskbar, and in the game window's own title bar. Icon 1 is the icon a
+// Win32 window takes by default, so no code has to set it. The version comes
+// from VERSION (pd_version_generated.h, written by CMakeLists.txt).
+#include "pd_version_generated.h"
+
+#define IDI_APP_ICON 1
+IDI_APP_ICON ICON "perfect_dark.ico"
+
+1 VERSIONINFO
+ FILEVERSION PD_VERSION_COMMA
+ PRODUCTVERSION PD_VERSION_COMMA
+ FILEOS 0x40004
+ FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Perfect Dark XBLA PC Recomp project"
+      VALUE "FileDescription", "Perfect Dark"
+      VALUE "ProductName", "Perfect Dark XBLA PC Recomp"
+      VALUE "ProductVersion", PD_VERSION
+      VALUE "FileVersion", PD_VERSION
+      VALUE "InternalName", "perfect_dark"
+      VALUE "OriginalFilename", "Perfect Dark.exe"
+      VALUE "LegalCopyright", "The Unlicense (see the licenses folder)"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

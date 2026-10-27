@@ -1,0 +1,74 @@
+THIRD-PARTY NOTICES
+===================
+
+Perfect Dark XBLA PC Recomp uses and distributes components from the following
+projects. Complete license texts are in this folder.
+
+This port
+---------
+Perfect Dark XBLA PC Recomp's own code is released under The Unlicense
+(public domain); see LICENSE in the project repository
+(https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp). That does not
+cover the components below, the game itself, or the code ReXGlue generates
+from the player's own copy of the game.
+
+Runtime and tools
+-----------------
+ReXGlue (recompilation runtime)      BSD 3-Clause, includes Xenia-derived code
+  Files: resources\runtime\Perfect Dark.exe, resources\runtime\rexruntime.dll,
+         resources\runtime\rexgpu-xenos.dll
+  This port's changes to ReXGlue (patches/rexglue.patch in the repository)
+  modify ReXGlue code, which stays under ReXGlue's licence.
+                                     LICENSE-ReXGlue.txt
+STFS package reader                  GNU GPL version 3   LICENSE-Extract-STFS.txt
+  Compiled into the launcher, Perfect Dark.exe in the release root, which is
+  therefore distributed under the GNU GPL version 3. Derived from Velocity
+  (https://github.com/hetelek/Velocity). Its complete source is in the
+  project repository (packaging/launcher). The game in resources\runtime is
+  a separate program and is not covered by the GPL.
+
+Libraries compiled into rexruntime.dll / rexgpu-xenos.dll
+---------------------------------------------------------
+SDL 3                                zlib      LICENSE-SDL3.txt
+Dear ImGui                           MIT       LICENSE-DearImGui.txt
+spdlog                               MIT       LICENSE-spdlog.txt
+{fmt}                                MIT       LICENSE-fmt.txt
+toml++                               MIT       LICENSE-tomlplusplus.txt
+o1heap                               MIT       LICENSE-o1heap.txt
+stb_image                            MIT / public domain   LICENSE-stb.txt
+Snappy                               BSD 3-Clause          LICENSE-snappy.txt
+xxHash                               BSD 2-Clause          LICENSE-xxHash.txt
+utfcpp                               Boost Software License 1.0  LICENSE-utfcpp.txt
+PicoSHA2                             MIT       LICENSE-picosha2.txt
+AES-128                              see       LICENSE-aes_128.txt
+RenderDoc in-application API header  MIT       LICENSE-renderdoc-app.txt
+SIMDe                                MIT       LICENSE-simde.txt
+glslang                              BSD 3-Clause and others  LICENSE-glslang.txt
+SPIRV-Tools                          Apache 2.0  LICENSE-SPIRV-Tools-Apache-2.0.txt
+SPIRV-Headers                        MIT-style   LICENSE-SPIRV-Headers.txt
+Vulkan-Headers                       Apache 2.0 / MIT      LICENSE-Vulkan-Headers.txt
+Vulkan Memory Allocator              MIT       LICENSE-VulkanMemoryAllocator.txt
+volk                                 MIT       LICENSE-volk.txt
+AMD FidelityFX CAS and FSR 1         MIT       LICENSE-AMD-FidelityFX-CAS-FSR1.txt
+disruptorplus (Lewis Baker)          MIT (upstream: github.com/lewissbaker/disruptorplus)
+tiny-AES-c                           The Unlicense (public domain)
+FFmpeg (audio decoding)              LGPL 2.1 or later     LICENSE-FFmpeg-LGPL-2.1.txt
+libmspack                            LGPL 2.1              LICENSE-libmspack-LGPL-2.1.txt
+
+FFmpeg and libmspack are used under the GNU Lesser General Public License.
+FFmpeg is built without its optional GPL components. Their complete source
+code is available from the upstream projects (ffmpeg.org and
+cabextract.org.uk/libmspack) and is included in the ReXGlue SDK sources used
+for this build.
+
+Microsoft Visual C++ runtime
+----------------------------
+msvcp140.dll, msvcp140_atomic_wait.dll, vcruntime140.dll and vcruntime140_1.dll
+are Microsoft Visual C++ Redistributable files, distributed under the
+Microsoft Visual Studio license terms for redistributable code.
+
+Game content
+------------
+Perfect Dark, Rare, Xbox, Xbox 360, and related names and assets belong to
+their respective rights holders. Original Perfect Dark game data is not
+included with this release; it is installed from the player's own package.

@@ -1,0 +1,47 @@
+# Perfect Dark PC settings. Setup only writes this file when it is missing,
+# so your changes survive reinstalling. Edit it while the game is closed.
+fullscreen = false
+vsync = true
+license_mask = 1
+pd_settings_revision = 1
+gpu_plugin = "xenos"
+gpu_allow_invalid_fetch_constants = true
+# Shine on reflective surfaces (suit, guns, signs, ships). 1.0 = original look.
+pd_shine = 1.150000
+# How much of a room stays visible with its lights off. 0 = fully black.
+pd_dark_room_visibility = 0.370000
+# The same for objects, characters and your gun in that room, kept lower so
+# they sit in the dark rather than standing out of it.
+pd_dark_room_object_visibility = 0.030000
+# Mouse in menus: point to highlight, left button selects, right goes back.
+pd_menu_mouse = true
+mnk_mode = true
+mnk_direct_look = true
+mnk_sensitivity = 1.500000
+mnk_invert_y = false
+keybind_lstick_up = "W"
+keybind_lstick_down = "S"
+keybind_lstick_left = "A"
+keybind_lstick_right = "D"
+keybind_right_trigger = "LMB"
+keybind_left_trigger = "RMB"
+keybind_rstick_press = "MMB"
+keybind_x = "R"
+keybind_a = "E"
+keybind_y = "WheelUp"
+keybind_b = "WheelDown"
+keybind_left_shoulder = "Q"
+keybind_right_shoulder = "F"
+keybind_lstick_press = "Control"
+keybind_back = "Tab"
+keybind_start = "Escape"
+# Bug reports: true writes a detailed log (frame timing, network statistics)
+# to resources\runtime\logs. Set it back to false afterwards.
+diagnostics = false
+# Online play: Xbox LIVE Private Match over your network or Radmin VPN.
+net_private_match = false
+# Extras (Setup > Change extras). Story completion is written into your save
+# and stays there after it is switched off.
+pd_unlock_all_cheats = false
+pd_story_complete = false
+pd_unlock_all_multiplayer = false

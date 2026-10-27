@@ -1,0 +1,53 @@
+# --- Original game: never committed ---------------------------------------
+# The player's own extracted Perfect Dark package (default.xex and its data)
+# goes in game/ for code generation and local runs. Never committed.
+/game/
+/assets/
+*.xex
+# Xbox 360 package files (named by their 40-character content hash) and dumps.
+/[0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]*
+*.bin
+
+# Code translated from default.xex by the ReXGlue code generator. Derived
+# from the game's program, so never committed; only the SDK boilerplate
+# generated/rexglue.cmake is tracked.
+/generated/*
+!/generated/rexglue.cmake
+
+# --- Build output and release archives ------------------------------------
+# Every out/ folder, including the SDK's own (rexglue-sdk/out/).
+out/
+/build/
+/build-*/
+/cmake-build-*/
+*.zip
+*.7z
+*.pdb
+*.exe
+*.ilk
+*.exp
+*.lib
+*.obj
+*.o
+
+# --- Runtime data from running a build in place ---------------------------
+perfect_dark.toml
+!/packaging/perfect_dark.toml
+/userdata/
+/logs/
+*.log
+*.dmp
+
+# --- IDE, tooling and OS files ---------------------------------------------
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+CMakeUserPresets.json
+compile_commands.json
+Thumbs.db
+desktop.ini
+.DS_Store
