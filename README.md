@@ -20,8 +20,6 @@ tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 
 ![A rooftop above the city at night](docs/screenshots/gameplay-rooftop.webp)
 
-![Perfect Dark](docs/screenshots/title-logo.png)
-
 ## Requirements
 
 - Windows 10 or 11, 64-bit
@@ -66,7 +64,7 @@ needs no administrator rights, and neither it nor the game contacts Xbox Live.
   and **Upscaling**: Off, Sharpen (AMD CAS) or FSR (AMD FSR 1)
 - **Steady 60 FPS** (the game's own rate) with tear-free V-Sync, Direct3D 12 on
   NVIDIA and Vulkan on AMD and Intel graphics cards, picked automatically
-
+![Video Settings](docs/screenshots/Video-settings.png)
 - **Keyboard and mouse**: raw mouse look, rebindable keys (all five mouse
   buttons and the wheel), a radial weapon menu, and the mouse in every menu
 - **Xbox controller** support, working alongside keyboard and mouse; button
