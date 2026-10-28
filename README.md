@@ -13,9 +13,7 @@ multiplayer for up to 8 players.
 > game data from it into the game's folder on your PC.
 
 Like the recomp and want to support future projects? You can
-tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
-
-[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
+tip me on [Ko-fi](https://ko-fi.com/caiuscodes). [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
 
 ![A rooftop above the city at night](docs/screenshots/gameplay-rooftop.webp)
 
@@ -139,19 +137,19 @@ controller works as on the console.
 ## Reporting a problem
 
 Every run writes a log to `resources\runtime\logs` (the 20 newest are kept).
-**When reporting a problem please attach your latest `resources\runtime\logs`.**
+**When reporting an issue please attach your latest `resources\runtime\logs`.**
 It starts with your Windows version, processor, graphics card, driver, screen and main
 settings; it holds no saves or passwords. If the game crashed, the log ends with
 a `[crash]` line and a `crash-<date>-<time>.dmp` is written beside it: attach
 that too.
 
-For stutter, slowdowns, multiplayer lag or anything that comes and goes, a
-detailed log helps most:
+For anything more detailed, stutter, slowdowns, multiplayer lag or anything that
+comes and goes, a more detailed log helps most:
 
 1. Close the game and open `resources\userdata\perfect_dark.toml` in Notepad.
 2. Set `diagnostics = true` (add the line if it is not there) and save.
-3. Play until the problem has happened a few times, then close the game.
-4. Attach the newest log from `resources\runtime\logs`.
+3. Play until the problem has happened a few times then close the game.
+4. Open an Issue and attach the newest log from `resources\runtime\logs`.
 5. Set it back to `false` afterwards.
 
 ## For Developers
