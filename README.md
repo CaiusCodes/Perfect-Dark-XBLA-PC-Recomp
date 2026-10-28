@@ -62,11 +62,6 @@ needs no administrator rights and neither it nor the game contacts Xbox Live.
 - **Keyboard and mouse**: raw mouse look with rebindable keys and the mouse support in every menu
 - **Xbox controller** support working alongside keyboard and mouse; button
   prompts hide themselves when no controller is connected
-- **LAN and Direct Connect multiplayer** for up to 8 players with 2 player co-op over virtual
-  LAN services such as Radmin VPN, ZeroTier, Tailscale and Hamachi
-  ![Combat Simulator lobby](docs/screenshots/combat-simulator-lobby-host.webp)
-  ![Four players in a Combat Simulator match](docs/screenshots/combat-simulator-match.webp)
-- **Local split-screen** for up to 4 players on one PC
 - **Settings menus** in Help & Options: Keyboard & Mouse, Gamepad Controls,
   Graphics, Display Interface, Audio and Online
 - **Leaderboards and achievements** kept on your PC
@@ -74,7 +69,10 @@ needs no administrator rights and neither it nor the game contacts Xbox Live.
   (every mission on every difficulty) and **all multiplayer content unlocked**
 - **Portable**: one program to open, no installer; saves and settings stay in
   the game folder
-
+- **LAN and Direct Connect multiplayer** for up to 8 players with 2 player co-op over virtual
+  LAN services such as Radmin VPN, ZeroTier, Tailscale and Hamachi
+  ![Combat Simulator lobby](docs/screenshots/combat-simulator-lobby-host.webp)
+  ![Four players in a Combat Simulator match](docs/screenshots/combat-simulator-match.webp)
 | Mode | Players |
 |---|---|
 | Local split-screen on one PC | up to 4 |
