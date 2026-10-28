@@ -138,12 +138,9 @@ controller works as on the console.
 
 ## Reporting a problem
 
-Every run writes a log to `resources\runtime\logs` (the 20 newest are kept).
 **When reporting an issue please attach your latest `resources\runtime\logs`.**
-It starts with your Windows version, processor, graphics card, driver, screen and main
-settings; it holds no saves or passwords. If the game crashed, the log ends with
-a `[crash]` line and a `crash-<date>-<time>.dmp` is written beside it: attach
-that too.
+If the game crashed, the log ends with a `[crash]` line and 
+a `crash-<date>-<time>.dmp` is written beside it: attach that too.
 
 For anything more detailed, stutter, slowdowns, multiplayer lag or anything that
 comes and goes, a more detailed log helps most:
