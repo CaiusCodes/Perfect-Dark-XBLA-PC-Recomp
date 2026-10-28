@@ -1,5 +1,7 @@
 # Perfect Dark XBLA PC Recomp
 
+![Perfect Dark](docs/screenshots/title-logo.png)
+
 A native Windows PC version of **Perfect Dark**, from the 2010 Xbox 360 Xbox Live
 Arcade remaster by Rare and 4J Studios, created through static recompilation with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs the whole game, the
@@ -64,6 +66,7 @@ needs no administrator rights, and neither it nor the game contacts Xbox Live.
   and **Upscaling**: Off, Sharpen (AMD CAS) or FSR (AMD FSR 1)
 - **Steady 60 FPS** (the game's own rate) with tear-free V-Sync, Direct3D 12 on
   NVIDIA and Vulkan on AMD and Intel graphics cards, picked automatically
+  ![A rooftop above the city at night](docs/screenshots/gameplay-rooftop.webp)
 - **Keyboard and mouse**: raw mouse look, rebindable keys (all five mouse
   buttons and the wheel), a radial weapon menu, and the mouse in every menu
 - **Xbox controller** support, working alongside keyboard and mouse; button
