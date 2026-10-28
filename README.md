@@ -69,17 +69,10 @@ needs no administrator rights and neither it nor the game contacts Xbox Live.
   (every mission on every difficulty) and **all multiplayer content unlocked**
 - **Portable**: one program to open, no installer; saves and settings stay in
   the game folder
-- **LAN and Direct Connect multiplayer** for up to 8 players with 2 player co-op over virtual
-  LAN services such as Radmin VPN, ZeroTier, Tailscale and Hamachi
+- **LAN and Virtual LAN multiplayer** for up to 8 players (12 with Simulants) 2 player Co-Operative
+  and Counter-Operative over services such as Radmin VPN, ZeroTier, Tailscale and Hamachi
   ![Combat Simulator lobby](docs/screenshots/combat-simulator-lobby-host.webp)
   ![Four players in a Combat Simulator match](docs/screenshots/combat-simulator-match.webp)
-
-| Mode | Players |
-|---|---|
-| Local split-screen on one PC | up to 4 |
-| LAN / Direct Connect | up to 8 |
-| Combat Simulator | up to 12 in a match, players and Simulants |
-| Co-Operative / Counter-Operative | 2 |
 
 ### Controls
 
