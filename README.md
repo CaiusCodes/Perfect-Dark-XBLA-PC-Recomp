@@ -73,6 +73,7 @@ needs no administrator rights and neither it nor the game contacts Xbox Live.
   LAN services such as Radmin VPN, ZeroTier, Tailscale and Hamachi
   ![Combat Simulator lobby](docs/screenshots/combat-simulator-lobby-host.webp)
   ![Four players in a Combat Simulator match](docs/screenshots/combat-simulator-match.webp)
+
 | Mode | Players |
 |---|---|
 | Local split-screen on one PC | up to 4 |
