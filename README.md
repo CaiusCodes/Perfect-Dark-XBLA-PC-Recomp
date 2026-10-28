@@ -2,9 +2,9 @@
 
 A native Windows PC version of **Perfect Dark** from the 2010 Xbox 360 Xbox Live
 Arcade remaster by Rare and 4J Studios. Created through static recompilation with
-[ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs a steady
-60 FPS at up to 4K with keyboard and mouse or Xbox controller support and features a built in LAN / Virtual LAN
-multiplayer for up to 8 players and 2 player co-op.
+[ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs 60 FPS at up to 4K
+with keyboard and mouse or Xbox controller support and features a built in
+LAN / Virtual LANmultiplayer for up to 8 players and 2 player co-op.
 
 > **You need your own copy of Perfect Dark XBLA.** This project contains no
 > original game program, graphics, sound, music or other game data. The first
