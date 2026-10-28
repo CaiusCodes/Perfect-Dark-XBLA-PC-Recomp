@@ -14,6 +14,7 @@ multiplayer for up to 8 players.
 
 Like the recomp and want to support future projects? You can
 tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
+
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
 
 ![A rooftop above the city at night](docs/screenshots/gameplay-rooftop.webp)
