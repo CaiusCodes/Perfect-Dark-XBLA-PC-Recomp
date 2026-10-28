@@ -1,7 +1,5 @@
 # Perfect Dark XBLA PC Recomp
 
-![Perfect Dark](docs/screenshots/title-logo.png)
-
 A native Windows PC version of **Perfect Dark**, from the 2010 Xbox 360 Xbox Live
 Arcade remaster by Rare and 4J Studios, created through static recompilation with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs the whole game, the
@@ -20,7 +18,9 @@ tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
 
-![Joanna and Cassandra De Vries in dataDyne Central](docs/screenshots/gameplay-cassandra.webp)
+![A rooftop above the city at night](docs/screenshots/gameplay-rooftop.webp)
+
+![Perfect Dark](docs/screenshots/title-logo.png)
 
 ## Requirements
 
@@ -66,7 +66,7 @@ needs no administrator rights, and neither it nor the game contacts Xbox Live.
   and **Upscaling**: Off, Sharpen (AMD CAS) or FSR (AMD FSR 1)
 - **Steady 60 FPS** (the game's own rate) with tear-free V-Sync, Direct3D 12 on
   NVIDIA and Vulkan on AMD and Intel graphics cards, picked automatically
-  ![A rooftop above the city at night](docs/screenshots/gameplay-rooftop.webp)
+
 - **Keyboard and mouse**: raw mouse look, rebindable keys (all five mouse
   buttons and the wheel), a radial weapon menu, and the mouse in every menu
 - **Xbox controller** support, working alongside keyboard and mouse; button
@@ -74,7 +74,7 @@ needs no administrator rights, and neither it nor the game contacts Xbox Live.
 - **LAN and Direct Connect multiplayer** for up to 8 players, also over virtual
   LAN services such as Radmin VPN, ZeroTier, Tailscale and Hamachi; every PC
   hears the host's music
-  ![Four players in a Combat Simulator match](docs/screenshots/combat-simulator-match.webp)
+  ![Combat Simulator lobby](docs/screenshots/combat-simulator-lobby-host.webp)
 - **Local split-screen** for up to 4 players on one PC
 - **Settings menus** in Help & Options: Keyboard & Mouse, Gamepad Controls,
   Graphics, Display Interface, Audio and Online (your player name)
@@ -84,14 +84,14 @@ needs no administrator rights, and neither it nor the game contacts Xbox Live.
 - **Portable**: one program to open, no installer; saves and settings stay in
   the game folder
 
-![Perfect Menu](docs/screenshots/perfect-menu.webp)
-
 | Mode | Players |
 |---|---|
 | Local split-screen on one PC | up to 4 |
 | LAN / Direct Connect | up to 8 |
 | Combat Simulator | up to 12 in a match, players and Simulants |
 | Co-Operative / Counter-Operative | 2 |
+
+![Four players in a Combat Simulator match](docs/screenshots/combat-simulator-match.webp)
 
 ### Controls
 
@@ -129,8 +129,6 @@ controller works as on the console.
 - No Xbox LIVE Arcade logo at start-up; the Carrington Institute walk-in no
   longer turns Joanna with the mouse before the menu appears.
 - Other miscellaneous fixes.
-
-![Combat Simulator lobby](docs/screenshots/combat-simulator-lobby-host.webp)
 
 ## Known limitations
 
