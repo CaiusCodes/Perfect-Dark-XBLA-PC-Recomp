@@ -1,19 +1,18 @@
 # Perfect Dark XBLA PC Recomp
 
-A native Windows PC version of **Perfect Dark**, from the 2010 Xbox 360 Xbox Live
-Arcade remaster by Rare and 4J Studios, created through static recompilation with
-[ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs the whole game, the
-solo missions, Combat Simulator, Co-Operative and Counter-Operative, at a steady
-60 FPS at up to 4K, with keyboard and mouse or an Xbox controller, and LAN and
-Direct Connect multiplayer for up to 8 players.
+A native Windows PC version of **Perfect Dark** from the 2010 Xbox 360 Xbox Live
+Arcade remaster by Rare and 4J Studios. Created through static recompilation with
+[ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs a steady
+60 FPS at up to 4K with keyboard and mouse or Xbox controller support and features a built in LAN / Virtual LAN
+multiplayer for up to 8 players.
 
 > **You need your own copy of Perfect Dark XBLA.** This project contains no
 > original game program, graphics, sound, music or other game data. The first
-> time you start it, it reads the Xbox 360 Perfect Dark package you provide
+> time you start it reads the Xbox 360 Perfect Dark package you provide
 > (Title ID `584109C2`), checks that it is the supported version and imports the
 > game data from it into the game's folder on your PC.
 
-Like the Perfect Dark XBLA PC Recomp and want to support future projects? You can
+Like the recomp and want to support future projects? You can
 tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
@@ -24,7 +23,7 @@ tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 
 - Windows 10 or 11, 64-bit
 - A processor with AVX2 (Intel Haswell / 4th generation Core or AMD Ryzen and
-  newer; most PCs from 2013 on)
+  newer; most PCs from 2015 onwards)
 - A graphics card with DirectX 12 or Vulkan support
 - Your own Perfect Dark Xbox Live Arcade package (the Xbox 360 game file for
   Title ID `584109C2`)
@@ -36,47 +35,41 @@ tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
    page and extract the **Perfect Dark** folder somewhere you can write to (not
    Program Files).
 2. Open **Perfect Dark.exe**. The first time, the setup window opens.
-3. Drag your package file (or the folder holding it) onto the window, or click
-   **Browse Package**. A package placed beside `Perfect Dark.exe`, or in a
-   `Game Package` folder next to it, is found and imported automatically.
+3. Drag your package file onto the window or click **Browse Package**.
 4. Tick any optional extras: start in fullscreen, desktop shortcut, all cheats
    unlocked, 100% story completion, unlock all multiplayer content.
 5. Click **Play** once it says READY TO PLAY.
 
 ![Setup window](docs/screenshots/setup.png)
 
-From then on, opening `Perfect Dark.exe` starts the game straight away; the
+After setup opening `Perfect Dark.exe` starts the game straight away; the
 package is not needed again. Everything stays inside the extracted folder
 (`resources\assets` for the imported game data, `resources\userdata` for saves
-and settings), so it can be moved or backed up as a whole. To update, extract a
-new release over the folder: your imported data, saves and settings are kept.
+and settings), so it can be moved or backed up as a whole. To update, run a fresh install or
+extract a new release over the folder: your imported data, saves and settings are kept.
 
 The launcher only reads your package and never changes it. It downloads nothing,
-needs no administrator rights, and neither it nor the game contacts Xbox Live.
+needs no administrator rights and neither it nor the game contacts Xbox Live.
 
 ## Features
 
 - **Native Windows PC build**: no emulator, runs as a normal Windows program
-- **The whole game**: solo missions, Combat Simulator with Simulants, Co-Operative
-  and Counter-Operative, Carrington Institute training, challenges and cheats
 - **Up to 4K**: windowed or fullscreen at your screen's resolution, with
   **Render Scale** 1x, 2x or 3x the Xbox's 1280 × 720 (Settings → Graphics)
   and **Upscaling**: Off, Sharpen (AMD CAS) or FSR (AMD FSR 1)
-- **Steady 60 FPS** (the game's own rate) with tear-free V-Sync, Direct3D 12 on
-  NVIDIA and Vulkan on AMD and Intel graphics cards, picked automatically
-![Video Settings](docs/screenshots/Video-settings.png)
-- **Keyboard and mouse**: raw mouse look, rebindable keys (all five mouse
-  buttons and the wheel), a radial weapon menu, and the mouse in every menu
-- **Xbox controller** support, working alongside keyboard and mouse; button
+- **Steady 60 FPS** (the game's own rate) with V-Sync, Direct3D 12 on
+  NVIDIA and Vulkan on AMD and Intel graphics cards are picked automatically
+- **Keyboard and mouse**: raw mouse look with rebindable keys and the mouse support in every menu
+- **Xbox controller** support working alongside keyboard and mouse; button
   prompts hide themselves when no controller is connected
-- **LAN and Direct Connect multiplayer** for up to 8 players, also over virtual
-  LAN services such as Radmin VPN, ZeroTier, Tailscale and Hamachi; every PC
-  hears the host's music
+- **LAN and Direct Connect multiplayer** for up to 8 players with 2 player co-op over virtual
+  LAN services such as Radmin VPN, ZeroTier, Tailscale and Hamachi
   ![Combat Simulator lobby](docs/screenshots/combat-simulator-lobby-host.webp)
+  ![Four players in a Combat Simulator match](docs/screenshots/combat-simulator-match.webp)
 - **Local split-screen** for up to 4 players on one PC
 - **Settings menus** in Help & Options: Keyboard & Mouse, Gamepad Controls,
-  Graphics, Display Interface, Audio and Online (your player name)
-- **Leaderboards and achievements**, kept on your PC
+  Graphics, Display Interface, Audio and Online
+- **Leaderboards and achievements** kept on your PC
 - Optional extras in setup: **all cheats unlocked**, **100% story completion**
   (every mission on every difficulty) and **all multiplayer content unlocked**
 - **Portable**: one program to open, no installer; saves and settings stay in
@@ -88,8 +81,6 @@ needs no administrator rights, and neither it nor the game contacts Xbox Live.
 | LAN / Direct Connect | up to 8 |
 | Combat Simulator | up to 12 in a match, players and Simulants |
 | Co-Operative / Counter-Operative | 2 |
-
-![Four players in a Combat Simulator match](docs/screenshots/combat-simulator-match.webp)
 
 ### Controls
 
@@ -114,13 +105,15 @@ controller works as on the console.
 
 ### Fixes
 
-- The game clock no longer runs 2% fast, and network matches no longer run
+- The game clock no longer runs 2% fast and network matches no longer run
   0.25% fast with a double step every few seconds.
+- Light and sun flares no longer showing through walls and causing slow downs
 - Rooms with their lights switched off are dark but visible again (they went
   completely black), with objects kept darker than the room.
 - Hosting a match no longer crashes after about three minutes in the lobby.
-- The game no longer keeps three CPU cores fully busy: about a third of one core
-  standing still.
+- In game multiplayer Virtual LAN games now sync smoothly with other players.
+- Game no longer keeps three CPU cores fully busy: about a third of one core
+  standing still reducing load.
 - Xbox LIVE leftovers removed: dead buttons, gamer cards, storage device prompts
   and messages that don't apply on PC.
 - Auto-Aim starts off, since the mouse aims; switch it on in Control settings.
@@ -131,24 +124,23 @@ controller works as on the console.
 ## Known limitations
 
 - Windows only for now.
-- Only the Perfect Dark Xbox Live Arcade package with Title ID `584109C2` and
-  the exact game program this port was recompiled from is supported; setup
-  refuses other builds.
 - The game is not digitally signed, so Windows SmartScreen may warn the first
   time: choose *More info*, then *Run anyway*. Windows also asks for network
   access the first time you host or join a LAN or Direct Connect game; allow it
   on private and public networks (virtual LANs often count as public).
-- Not yet tested: matches with five to eight players, local split-screen,
-  Co-Operative and Counter-Operative over the network, a host leaving
-  mid-match, and AMD graphics cards on real hardware.
+- Only the Perfect Dark Xbox Live Arcade package with Title ID `584109C2` and
+  the exact game program this port was recompiled from is supported; setup
+  refuses other builds.
+- Not yet tested: matches eight players, local split-screen, Counter-Operative
+  over the network and AMD graphics cards on real hardware.
 - At 144 or 165 Hz without G-Sync / FreeSync, 60 frames a second cannot be
   shown evenly; turn on G-Sync / FreeSync or set the screen to 120 Hz.
 
 ## Reporting a problem
 
 Every run writes a log to `resources\runtime\logs` (the 20 newest are kept).
-**When reporting a problem, attach the newest `perfect_dark_NNN.log`.** It starts
-with your Windows version, processor, graphics card, driver, screen and main
+**When reporting a problem please attach your latest `resources\runtime\logs`.**
+It starts with your Windows version, processor, graphics card, driver, screen and main
 settings; it holds no saves or passwords. If the game crashed, the log ends with
 a `[crash]` line and a `crash-<date>-<time>.dmp` is written beside it: attach
 that too.
