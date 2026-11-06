@@ -1,17 +1,17 @@
 # Perfect Dark XBLA PC Recomp
 
-A native Windows PC port of **Perfect Dark (2010)**, the Xbox 360 remaster by Rare and 4J Studios, built using [ReXGlue](https://github.com/rexglue/rexglue-sdk) static recompilation.
+A native Windows PC port of **Perfect Dark (2010)**, the Xbox 360 remaster by Rare and 4J Studios, built using [ReXGlue](https://github.com/rexglue/rexglue-sdk) static recompilation. Play at **up to 4K and 60 FPS**, with keyboard and mouse support, enhanced graphics, and LAN / Virtual LAN multiplayer. No emulator required.
 
-Play at **up to 4K and 60 FPS**, with keyboard and mouse support, enhanced graphics, and LAN / Virtual LAN multiplayer. No emulator required.
-
-![Perfect Dark gameplay](docs/screenshots/gameplay-rooftop.webp)
-
-> **You must provide your own copy of Perfect Dark XBLA.** No copyrighted game files are distributed with this project. The launcher imports the required files from your Xbox 360 game package during first-time setup.
+**Free and open-source**.
 
 Like the recomp and want to support future projects? You can
 tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
+
+![Perfect Dark gameplay](docs/screenshots/gameplay-rooftop.webp)
+
+> **You must provide your own copy of Perfect Dark XBLA.** No copyrighted game files are distributed with this project. The launcher imports the required files from your Xbox 360 game package during first-time setup.
 
 ## Download & Installation
 
@@ -73,8 +73,6 @@ Most graphics settings apply instantly; Render Scale and Graphics API restart th
 - Compatible with Radmin VPN, ZeroTier, Tailscale and Hamachi
 - Multiplayer music synchronised across connected players
 
-No Xbox Live connection is required.
-
 ![Combat Simulator lobby](docs/screenshots/combat-simulator-lobby-host.webp)
 
 ![Combat Simulator gameplay](docs/screenshots/combat-simulator-match.webp)
@@ -114,7 +112,7 @@ For detailed changes and bug fixes, see the [release notes](https://github.com/C
 ## Known Limitations
 
 - Windows only.
-- Some multiplayer configurations, including 8-player matches, local split-screen and network Counter-Operative, remain untested.
+- Some multiplayer configurations.
 - Vulkan has not been fully tested on AMD and Intel GPUs.
 - Windows SmartScreen may warn about the unsigned executable. Download only from the official release page.
 - Windows Firewall may request permission for network multiplayer.
