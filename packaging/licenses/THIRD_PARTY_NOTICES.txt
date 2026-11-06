@@ -26,6 +26,8 @@ STFS package reader                  GNU GPL version 3   LICENSE-Extract-STFS.tx
   (https://github.com/hetelek/Velocity). Its complete source is in the
   project repository (packaging/launcher). The game in resources\runtime is
   a separate program and is not covered by the GPL.
+stb_image (zlib inflate)             MIT / public domain   LICENSE-stb.txt
+  Also compiled into the launcher, which unpacks downloaded updates with it.
 
 Libraries compiled into rexruntime.dll / rexgpu-xenos.dll
 ---------------------------------------------------------
@@ -54,6 +56,29 @@ disruptorplus (Lewis Baker)          MIT (upstream: github.com/lewissbaker/disru
 tiny-AES-c                           The Unlicense (public domain)
 FFmpeg (audio decoding)              LGPL 2.1 or later     LICENSE-FFmpeg-LGPL-2.1.txt
 libmspack                            LGPL 2.1              LICENSE-libmspack-LGPL-2.1.txt
+
+The Plume renderer (compiled into resources\runtime\Perfect Dark.exe)
+----------------------------------------------------------------------
+Plume (Direct3D 12 rendering layer)  MIT       LICENSE-Plume.txt
+D3D12 Memory Allocator (AMD)         MIT       LICENSE-D3D12MemoryAllocator.txt
+XenosRecomp (shader recompiler)      MIT       LICENSE-XenosRecomp.txt
+  This port's changes to Plume and XenosRecomp (patches/plume.patch and
+  patches/xenosrecomp.patch in the repository) stay under their licences.
+
+DirectX Shader Compiler (Microsoft)
+-----------------------------------
+resources\runtime\dxcompiler.dll and resources\runtime\dxil.dll, DXC release
+v1.8.2407 (July 2024), unmodified. Plume uses them to translate the game's
+shaders on the player's PC.
+DXC (dxcompiler.dll)                 University of Illinois/NCSA   LICENSE-DXC.txt
+  Microsoft's own code in it         MIT                           LICENSE-DXC-MIT.txt
+  Its third-party components         see LICENSE-DXC-ThirdPartyNotices.txt
+dxil.dll (the DXIL validator)        Microsoft Software License    LICENSE-DXIL.txt
+  dxil.dll is Microsoft's distributable code, distributed under the Microsoft
+  Software License Terms for the DirectX Shader Compiler (LICENSE-DXIL.txt),
+  for use on Windows only. Your use of it is subject to those terms. It is not
+  covered by this project's licence or by the launcher's GNU GPL, and nothing
+  here places it under any other licence.
 
 FFmpeg and libmspack are used under the GNU Lesser General Public License.
 FFmpeg is built without its optional GPL components. Their complete source

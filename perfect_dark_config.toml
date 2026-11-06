@@ -87,6 +87,15 @@ name = "PdHookIdleSleep"
 registers = ["r3"]
 jump_address_on_true = 0x8226D58C
 
+# A network match's frame wait (sub_8214D6C8, the loop at 0x8214D8A8 reads the match
+# clock until the next frame is due): after its `cmplw cr6,r9,r6`, yield or sleep
+# 0.5 ms before going round again (pd_sleep_in_waits). It spun with gpu_native.
+[[midasm_hook]]
+address = 0x8214D900
+name = "PdHookNetFrameWait"
+registers = ["r9", "r6"]
+after_instruction = true
+
 # ---- Controls -----------------------------------------------------------------------
 
 # Auto-Aim off in new and restored control settings (PC aims with the mouse).
@@ -145,6 +154,14 @@ return_on_true = true
 
 # ---- Graphics -----------------------------------------------------------------------
 
+# Aspect Ratio 4:3 (pd_aspect_ratio): optionsGetScreenRatio (sub_821DC2E0) answers
+# "normal", so every view gets the N64's 4:3 field of view.
+[[midasm_hook]]
+address = 0x821DC2E0
+name = "PdHookScreenRatio"
+registers = ["r3"]
+return_on_true = true
+
 # Dark rooms: the room brightness floor (lights_set_for_room, sub_821519C8) and the
 # objects' shade alpha (FogCol.a written by sub_822653B8).
 [[midasm_hook]]
@@ -158,6 +175,13 @@ address = 0x822672C4
 name = "PdHookShadeAlpha"
 registers = ["r9", "f9", "f10", "f11", "f12"]
 after_instruction = true
+
+# Camera Bob off (pd_view_bob = false): the head update (sub_820F0150, the N64's
+# bheadUpdate) hands on a level, steady eye height, look and up at 0x820F068C.
+[[midasm_hook]]
+address = 0x820F068C
+name = "PdHookViewBobHold"
+registers = ["r1"]
 
 # ---- Multiplayer --------------------------------------------------------------------
 

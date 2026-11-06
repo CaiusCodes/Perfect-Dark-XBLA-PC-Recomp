@@ -6,7 +6,8 @@
 #     licenses\
 #     resources\
 #       runtime\                  the game (Perfect Dark.exe, rexruntime.dll,
-#                                 rexgpu-xenos.dll, VC++ runtime DLLs)
+#                                 rexgpu-xenos.dll, VC++ runtime DLLs, and for
+#                                 Plume dxcompiler.dll, dxil.dll, native_pipelines.bin)
 #
 # The first time the launcher runs it imports the game data from the player's
 # own Xbox 360 package into resources\assets; saves and settings go to
@@ -48,7 +49,11 @@ $stageRoot = Join-Path $releaseRoot "staging\$releaseName"
 $zipPath = Join-Path $releaseRoot "Perfect-Dark-XBLA-PC-Recomp-v$Version.zip"
 $launcherBuilt = Join-Path $projectRoot "out\launcher\$exeName"
 
-$runtimeFiles = @("perfect_dark.exe", "rexruntime.dll", "rexgpu-xenos.dll")
+# Plume (the default renderer) translates the game's shaders with DXC
+# (dxcompiler.dll, dxil.dll) and warms up from native_pipelines.bin (shader
+# hashes and states, no game data); the build copies all three beside the exe.
+$runtimeFiles = @("perfect_dark.exe", "rexruntime.dll", "rexgpu-xenos.dll", "dxcompiler.dll", "dxil.dll",
+    "native_pipelines.bin")
 $vcRuntimeFiles = @("msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll")
 
 # --- 1. Inputs ---------------------------------------------------------------
@@ -198,6 +203,8 @@ foreach ($item in $staged) {
         throw "Forbidden item entered the release: $($item.FullName)"
     }
     foreach ($pattern in $forbiddenPatterns) {
+        # The one .bin that belongs: Plume's pipeline list, from the source tree.
+        if ($item.Name -eq "native_pipelines.bin" -and $item.DirectoryName -eq $runtimeStage) { continue }
         if ($item.Name -like $pattern) { throw "Forbidden file type entered the release: $($item.FullName)" }
     }
     if (-not $item.PSIsContainer -and $item.Length -gt 64MB) {

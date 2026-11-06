@@ -8,7 +8,7 @@ game_root = "game"
 [entrypoint]
 file_path = "game/default.xex"
 out_directory_path = "generated/default"
-includes = ["perfect_dark_config.toml"]
+includes = ["perfect_dark_config.toml", "pd_native_probe.toml"]
 
 [entrypoint.functions]
 0x82536028 = {}

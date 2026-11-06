@@ -35,6 +35,9 @@ include(generated/rexglue.cmake)
 set(PERFECTDARK_SOURCES
     src/main.cpp
     src/perfect_dark_hooks.cpp
+    src/pd_native_probe.cpp
+    src/pd_native_gpu.cpp
+    src/pd_native_shaders.cpp
 )
 
 # The release version: VERSION is the single source of truth. The game shows
@@ -89,4 +92,97 @@ endif()
 if(WIN32)
     # XInputGetState for the PC Settings panel's controller navigation.
     target_link_libraries(perfect_dark PRIVATE Xinput9_1_0.lib)
+    # Help & Options > Check for Updates asks GitHub over HTTPS (src/pd_update.h).
+    target_link_libraries(perfect_dark PRIVATE winhttp.lib)
+endif()
+
+# The Plume renderer (gpu_native, src/pd_native_gpu.cpp; the default since
+# 0.9.0a): Plume (MIT) for Direct3D 12, and XenosRecomp's shader recompiler
+# (MIT) with Microsoft's DXC (dxcompiler.dll + dxil.dll, redistributable) to
+# translate the game's shaders on the player's PC. In the public repository
+# they are the thirdparty/plume and thirdparty/XenosRecomp submodules (upstream
+# commits) plus patches/plume.patch and patches/xenosrecomp.patch, applied at
+# configure time (cmake/NativePatches.cmake); in the development tree they are
+# the already patched checkouts in ..\native\refs.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/plume/plume_d3d12.cpp")
+    set(_pd_native_refs "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty")
+else()
+    set(_pd_native_refs "${CMAKE_CURRENT_SOURCE_DIR}/../native/refs")
+endif()
+set(PD_PLUME_DIR "${_pd_native_refs}/plume" CACHE PATH "Plume checkout")
+set(PD_XENOSRECOMP_DIR "${_pd_native_refs}/XenosRecomp" CACHE PATH "XenosRecomp checkout")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/NativePatches.cmake")
+    include(cmake/NativePatches.cmake)
+endif()
+if(WIN32)
+    # Direct3D 12 and Vulkan backends (gpu_native_api; Vulkan since 0.9.1).
+    add_library(pd_plume STATIC
+        "${PD_PLUME_DIR}/plume_d3d12.cpp"
+        "${PD_PLUME_DIR}/plume_vulkan.cpp"
+        "${PD_PLUME_DIR}/contrib/D3D12MemoryAllocator/src/D3D12MemAlloc.cpp")
+    target_include_directories(pd_plume PUBLIC
+        "${PD_PLUME_DIR}"
+        "${PD_PLUME_DIR}/contrib/D3D12MemoryAllocator/include")
+    # Plume's Vulkan headers (volk, its Vulkan-Headers, VMA) only where Plume's
+    # Vulkan types are used: the SDK's Vulkan code (pd_native_vk_out.cpp, which
+    # hands frames to the SDK's Vulkan presenter) keeps its own.
+    set(_pd_plume_vk_includes
+        "${PD_PLUME_DIR}/contrib/volk"
+        "${PD_PLUME_DIR}/contrib/Vulkan-Headers/include"
+        "${PD_PLUME_DIR}/contrib/VulkanMemoryAllocator/include")
+    target_include_directories(pd_plume PRIVATE ${_pd_plume_vk_includes})
+    set_property(SOURCE src/pd_native_gpu.cpp APPEND PROPERTY INCLUDE_DIRECTORIES ${_pd_plume_vk_includes})
+    # The Vulkan presenter hand-off (src/pd_native_vk_out.cpp) uses the SDK's
+    # Vulkan headers: built on its own with the SDK's include paths (as
+    # GoldenEye's port does), plus renderdoc_app.h, which those headers include:
+    # the installed SDK's include/renderdoc, or the SDK source's thirdparty/renderdoc.
+    add_library(pd_vk_out OBJECT src/pd_native_vk_out.cpp)
+    target_compile_features(pd_vk_out PRIVATE cxx_std_23)
+    target_link_libraries(pd_vk_out PRIVATE rex::runtime)
+    if(rexglue_DIR AND EXISTS "${rexglue_DIR}/../../../include/renderdoc/renderdoc_app.h")
+        target_include_directories(pd_vk_out SYSTEM PRIVATE "${rexglue_DIR}/../../../include/renderdoc")
+    elseif(REXSDK_DIR AND EXISTS "${REXSDK_DIR}/thirdparty/renderdoc/renderdoc_app.h")
+        target_include_directories(pd_vk_out SYSTEM PRIVATE "${REXSDK_DIR}/thirdparty/renderdoc")
+    endif()
+    target_link_libraries(perfect_dark PRIVATE pd_vk_out)
+    target_compile_definitions(pd_plume PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pd_plume PRIVATE -w)
+    target_link_libraries(pd_plume PUBLIC d3d12 dxgi dxguid d3dcompiler)
+    target_link_libraries(perfect_dark PRIVATE pd_plume)
+    # The renderer reads guest memory inside __try blocks that must catch a bad
+    # page: without asynchronous exceptions clang only catches faults raised in
+    # a called function.
+    set_property(SOURCE src/pd_native_gpu.cpp APPEND PROPERTY COMPILE_OPTIONS -fasync-exceptions)
+    set_property(SOURCE src/pd_native_gpu.cpp src/pd_native_shaders.cpp APPEND PROPERTY COMPILE_DEFINITIONS _CRT_SECURE_NO_WARNINGS)
+
+    set(_pd_xr "${PD_XENOSRECOMP_DIR}/XenosRecomp")
+    set(_pd_dxc "${PD_XENOSRECOMP_DIR}/thirdparty/dxc-bin")
+    add_library(pd_xenosrecomp STATIC "${_pd_xr}/shader_recompiler.cpp")
+    target_include_directories(pd_xenosrecomp PUBLIC
+        "${_pd_xr}"
+        "${_pd_dxc}/inc"
+        "${PD_XENOSRECOMP_DIR}/thirdparty/smol-v/source"
+        "${PD_XENOSRECOMP_DIR}/thirdparty/zstd/lib"
+        "${PD_XENOSRECOMP_DIR}/thirdparty/xxHash")
+    target_precompile_headers(pd_xenosrecomp PRIVATE "${_pd_xr}/pch.h")
+    target_compile_definitions(pd_xenosrecomp PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    target_compile_options(pd_xenosrecomp PRIVATE -w -fms-extensions)
+    target_link_libraries(pd_xenosrecomp PUBLIC fmt::fmt)
+    target_link_libraries(perfect_dark PRIVATE pd_xenosrecomp)
+    # XenosRecomp's shared definitions, prepended to every translated shader:
+    # embedded so the game needs no loose file for it.
+    file(READ "${_pd_xr}/shader_common.h" _pd_shader_common)
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated_include/pd_shader_common.inc"
+        CONTENT "// Generated from XenosRecomp/shader_common.h by CMakeLists.txt.\nR\"PDSC(@_pd_shader_common@)PDSC\"\n"
+        @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_pd_xr}/shader_common.h")
+    add_custom_command(TARGET perfect_dark POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_pd_dxc}/bin/x64/dxcompiler.dll" "${_pd_dxc}/bin/x64/dxil.dll" "$<TARGET_FILE_DIR:perfect_dark>")
+    # The pipelines every level draws (shader hashes and state, no game data),
+    # recorded on the developer's PC: created at boot so a first play has no
+    # first-compile hitches (pd_native_gpu.cpp, warm_pipelines).
+    add_custom_command(TARGET perfect_dark POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/packaging/native_pipelines.bin" "$<TARGET_FILE_DIR:perfect_dark>")
 endif()

@@ -12,6 +12,8 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <intrin.h>
+#include <wincodec.h>
+#pragma comment(lib, "windowscodecs.lib")
 
 #include <algorithm>
 #include <array>
@@ -25,6 +27,8 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <sstream>
+#include <fstream>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -43,6 +47,9 @@
 #undef XINPUT_DEVTYPE_GAMEPAD
 #undef XINPUT_DEVTYPE_KEYBOARD
 #include <rex/input/mnk/mnk_input_driver.h>
+#include "pd_test_input.h"  // native-renderer branch: test pipe input
+#include "pd_native_vk_out.h"  // Graphics API: pd::native_vk::VulkanUsable
+#include "pd_update.h"         // Check for Updates
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/cvar.h>
 #include <rex/diag_timing.h>
@@ -64,11 +71,16 @@
 REXCVAR_DECLARE(bool, pd_dev_hotkeys);
 // A crash writes a [crash] line and a small dump into logs\ (main.cpp).
 void PdInstallCrashReport();
+// Keeps the game on a hybrid CPU's performance cores (main.cpp, HANDOVER 4ba).
+void PdPreferPerformanceCores();
 REXCVAR_DECLARE(bool, pd_story_complete);
 REXCVAR_DECLARE(bool, pd_frame_stats);
 REXCVAR_DECLARE(bool, pd_menu_mouse);
 REXCVAR_DECLARE(int32_t, pd_mp_facing_delay_ms);
 REXCVAR_DECLARE(double, pd_shine);
+REXCVAR_DECLARE(bool, pd_view_bob);
+REXCVAR_DECLARE(bool, pd_light_capture);
+#include <rex/logging/api.h>
 #include <rex/logging/macros.h>
 #include <rex/rex_app.h>
 
@@ -83,6 +95,10 @@ REXCVAR_DECLARE(double, pd_shine);
 #include <rex/ui/window_sdl.h>
 
 class PerfectDarkApp;
+
+namespace pd {
+uint64_t NativeFramesShown();  // pd_native_gpu.cpp: frames shown by Plume
+}
 
 // TEMP_MENU_SCAN: a self-contained, in-process guest-memory write-watch,
 // triggered by F8 (arm) / F6 (disarm + report) - see PerfectDarkInputTracker.
@@ -117,11 +133,33 @@ struct WatchState {
   PVOID veh_handle = nullptr;
   bool sym_initialized = false;
   int hits_logged = 0;
+  std::map<std::string, int> hits_by_symbol;  // writer function + offset -> writes
 };
 
 inline WatchState& State() {
   static WatchState s;
   return s;
+}
+
+// The recompiled guest function a host address lies in (the build has no
+// symbol file): the nearest function start below it in the generated
+// guest -> host table. Built when a watch is armed, not in the handler.
+inline const std::vector<std::pair<uintptr_t, uint32_t>>& HostFunctionTable() {
+  static const std::vector<std::pair<uintptr_t, uint32_t>> table = [] {
+    std::vector<std::pair<uintptr_t, uint32_t>> t;
+    for (const PPCFuncMapping* m = PPCFuncMappings; m->guest; ++m)
+      t.emplace_back(reinterpret_cast<uintptr_t>(m->host), uint32_t(m->guest));
+    std::sort(t.begin(), t.end());
+    return t;
+  }();
+  return table;
+}
+inline std::string GuestFunctionAt(uintptr_t host) {
+  const auto& t = HostFunctionTable();
+  auto it = std::upper_bound(t.begin(), t.end(), std::make_pair(host, UINT32_MAX));
+  if (it == t.begin()) return "?";
+  --it;
+  return fmt::format("sub_{:08X}+0x{:X}", it->second, host - it->first);
 }
 
 inline LONG CALLBACK VectoredHandler(EXCEPTION_POINTERS* info) {
@@ -152,7 +190,10 @@ inline LONG CALLBACK VectoredHandler(EXCEPTION_POINTERS* info) {
       line.SizeOfStruct = sizeof(line);
       DWORD line_disp = 0;
       bool have_line = SymGetLineFromAddr64(GetCurrentProcess(), rip, &line_disp, &line);
-      if (SymFromAddr(GetCurrentProcess(), rip, &disp, sym)) {
+      st.hits_by_symbol[GuestFunctionAt(rip)]++;
+      if (st.hits_logged >= 60) {
+        // (counted per function above; DisarmMemoryWriteWatch lists them)
+      } else if (SymFromAddr(GetCurrentProcess(), rip, &disp, sym)) {
         if (have_line) {
           REXLOG_INFO(
               "[menu_watch] {}write to guest 0x{:08X} from {}+0x{:X} at {}:{} (host rip=0x{:X})",
@@ -243,6 +284,7 @@ inline void ArmMemoryWriteWatch(rex::memory::Memory* mem, const std::vector<uint
 // actual executable code lives entirely in this host process's own code
 // section, a completely separate address range.
 inline void ArmMemoryWriteWatchRange(rex::memory::Memory* mem, uint32_t start, uint32_t end) {
+  HostFunctionTable();
   auto& st = State();
   std::lock_guard<std::mutex> lock(st.mutex);
   st.virtual_membase = mem->virtual_membase();
@@ -288,6 +330,9 @@ inline void DisarmMemoryWriteWatch() {
   st.single_step_page_by_thread.clear();
   REXLOG_INFO("[menu_watch] Disarmed ({} page(s) unprotected). {} write hit(s) were logged above.",
               page_count, st.hits_logged);
+  for (const auto& [name, count] : st.hits_by_symbol)
+    REXLOG_INFO("[menu_watch]   {} writes from {}", count, name);
+  st.hits_by_symbol.clear();
 }
 
 }  // namespace pd_watch
@@ -450,6 +495,40 @@ class PerfectDarkMatchPicker : public rex::ui::ImGuiDialog {
   int chosen_ = -1;
 };
 
+enum class PdUpdateState { kIdle, kChecking, kUpToDate, kAvailable, kFailed, kNoLauncher };
+struct PdUpdateStatus {
+  PdUpdateState state = PdUpdateState::kIdle;
+  std::string latest, error;  // the latest release's version; why a check failed
+  uint64_t size = 0;          // its ZIP's size in bytes (0 unknown)
+};
+
+// Settings > Check for Updates (HANDOVER 4bs): asks GitHub for the
+// latest release on a worker (PerfectDarkApp::StartUpdateCheck) and shows the
+// answer; "Update now" closes the game and opens the launcher's update window
+// (Perfect Dark.exe --update), which downloads and installs it. Same look and
+// keys as the match picker.
+class PerfectDarkUpdateDialog : public rex::ui::ImGuiDialog {
+ public:
+  PerfectDarkUpdateDialog(rex::ui::ImGuiDrawer* imgui_drawer, PerfectDarkApp* app)
+      : rex::ui::ImGuiDialog(imgui_drawer), app_(app) {}
+  void OnDraw(ImGuiIO& io) override;
+
+ protected:
+  void OnClose() override;
+
+ private:
+  enum Key : int { kUp, kDown, kConfirm, kBack, kKeyCount };
+  void PollInput(bool edges[kKeyCount], bool* any_held);
+
+  PerfectDarkApp* app_;
+  int selected_ = 0;
+  bool opened_ = false;
+  bool primed_ = false;
+  bool was_down_[kKeyCount] = {};
+  int chosen_ = -1;          // the row to act on once every key is released
+  bool blocked_ = false;     // Update now chosen where restarting is not safe
+};
+
 // Persistent, invisible background dialog whose only purpose is a per-frame
 // hook: ImGuiDrawer::Draw() only calls OnDraw() for dialogs that exist in its
 // list (it early-returns entirely when the list is empty), so without this
@@ -471,6 +550,7 @@ class PerfectDarkInputTracker : public rex::ui::ImGuiDialog {
  private:
   PerfectDarkApp* app_;
   bool f9_was_down_ = false;
+  bool f12_shot_was_down_ = false;
   // TEMP_MENU_SCAN: F10 triggers a one-shot guest-memory scan for known
   // Video Options menu strings, to locate the real menu-item table for the
   // native-menu injection work. Remove once that table's address is known.
@@ -494,6 +574,8 @@ class PerfectDarkInputTracker : public rex::ui::ImGuiDialog {
   bool f5_was_down_ = false;
   // TEMP_LIGHT_DIAG: Insert arms the pixel-constant draw capture.
   bool ins_was_down_ = false;
+  // Insert with pd_light_capture: one frame's lighting capture.
+  bool capture_was_down_ = false;
   // TEMP_MENU_SCAN: F4 triggers the second (item-base) trace point.
   bool f4_was_down_ = false;
   // TEMP_MENU_SCAN: F1 arms a write-watch on a narrow range around the
@@ -605,6 +687,36 @@ class PerfectDarkApp : public rex::ReXApp {
     if (kOnlineServer[0] && rex::cvar::GetFlagByName("net_relay_server").empty()) {
       rex::cvar::SetFlagByName("net_relay_server", kOnlineServer);
     }
+    // Show FPS: the SDK's counter counts the frames the Xenos command processor
+    // swaps, which stays at 0 under Plume (the counter never appeared). Count
+    // the game's frames from either renderer instead.
+    SetGuestFrameStats([last_time = std::chrono::steady_clock::now(), last_frames = uint64_t(0),
+                        fps = 0.0]() mutable {
+      rex::ui::FrameStats stats;
+      const uint64_t frames = GameFramesShown();
+      const auto now = std::chrono::steady_clock::now();
+      const double elapsed = std::chrono::duration<double>(now - last_time).count();
+      if (last_frames == 0 || frames < last_frames) {
+        last_frames = frames;
+        last_time = now;
+      } else if (elapsed >= 0.25) {
+        fps = double(frames - last_frames) / elapsed;
+        last_frames = frames;
+        last_time = now;
+      }
+      stats.frame_count = frames;
+      stats.fps = fps;
+      stats.frame_time_ms = fps > 0.0 ? 1000.0 / fps : 0.0;
+      return stats;
+    });
+  }
+
+  // The game's frames so far: the Xenos command processor's swaps (Classic)
+  // plus the frames Plume showed (only one of them counts in a run).
+  static uint64_t GameFramesShown() {
+    PerfectDarkApp* app = current_instance_;
+    auto* gs = (app && app->runtime()) ? app->runtime()->graphics_system() : nullptr;
+    return (gs ? gs->guest_frame_count() : 0) + pd::NativeFramesShown();
   }
 
   // Shader template fix-ups, applied right after default.xex is loaded and
@@ -1046,6 +1158,62 @@ class PerfectDarkApp : public rex::ReXApp {
       }
       addr += info.region_size;
     }
+  }
+
+  // Finds `hex` (a byte pattern, 4-byte aligned) in the game's memory and
+  // watches writes to [match, match + span) for up to 4 matches (pd_watch).
+  static int WatchPattern(const std::string& hex, uint32_t span) {
+    PerfectDarkApp* app = current_instance_;
+    if (!app || !app->runtime() || !app->runtime()->memory()) return 0;
+    auto* mem = app->runtime()->memory();
+    std::vector<uint8_t> pattern;
+    for (size_t i = 0; i + 1 < hex.size(); i += 2)
+      pattern.push_back(uint8_t(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
+    std::vector<uint32_t> found;
+    ForEachCommittedRegion(mem, [&](uint32_t region, uint32_t size) {
+      const uint8_t* p = mem->TranslateVirtual<uint8_t*>(region);
+      if (!p || pattern.empty() || found.size() >= 4) return;
+      for (uint32_t i = 0; i + pattern.size() <= size && found.size() < 4; i += 4)
+        if (std::memcmp(p + i, pattern.data(), pattern.size()) == 0) found.push_back(region + i);
+    });
+    for (uint32_t a : found) {
+      REXLOG_INFO("[watch] pattern at {:08X}", a);
+      pd_watch::ArmMemoryWriteWatchRange(mem, a, a + span);
+    }
+    if (found.empty()) REXLOG_INFO("[watch] pattern not found");
+    return int(found.size());
+  }
+
+  // Lighting capture (pd_light_capture): the game's memory as it is now, every
+  // committed readable region below 0xC0000000, to userdata\captures\mem-<n>.bin
+  // as records of {u32 address, u32 size, bytes} (little-endian header). Two of
+  // them (lights on, lights off) diffed show what the switch changed. The game
+  // keeps running while it is copied. Test copies only: never ship one.
+  static void DumpGuestMemory(int index) {
+    PerfectDarkApp* app = current_instance_;
+    if (!app || !app->runtime() || !app->runtime()->memory() || app->config_path().empty()) return;
+    auto* mem = app->runtime()->memory();
+    const std::filesystem::path folder = std::filesystem::path(app->config_path()).parent_path() / "captures";
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    const std::filesystem::path path = folder / fmt::format("mem-{}.bin", index);
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) { REXLOG_INFO("[light_capture] could not write {}", path.string()); return; }
+    constexpr uint64_t kCap = 768ull << 20;
+    uint64_t total = 0;
+    int regions = 0;
+    ForEachCommittedRegion(mem, [&](uint32_t addr, uint32_t size) {
+      if (total + size > kCap) return;
+      const uint8_t* p = mem->TranslateVirtual<uint8_t*>(addr);
+      if (!p) return;
+      const uint32_t header[2] = {addr, size};
+      fwrite(header, 4, 2, f);
+      fwrite(p, 1, size, f);
+      total += size;
+      ++regions;
+    });
+    fclose(f);
+    REXLOG_INFO("[light_capture] memory: {} regions, {:.1f} MB to {}", regions, total / 1048576.0, path.string());
   }
 
   // TEMP_MENU_SCAN: manual big-endian 32-bit read, matching the pattern
@@ -1592,14 +1760,33 @@ class PerfectDarkApp : public rex::ReXApp {
     return entry;
   }
 
+  // The picture's place in the window: the presenter fits it whole, with bars
+  // where the shapes differ (Aspect Ratio 4:3, or 16:9 on an ultrawide screen).
+  struct PictureRect {
+    float x, y, w, h;
+  };
+  static PictureRect PicturePixels(const ImGuiIO& io) {
+    const float aspect = AspectRatioIndex() == 1 ? 4.0f / 3.0f : 16.0f / 9.0f;
+    const float win_w = io.DisplaySize.x, win_h = io.DisplaySize.y;
+    if (win_w <= 0.0f || win_h <= 0.0f) return {0.0f, 0.0f, win_w, win_h};
+    if (win_w / win_h > aspect) {
+      const float w = win_h * aspect;
+      return {(win_w - w) * 0.5f, 0.0f, w, win_h};
+    }
+    const float h = win_w / aspect;
+    return {0.0f, (win_h - h) * 0.5f, win_w, h};
+  }
+
   // Menu space to window pixels, for drawing the pointer: the menus span the
   // picture, 640 across and 220 down.
   static float MenuPixelsY(const ImGuiIO& io, float menu_y) {
-    return io.DisplaySize.y * menu_y / kMenuSpaceHeight;
+    const PictureRect pic = PicturePixels(io);
+    return pic.y + pic.h * menu_y / kMenuSpaceHeight;
   }
 
   static ImVec2 MenuCursorPixels(const ImGuiIO& io) {
-    return ImVec2(menu_cursor_x_ * io.DisplaySize.x / kMenuSpaceWidth,
+    const PictureRect pic = PicturePixels(io);
+    return ImVec2(pic.x + menu_cursor_x_ * pic.w / kMenuSpaceWidth,
                   MenuPixelsY(io, menu_cursor_y_));
   }
 
@@ -1610,9 +1797,11 @@ class PerfectDarkApp : public rex::ReXApp {
     ImGuiIO& io = ImGui::GetIO();
     // Keep the pointer's speed the same across and down: a menu unit is a
     // different number of pixels each way, depending on the window's shape.
-    if (io.DisplaySize.x > 0.0f && io.DisplaySize.y > 0.0f) {
-      menu_dy_scale_.store((io.DisplaySize.x / kMenuSpaceWidth) /
-                           (io.DisplaySize.y / kMenuSpaceHeight));
+    {
+      const PictureRect pic = PicturePixels(io);
+      if (pic.w > 0.0f && pic.h > 0.0f) {
+        menu_dy_scale_.store((pic.w / kMenuSpaceWidth) / (pic.h / kMenuSpaceHeight));
+      }
     }
     if (!menu_mouse_active_) return;
     const ImVec2 at = MenuCursorPixels(io);
@@ -1665,6 +1854,45 @@ class PerfectDarkApp : public rex::ReXApp {
                       hot ? 2.0f : 1.0f);
       }
     }
+  }
+
+  // Cutscenes: left click and the pad's A skip them too, as START (Enter, or
+  // the pad's START) does. In a cutscene g_Vars+1788 (the N64's in_cutscene)
+  // is set and the tick mode (g_Vars+1228) is 6; in play and in the pause menu
+  // they are 0 and 1, so there a click still fires and A does what it does.
+  // A press counts only if it starts during the cutscene (a click held from
+  // the menu that started the mission does not skip its intro). The title and
+  // its attract film have their own rule (TickMenuMouse).
+  static constexpr uint32_t kInCutscene = 0x82648BF8 + 1788;
+  static constexpr uint32_t kTickMode = 0x82648BF8 + 1228;
+  static constexpr uint32_t kTickModeCutscene = 6;
+  static void TickCutsceneSkip() {
+    PerfectDarkApp* app = current_instance_;
+    if (!app || !app->runtime() || !app->runtime()->memory()) return;
+    auto* mem = app->runtime()->memory();
+    static bool lmb_was_down = true, pad_a_was_down = true;
+    const uint32_t stage = ReadGuestU32(mem, kStageNum);
+    const bool cutscene = app->HasWindowFocus() && stage != kStageTitle && !menu_attract_ &&
+                          ReadGuestU32(mem, kInCutscene) != 0 &&
+                          ReadGuestU32(mem, kTickMode) == kTickModeCutscene;
+    if (!cutscene) {
+      lmb_was_down = pad_a_was_down = true;  // to count, a press starts in the cutscene
+      return;
+    }
+    const bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    bool pad_a = false;
+    for (DWORD i = 0; i < 4 && !pad_a; ++i) {
+      XINPUT_STATE state{};
+      pad_a = XInputGetState(i, &state) == ERROR_SUCCESS && (state.Gamepad.wButtons & XINPUT_GAMEPAD_A);
+    }
+    if ((lmb && !lmb_was_down) || (pad_a && !pad_a_was_down)) {
+      namespace mnk = rex::input::mnk;
+      mnk::MnkInputDriver::InjectButtons(0x0010, 90);   // X_INPUT_GAMEPAD_START
+      mnk::MnkInputDriver::InjectPadKeystroke(0x5814);  // pad START
+      REXLOG_INFO("[cutscene] {} skips (stage {})", lmb && !lmb_was_down ? "left click" : "pad A", stage);
+    }
+    lmb_was_down = lmb;
+    pad_a_was_down = pad_a;
   }
 
   // Runs once per drawn frame. One set of rules for every menu that goes
@@ -2506,6 +2734,9 @@ class PerfectDarkApp : public rex::ReXApp {
   // Upscaling row (HANDOVER 4an): its label and three values.
   static constexpr uint32_t kLblUpscaling = 0x82675290;
   static constexpr uint32_t kUpscalingStrings = 0x826752A0;  // 3 x 16
+  // Aspect Ratio row (HANDOVER 4ay): its label and two values.
+  static constexpr uint32_t kLblAspectRatio = 0x82675350;
+  static constexpr uint32_t kAspectStrings = 0x82675360;  // 2 x 16
   // Keyboard binding rows: label and value strings, 32-byte slots so a long
   // action name or a two-key bind ("2,WheelUp") fits.
   static constexpr uint32_t kBindRowStride = 32;
@@ -2526,6 +2757,7 @@ class PerfectDarkApp : public rex::ReXApp {
   static void PdLabelShowFps(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = kLblShowFps; }
   static void PdLabelRenderScale(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = kLblRenderScale; }
   static void PdLabelUpscaling(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = kLblUpscaling; }
+  static void PdLabelAspectRatio(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = kLblAspectRatio; }
   static void PdLabelGamepadControls(PPCContext& ctx, uint8_t*) {
     ctx.r3.u64 = kLblGamepadControls;
   }
@@ -3791,27 +4023,6 @@ class PerfectDarkApp : public rex::ReXApp {
     ctx.r3.u64 = ret;
   }
 
-  // TEMP_MENU_SCAN: overwrite a string in the game's table in place. Only works
-  // when the replacement is no longer than the original. Used for menu rows
-  // whose label must be a real text ID (see the note on type-0x04 items).
-  static int ReplaceGuestString(rex::memory::Memory* mem, const char* find, const char* repl) {
-    const size_t flen = strlen(find);
-    const size_t rlen = strlen(repl);
-    if (rlen > flen) return 0;
-    int patched = 0;
-    ForEachCommittedRegion(mem, [&](uint32_t region_addr, uint32_t region_size) {
-      uint8_t* host = mem->TranslateVirtual<uint8_t*>(region_addr);
-      if (!host || region_size < flen + 1) return;
-      for (size_t off = 0; off + flen + 1 <= region_size; ++off) {
-        if (memcmp(host + off, find, flen) == 0) {
-          memcpy(host + off, repl, rlen + 1);  // includes the NUL
-          ++patched;
-        }
-      }
-    });
-    return patched;
-  }
-
   // Replace a phrase *inside* a string in the game's table, keeping whatever
   // follows it. ReplaceGuestString writes its NUL at the end of the
   // replacement, so it throws away the rest of the sentence: renaming
@@ -4802,31 +5013,6 @@ class PerfectDarkApp : public rex::ReXApp {
     }
   }
 
-  // True once the game's text bank holds `find`. The Settings rows reuse two of
-  // its strings, so the menu patch has to wait until it is loaded. memchr keeps
-  // the sweep cheap, and it stops at the first hit.
-  static bool GuestStringPresent(rex::memory::Memory* mem, const char* find) {
-    const size_t flen = strlen(find);
-    bool found = false;
-    ForEachCommittedRegion(mem, [&](uint32_t region_addr, uint32_t region_size) {
-      if (found || region_size < flen) return;
-      uint8_t* host = mem->TranslateVirtual<uint8_t*>(region_addr);
-      if (!host) return;
-      const uint8_t* p = host;
-      const uint8_t* last = host + region_size - flen;
-      while (p <= last) {
-        p = static_cast<const uint8_t*>(memchr(p, find[0], size_t(last - p) + 1));
-        if (!p) break;
-        if (memcmp(p, find, flen) == 0) {
-          found = true;
-          return;
-        }
-        ++p;
-      }
-    });
-    return found;
-  }
-
   // Installs the native menu rows (Video Options and PC Controls) without the
   // player pressing F11. Polled from the UI thread about once a second until the
   // text bank is loaded, then patched exactly once.
@@ -4838,7 +5024,7 @@ class PerfectDarkApp : public rex::ReXApp {
     PerfectDarkApp* app = current_instance_;
     if (!app || !app->runtime() || !app->runtime()->memory()) return;
     ++checks;
-    if (!GuestStringPresent(app->runtime()->memory(), "Controller Pak Menu\n")) {
+    if (!TextTableLoaded(app->runtime()->memory())) {
       if (checks >= 180) {
         REXLOG_INFO("[menu_patch] text bank never appeared; PC menu rows not installed");
         done = true;
@@ -4884,7 +5070,7 @@ class PerfectDarkApp : public rex::ReXApp {
     if (!app || !app->runtime() || !app->runtime()->memory()) return;
     auto* mem = app->runtime()->memory();
     if (!started) {
-      if (!GuestStringPresent(mem, "Xbox LIVE Private Match")) {
+      if (!TextTableLoaded(mem)) {
         if (++checks >= 180) {
           REXLOG_INFO("[lobby] XBLA text bank never appeared; lobby labels left as they are");
           done = true;
@@ -4892,6 +5078,11 @@ class PerfectDarkApp : public rex::ReXApp {
         return;
       }
       started = true;
+      if (!GameTextIsEnglish()) {
+        OverrideLobbyLabels(mem);
+        done = true;
+        return;
+      }
     }
     static GuestSwap kLabels[] = {
         // How To Play. These quote the Match Type entries, so they have to be
@@ -4973,6 +5164,43 @@ class PerfectDarkApp : public rex::ReXApp {
     }
   }
 
+  // The same clean-up in French, German, Italian and Spanish, by text id: the
+  // whole-string entries above get the port's English wording, since what
+  // they name changed. The How To Play pages keep their translated text,
+  // Xbox LIVE mentions and all - they are long and only quote these names.
+  static void OverrideLobbyLabels(rex::memory::Memory* mem) {
+    static const struct {
+      uint32_t tid;
+      const char* text;
+    } kLabels[] = {
+        {0x8CC1, "Host Match"},
+        {0x8CC0, "Join Match"},
+        {0x8CE4, "Host a match others can join"},
+        {0x8CE3, "LAN or Direct Connect"},
+        {0x8CE2, "Split-screen with up to four players on one PC"},
+        {0x8CE5, "Split-screen with up to two players on one PC"},
+        {0x8CE6, "Co-operate with another player online"},
+        {0x8CE7, "Compete against another player online"},
+        {0x8CBE, "Join an online game"},
+        {0x8CD8, "%s is not allowed to play\nmultiplayer games online."},
+        {0x8CD9, "%s has no online profile,\nso cannot play multiplayer games online."},
+        {0x8C20, "Player"},  // "Gamertag"
+        {0x8C3C, "Player"},
+        {0x8C4C, "This PC"},  // "Friends"
+        {0x8C50, "No Scores On This Board Yet"},
+        {0x8C7C, "Local leaderboards"},
+        {0x8C7D, "Your scores are kept on this PC and are never sent anywhere."},
+        {0x8C64, "Invite Friends"},  // "Invite Xbox LIVE Party"
+        {0x8C65, "Player Info"},
+        {0x8C66, "View Player Info"},
+        {kSetupHudRowTid, "HUD Options\n"},
+    };
+    int done = 0;
+    for (const auto& l : kLabels) done += OverrideText(mem, l.tid, l.text) ? 1 : 0;
+    REXLOG_INFO("[lobby] {} of {} labels set by text id", done,
+                int(sizeof(kLabels) / sizeof(kLabels[0])));
+  }
+
   // Setup extra "100% story completion" (pd_story_complete): every solo
   // mission counts as completed on every difficulty. The game file keeps best
   // times as u16 seconds, 0 meaning not completed, in besttimes[21 stages][3
@@ -5018,7 +5246,8 @@ class PerfectDarkApp : public rex::ReXApp {
   // A string from the game's text table (sub_821886E8's lookup): bank
   // id >> 9, index id & 0x1FF, slot = bank start (u32s at 0x825F76A8) +
   // index; banks past 70 share bank 70's start + 512. 0 if not loaded.
-  static uint32_t GuestTextAddress(rex::memory::Memory* mem, uint32_t tid) {
+  // The guest address of the table entry for a text id, 0 if not loaded.
+  static uint32_t GuestTextSlot(rex::memory::Memory* mem, uint32_t tid) {
     constexpr uint32_t kBankStarts = 0x825F76A8;
     constexpr uint32_t kTablePtr = 0x825F77D0;
     const uint32_t bank = tid >> 9;
@@ -5027,26 +5256,71 @@ class PerfectDarkApp : public rex::ReXApp {
     const uint32_t slot = bank <= 70 ? ReadGuestU32(mem, kBankStarts + (bank - 1) * 4) + index
                                      : ReadGuestU32(mem, kBankStarts + 69 * 4) + 512 + index;
     const uint32_t table = ReadGuestU32(mem, kTablePtr);
-    const uint32_t ptr = table ? ReadGuestU32(mem, table + slot * 4) : 0;
-    return (ptr < 0x40000000 || ptr >= 0xA0000000) ? 0 : ptr;
+    if (table < 0x40000000 || table >= 0xA0000000) return 0;
+    return table + slot * 4;
   }
 
-  // Replaces a text-table string in place (the new text no longer than the
-  // old), found by its text id. ReplaceGuestString walks all of guest memory,
-  // about 0.45 s on the UI thread each time; five of them at start-up froze
-  // the window on the boot screens for over two seconds (HANDOVER 4aq). Falls
-  // back to the walk if the string is not where its id says.
-  static int ReplaceTextById(rex::memory::Memory* mem, uint32_t tid, const char* find,
-                             const char* repl) {
-    const uint32_t ptr = GuestTextAddress(mem, tid);
-    char* p = ptr ? mem->TranslateVirtual<char*>(ptr) : nullptr;
-    const size_t flen = std::strlen(find);
-    const size_t rlen = std::strlen(repl);
-    if (p && rlen <= flen && std::memcmp(p, find, flen) == 0) {
-      std::memcpy(p, repl, rlen + 1);  // includes the NUL
-      return 1;
+  // The string for a text id, 0 if not loaded. The game's strings are at
+  // 0x40000000 and up; OverrideText's are in the system heap (0x30000000 up).
+  static uint32_t GuestTextAddress(rex::memory::Memory* mem, uint32_t tid) {
+    const uint32_t slot = GuestTextSlot(mem, tid);
+    const uint32_t ptr = slot ? ReadGuestU32(mem, slot) : 0;
+    return (ptr < 0x30000000 || ptr >= 0xA0000000) ? 0 : ptr;
+  }
+
+  // True once the game's text is loaded: an N64-era menu string (0x56B8,
+  // "Display") and an XBLA one (0x8D47, "Show Crouch") both resolve. By text
+  // id, so it holds in every language (HANDOVER 4bb); neither id is one the
+  // port overrides.
+  static bool TextTableLoaded(rex::memory::Memory* mem) {
+    for (uint32_t tid : {0x56B8u, 0x8D47u}) {
+      const uint32_t ptr = GuestTextAddress(mem, tid);
+      if (!ptr || ReadGuestU8(mem, ptr) == 0) return false;
     }
-    return ReplaceGuestString(mem, find, repl);
+    return true;
+  }
+
+  // Text the port puts in place of the game's, by text id: the table entry is
+  // pointed at a string of our own in a guest heap block, so the new text can
+  // be any length and works whatever language the game loaded. The entries
+  // are checked again once a second (TickTextOverrides) in case the game ever
+  // refills the table.
+  struct TextOverride {
+    uint32_t tid;
+    uint32_t text;  // guest address of our string
+  };
+  static inline std::vector<TextOverride> text_overrides_;
+  static constexpr uint32_t kTextBlockSize = 4096;
+  static inline uint32_t text_block_ = 0;
+  static inline uint32_t text_block_used_ = 0;
+
+  static bool OverrideText(rex::memory::Memory* mem, uint32_t tid, const char* text) {
+    const uint32_t slot = GuestTextSlot(mem, tid);
+    if (!slot) return false;
+    const uint32_t size = uint32_t(std::strlen(text)) + 1;
+    if (!text_block_ || text_block_used_ + size > kTextBlockSize) {
+      text_block_ = mem->SystemHeapAlloc(kTextBlockSize);
+      text_block_used_ = 0;
+      if (!text_block_) return false;
+    }
+    const uint32_t at = text_block_ + text_block_used_;
+    text_block_used_ += (size + 3) & ~3u;
+    WriteGuestBytes(mem, at, text, size);  // with its NUL
+    WriteGuestU32(mem, slot, at);
+    text_overrides_.push_back({tid, at});
+    return true;
+  }
+
+  static void TickTextOverrides() {
+    static int frames = 0;
+    if (text_overrides_.empty() || ++frames % 60 != 0) return;
+    PerfectDarkApp* app = current_instance_;
+    if (!app || !app->runtime() || !app->runtime()->memory()) return;
+    auto* mem = app->runtime()->memory();
+    for (const TextOverride& o : text_overrides_) {
+      const uint32_t slot = GuestTextSlot(mem, o.tid);
+      if (slot && ReadGuestU32(mem, slot) != o.text) WriteGuestU32(mem, slot, o.text);
+    }
   }
 
   static std::string GuestText(rex::memory::Memory* mem, uint32_t tid) {
@@ -5112,9 +5386,7 @@ class PerfectDarkApp : public rex::ReXApp {
       // The game's own frames (its speed follows these) next to the frames
       // the window presented (the monitor's rate with vsync).
       static uint64_t guest_start = 0;
-      PerfectDarkApp* app = current_instance_;
-      auto* gs = (app && app->runtime()) ? app->runtime()->graphics_system() : nullptr;
-      const uint64_t guest_now = gs ? gs->guest_frame_count() : 0;
+      const uint64_t guest_now = GameFramesShown();
       const double guest_fps = guest_start ? double(guest_now - guest_start) / window : 0.0;
       guest_start = guest_now;
       REXLOG_INFO("[frame_stats] game {:.1f} fps; window {} frames in {:.1f} s: {:.1f} fps, "
@@ -5137,6 +5409,101 @@ class PerfectDarkApp : public rex::ReXApp {
     imgui_drawer_->AddDialog(new PerfectDarkMatchPicker(imgui_drawer_, this));
   }
   void OnMatchPickerClosed() { match_picker_open_ = false; }
+
+  // ---- Check for Updates (Settings, last row; HANDOVER 4bs) ------------------
+  // Only when the player asks: the row opens PerfectDarkUpdateDialog, which
+  // asks GitHub for the latest release (src/pd_update.h) on a worker thread.
+  // "Update now" starts the launcher with --update and ends the game, from the
+  // front end only (RestartIsSafe); the launcher downloads, verifies and
+  // installs the release and offers Play.
+  using UpdateState = PdUpdateState;
+  using UpdateStatus = PdUpdateStatus;
+  static inline std::mutex update_mutex_;
+  static inline UpdateStatus update_status_;
+  static inline std::atomic<bool> update_requested_{false};
+  static inline bool update_dialog_open_ = false;
+  // Test pipe (pd_test_pipe): dlgdown / dlgpress move and press in the box.
+  static inline std::atomic<bool> test_dialog_down_{false}, test_dialog_press_{false};
+
+  static UpdateStatus CurrentUpdateStatus() {
+    std::lock_guard<std::mutex> lock(update_mutex_);
+    return update_status_;
+  }
+
+  // The release folder's launcher (root\Perfect Dark.exe, two folders above
+  // resources\runtime\Perfect Dark.exe); empty outside the release layout.
+  static std::filesystem::path LauncherPath() {
+    wchar_t exe[32768] = {};
+    GetModuleFileNameW(nullptr, exe, 32768);
+    const std::filesystem::path runtime = std::filesystem::path(exe).parent_path();
+    if (_wcsicmp(runtime.filename().c_str(), L"runtime") != 0) return {};
+    const std::filesystem::path launcher = runtime.parent_path().parent_path() / L"Perfect Dark.exe";
+    std::error_code ec;
+    return std::filesystem::exists(launcher, ec) ? launcher : std::filesystem::path();
+  }
+
+  static void StartUpdateCheck() {
+    {
+      std::lock_guard<std::mutex> lock(update_mutex_);
+      update_status_ = UpdateStatus{};
+      update_status_.state = LauncherPath().empty() ? UpdateState::kNoLauncher : UpdateState::kChecking;
+      if (update_status_.state != UpdateState::kChecking) return;
+    }
+    std::thread([] {
+      pd::update::Release release;
+      std::string error;
+      const std::wstring agent = L"PerfectDark-XBLA-PC-Recomp/" + pd::update::Widen(PD_VERSION);
+      const bool ok = pd::update::LatestRelease(release, agent, error);
+      std::lock_guard<std::mutex> lock(update_mutex_);
+      if (update_status_.state != UpdateState::kChecking) return;  // closed meanwhile
+      update_status_.latest = release.version;
+      update_status_.size = release.zip_size;
+      update_status_.error = error;
+      update_status_.state = !ok ? UpdateState::kFailed
+                             : pd::update::CompareVersions(release.version, PD_VERSION) > 0 ? UpdateState::kAvailable
+                                                                                             : UpdateState::kUpToDate;
+      REXLOG_INFO("[update] latest release {} (this copy {}): {}", ok ? release.version : "?", PD_VERSION,
+                  ok ? (update_status_.state == UpdateState::kAvailable ? "newer" : "not newer") : error);
+    }).detach();
+  }
+
+  // Opens the launcher's update window and ends the game (as RestartGame does).
+  [[noreturn]] static void StartUpdater() {
+    const std::filesystem::path launcher = LauncherPath();
+    std::wstring command = L"\"" + launcher.wstring() + L"\" --update";
+    STARTUPINFOW startup = {sizeof(startup)};
+    PROCESS_INFORMATION process = {};
+    if (CreateProcessW(launcher.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                       launcher.parent_path().c_str(), &startup, &process)) {
+      AllowSetForegroundWindow(process.dwProcessId);
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+      REXLOG_INFO("[update] closing the game for the launcher's update");
+    } else {
+      REXLOG_ERROR("[update] could not start the launcher (error {})", GetLastError());
+    }
+    rex::FlushLogging();
+    TerminateProcess(GetCurrentProcess(), 0);
+    for (;;) {
+    }
+  }
+
+  static void PdCheckUpdatesHandler(PPCContext& ctx, uint8_t*) {
+    if (ctx.r3.u32 == 6) update_requested_ = true;  // op 6: pressed
+    ctx.r3.u64 = 0;
+  }
+
+  void TickUpdateDialog() {
+    if (!update_requested_.exchange(false) || !imgui_drawer_ || update_dialog_open_) return;
+    update_dialog_open_ = true;
+    StartUpdateCheck();
+    imgui_drawer_->AddDialog(new PerfectDarkUpdateDialog(imgui_drawer_, this));
+  }
+  void OnUpdateDialogClosed() {
+    update_dialog_open_ = false;
+    std::lock_guard<std::mutex> lock(update_mutex_);
+    update_status_.state = UpdateState::kIdle;
+  }
 
   // Shows the latest Private Match search message ("Looking for a Private
   // Match...", "No Private Match found...") at the top of the game window for
@@ -5165,7 +5532,7 @@ class PerfectDarkApp : public rex::ReXApp {
     }
     for (int vk : {VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_MENU,
                    VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN, VK_APPS, VK_SNAPSHOT, VK_F4, VK_F7,
-                   VK_F9}) {
+                   VK_F9, VK_F12}) {
       skip[vk] = true;
     }
     bool pressed = false;
@@ -5210,8 +5577,10 @@ class PerfectDarkApp : public rex::ReXApp {
     return 0;
   }
 
+  // English only: the other languages keep the game's own prompt (any key
+  // still starts the game).
   static void TickTitlePrompt() {
-    if (!menu_patched_) return;
+    if (!menu_patched_ || !GameTextIsEnglish()) return;
     static std::chrono::steady_clock::time_point next{};
     const auto now = std::chrono::steady_clock::now();
     if (now < next) return;
@@ -5330,6 +5699,248 @@ class PerfectDarkApp : public rex::ReXApp {
   // opens - so the label stayed up over the Institute (user, 2026-10-27). The
   // film is therefore the stage entered straight from the title stage, and
   // only that stage shows the label.
+  // Native renderer research only (branch native-renderer, never shipped): a
+  // test pipe. With pd_test_pipe = true, commands are read from test_cmd.txt
+  // beside the exe (one per line, the file is deleted once read) and run in
+  // order inside the game: buttons and sticks go through the input driver's own
+  // injection (pd_test_input.h: a driver of its own, which works without
+  // window focus), so nothing is sent to the desktop.
+  //   btn <a|b|x|y|start|back|up|down|left|right|lb|rb> [ms]
+  //   pbtn <pad 1-3> <button> [ms]  another pad's button (that pad reports connected from then)
+  //   stick <lx> <ly> <ms>      left stick, raw 16-bit values
+  //   wait <ms>
+  //   log <text>                a [test] line in the log (with the stage)
+  //   cvar <name> <value>
+  //   waitstage <n>             hold the queue until the stage number is n
+  //   shot <name>               the game's frame (as F12) to screenshots\<name>.png
+  //   wshot <name>              the window as painted (upscaling, aspect bars) to screenshots\w-<name>.png
+  //   poke <addr> <value>       write a guest u32 (hex)
+  //   peek <addr> <bytes> <tag> log guest memory as hex words (a test of what changes when)
+  //   watch <start> <end>       log writes to a guest range and the functions making them; unwatch stops
+  //   paint                     the presenter rereads present_effect and the like
+  //   res <w> <h>               resize the window; winmin / winrestore (never activates it)
+  //   full <on|off>             fullscreen, as Alt+Enter does it (not saved)
+  struct TestCmd {
+    std::string verb;
+    std::vector<std::string> args;
+  };
+  inline static std::deque<TestCmd> test_queue_;
+  inline static std::chrono::steady_clock::time_point test_next_{};
+  inline static std::chrono::steady_clock::time_point test_checked_{};
+
+  static void TickTestPipe() {
+    static const bool on = rex::cvar::GetFlagByName("pd_test_pipe") == "true";
+    if (!on) return;
+    PerfectDarkApp* app = current_instance_;
+    if (!app || !app->runtime() || !app->runtime()->memory()) return;
+    auto* mem = app->runtime()->memory();
+    pd::TestInputDriver::Install(app->runtime()->input_system());
+    const auto now = std::chrono::steady_clock::now();
+    if (now - test_checked_ > std::chrono::milliseconds(200)) {
+      test_checked_ = now;
+      wchar_t exe[32768] = {};
+      GetModuleFileNameW(nullptr, exe, 32768);
+      const std::filesystem::path path = std::filesystem::path(exe).parent_path() / "test_cmd.txt";
+      std::error_code ec;
+      if (std::filesystem::exists(path, ec)) {
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line)) {
+          std::istringstream words(line);
+          TestCmd cmd;
+          if (!(words >> cmd.verb)) continue;
+          std::string w;
+          while (words >> w) cmd.args.push_back(w);
+          test_queue_.push_back(std::move(cmd));
+        }
+        in.close();
+        std::filesystem::remove(path, ec);
+      }
+    }
+    while (!test_queue_.empty() && now >= test_next_) {
+      if (test_queue_.front().verb == "waitstage" && !test_queue_.front().args.empty() &&
+          ReadGuestU32(mem, kStageNum) != uint32_t(atoi(test_queue_.front().args[0].c_str())))
+        break;
+      const TestCmd c = std::move(test_queue_.front());
+      test_queue_.pop_front();
+      auto arg = [&](size_t i) { return i < c.args.size() ? c.args[i] : std::string(); };
+      auto num = [&](size_t i, int dflt) { return i < c.args.size() ? atoi(c.args[i].c_str()) : dflt; };
+      if (c.verb == "pbtn") {  // pbtn <pad 0-3> <button> [ms]: another pad (it connects then)
+        static const std::map<std::string, std::pair<uint16_t, uint16_t>> kPadButtons = {
+            {"a", {0x1000, 0x5800}},     {"b", {0x2000, 0x5801}},    {"x", {0x4000, 0x5802}},
+            {"y", {0x8000, 0x5803}},     {"start", {0x0010, 0x5814}}, {"back", {0x0020, 0x5815}},
+            {"up", {0x0001, 0x5810}},    {"down", {0x0002, 0x5811}}, {"left", {0x0004, 0x5812}},
+            {"right", {0x0008, 0x5813}}, {"lb", {0x0100, 0x5805}},   {"rb", {0x0200, 0x5804}}};
+        const uint32_t pad = uint32_t(num(0, 1)) & 3;
+        const auto it = kPadButtons.find(arg(1));
+        const int ms = num(2, 120);
+        pd::TestInputDriver::Connect(pad);
+        if (it != kPadButtons.end()) {
+          pd::TestInputDriver::Buttons(it->second.first, ms, pad);
+          pd::TestInputDriver::Keystroke(it->second.second, pad);
+        }
+        test_next_ = now + std::chrono::milliseconds(ms + 350);
+      } else if (c.verb == "btn") {
+        static const std::map<std::string, std::pair<uint16_t, uint16_t>> kButtons = {
+            {"a", {0x1000, 0x5800}},     {"b", {0x2000, 0x5801}},    {"x", {0x4000, 0x5802}},
+            {"y", {0x8000, 0x5803}},     {"start", {0x0010, 0x5814}}, {"back", {0x0020, 0x5815}},
+            {"up", {0x0001, 0x5810}},    {"down", {0x0002, 0x5811}}, {"left", {0x0004, 0x5812}},
+            {"right", {0x0008, 0x5813}}, {"lb", {0x0100, 0x5805}},   {"rb", {0x0200, 0x5804}}};
+        const auto it = kButtons.find(arg(0));
+        const int ms = num(1, 120);
+        if (it != kButtons.end()) {
+          pd::TestInputDriver::Buttons(it->second.first, ms);
+          pd::TestInputDriver::Keystroke(it->second.second);
+        }
+        test_next_ = now + std::chrono::milliseconds(ms + 350);
+      } else if (c.verb == "stick") {
+        const int ms = num(2, 100);
+        pd::TestInputDriver::Stick(int16_t(num(0, 0)), int16_t(num(1, 0)), ms);
+        test_next_ = now + std::chrono::milliseconds(ms);
+      } else if (c.verb == "rstick") {  // rstick <x> <y> <ms>: the right stick
+        const int ms = num(2, 100);
+        pd::TestInputDriver::RightStick(int16_t(num(0, 0)), int16_t(num(1, 0)), ms);
+        test_next_ = now + std::chrono::milliseconds(ms);
+      } else if (c.verb == "trig") {  // trig <left 0-255> <right 0-255> <ms>: held, no wait
+        pd::TestInputDriver::Triggers(uint8_t(num(0, 0)), uint8_t(num(1, 0)), num(2, 100));
+      } else if (c.verb == "wait") {
+        test_next_ = now + std::chrono::milliseconds(num(0, 100));
+      } else if (c.verb == "cvar") {
+        rex::cvar::SetFlagByName(arg(0), arg(1));
+        REXLOG_INFO("[test] cvar {} = {}", arg(0), rex::cvar::GetFlagByName(arg(0)));
+      } else if (c.verb == "shot") {
+        auto* graphics = ConcreteGraphics();
+        rex::ui::RawImage image;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (graphics && graphics->presenter() && graphics->presenter()->CaptureGuestOutput(image) && image.width) {
+          const double capture_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+          const std::filesystem::path folder =
+              std::filesystem::path(app->config_path()).parent_path() / "screenshots";
+          std::error_code ec;
+          std::filesystem::create_directories(folder, ec);
+          const std::filesystem::path path = folder / (arg(0) + ".png");
+          std::thread([image = std::move(image), path]() {
+            const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+            WritePng(path, image);
+            if (com) CoUninitialize();
+          }).detach();
+          REXLOG_INFO("[test] shot {} (stage {}), capture {:.1f} ms", arg(0), ReadGuestU32(mem, kStageNum), capture_ms);
+        } else {
+          REXLOG_INFO("[test] shot {}: no frame", arg(0));
+        }
+      } else if (c.verb == "poke") {  // poke <addr> <value>: a guest u32, both hex (cheat masks)
+        const uint32_t addr = uint32_t(std::strtoul(arg(0).c_str(), nullptr, 16));
+        const uint32_t value = uint32_t(std::strtoul(arg(1).c_str(), nullptr, 16));
+        WriteGuestU32(mem, addr, value);
+        REXLOG_INFO("[test] poke {:08X} = {:08X}", addr, value);
+      } else if (c.verb == "watch") {  // watch <start> <end>: log guest writes there (hex), and who made them
+        pd_watch::ArmMemoryWriteWatchRange(mem, uint32_t(std::strtoul(arg(0).c_str(), nullptr, 16)),
+                                           uint32_t(std::strtoul(arg(1).c_str(), nullptr, 16)));
+      } else if (c.verb == "watchfind") {  // watchfind <hex bytes> <span>: watch [match, match+span) for up to 4 matches
+        WatchPattern(arg(0), uint32_t(std::strtoul(arg(1).c_str(), nullptr, 0)));
+      } else if (c.verb == "unwatch") {  // stop, and list the writers
+        pd_watch::DisarmMemoryWriteWatch();
+      } else if (c.verb == "memdump") {  // memdump <n>: the lighting capture's memory snapshot, mem-<n>.bin
+        const auto t0 = std::chrono::steady_clock::now();
+        DumpGuestMemory(std::atoi(arg(0).c_str()));
+        REXLOG_INFO("[test] memdump took {:.0f} ms",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+      } else if (c.verb == "peek" || c.verb == "peekp") {  // peek <addr> <bytes> <tag>: guest words
+        // to the log, hex; peekp <pointer> <bytes> <tag> starts where the pointer points
+        uint32_t addr = uint32_t(std::strtoul(arg(0).c_str(), nullptr, 16));
+        if (c.verb == "peekp") addr = ReadGuestU32(mem, addr);
+        const uint32_t bytes = std::min<uint32_t>(uint32_t(std::strtoul(arg(1).c_str(), nullptr, 0)), 0x4000);
+        for (uint32_t off = 0; off < bytes; off += 32) {
+          std::string line;
+          for (uint32_t w = 0; w < 32 && off + w < bytes; w += 4) line += fmt::format(" {:08X}", ReadGuestU32(mem, addr + off + w));
+          REXLOG_INFO("[test] peek {} {:08X}:{}", arg(2), addr + off, line);
+        }
+      } else if (c.verb == "dlgdown" || c.verb == "dlgpress") {  // the Check for Updates box (its keys are real input)
+        (c.verb == "dlgdown" ? test_dialog_down_ : test_dialog_press_) = true;
+        REXLOG_INFO("[test] {}", c.verb);
+      } else if (c.verb == "paint") {  // after "cvar present_effect ...": the presenter rereads it
+        app->app_context().CallInUIThreadDeferred([]() {
+          auto* graphics = ConcreteGraphics();
+          if (graphics && graphics->presenter()) graphics->presenter()->ReloadGuestOutputPaintConfigFromCVarsFromUIThread();
+        });
+        REXLOG_INFO("[test] paint config reloaded");
+      } else if (c.verb == "res") {  // res <w> <h>: the window's size, as the Resolution row sets it
+        const int w = num(0, 1280), h = num(1, 720);
+        app->app_context().CallInUIThreadDeferred([app, w, h]() {
+          if (app->window()) static_cast<rex::ui::WindowSDL*>(app->window())->SetLogicalSize(w, h);
+        });
+        REXLOG_INFO("[test] window {}x{}", w, h);
+      } else if (c.verb == "winmin" || c.verb == "winrestore") {  // never activates the window
+        HWND hwnd = app->window() ? static_cast<HWND>(app->window()->GetNativeWindowHandle()) : nullptr;
+        if (hwnd) ShowWindowAsync(hwnd, c.verb == "winmin" ? SW_SHOWMINNOACTIVE : SW_SHOWNOACTIVATE);
+        REXLOG_INFO("[test] {} (window {} the foreground)", c.verb,
+                    hwnd && GetForegroundWindow() == hwnd ? "is" : "is not");
+      } else if (c.verb == "full") {  // full <on|off>: the window's own toggle, the cvar left alone
+        const bool full = arg(0) != "off";
+        app->app_context().CallInUIThreadDeferred([app, full]() {
+          if (!app->window()) return;
+          app->window()->SetFullscreen(full);
+          RECT r{};
+          GetClientRect(static_cast<HWND>(app->window()->GetNativeWindowHandle()), &r);
+          REXLOG_INFO("[test] fullscreen {}: client {}x{}", full ? "on" : "off", r.right, r.bottom);
+        });
+      } else if (c.verb == "wshot") {  // wshot <name>: the window as painted (upscaling, bars)
+        HWND hwnd = app->window() ? static_cast<HWND>(app->window()->GetNativeWindowHandle()) : nullptr;
+        const std::filesystem::path folder = std::filesystem::path(app->config_path()).parent_path() / "screenshots";
+        const std::string name = arg(0);
+        std::thread([hwnd, folder, name]() {
+          RECT rc{};
+          if (!hwnd || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) {
+            REXLOG_WARN("[test] wshot {}: no window", name);
+            return;
+          }
+          const int w = rc.right, h = rc.bottom;
+          HDC screen = GetDC(nullptr);
+          HDC dc = CreateCompatibleDC(screen);
+          HBITMAP bmp = CreateCompatibleBitmap(screen, w, h);
+          HGDIOBJ old = SelectObject(dc, bmp);
+          constexpr UINT kClientOnly = 0x1, kRenderFullContent = 0x2;  // PW_*: flip-model swap chains too
+          const bool printed = PrintWindow(hwnd, dc, kClientOnly | kRenderFullContent);
+          SelectObject(dc, old);
+          rex::ui::RawImage image;
+          image.width = uint32_t(w);
+          image.height = uint32_t(h);
+          image.stride = size_t(w) * 4;
+          image.data.resize(image.stride * size_t(h));
+          BITMAPINFO bi{};
+          bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+          bi.bmiHeader.biWidth = w;
+          bi.bmiHeader.biHeight = -h;
+          bi.bmiHeader.biPlanes = 1;
+          bi.bmiHeader.biBitCount = 32;
+          bi.bmiHeader.biCompression = BI_RGB;
+          const bool got = printed && GetDIBits(dc, bmp, 0, UINT(h), image.data.data(), &bi, DIB_RGB_COLORS) == h;
+          DeleteObject(bmp);
+          DeleteDC(dc);
+          ReleaseDC(nullptr, screen);
+          if (!got) {
+            REXLOG_WARN("[test] wshot {}: PrintWindow failed", name);
+            return;
+          }
+          for (size_t i = 0; i < image.data.size(); i += 4) std::swap(image.data[i], image.data[i + 2]);  // BGRX -> RGBX
+          std::error_code ec;
+          std::filesystem::create_directories(folder, ec);
+          const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+          WritePng(folder / ("w-" + name + ".png"), image);
+          if (com) CoUninitialize();
+          REXLOG_INFO("[test] wshot {} {}x{}", name, w, h);
+        }).detach();
+      } else if (c.verb == "log") {
+        std::string text;
+        for (const auto& a : c.args) text += a + " ";
+        HWND hwnd = app->window() ? static_cast<HWND>(app->window()->GetNativeWindowHandle()) : nullptr;
+        REXLOG_INFO("[test] {}(stage {}{})", text, ReadGuestU32(mem, kStageNum),
+                    hwnd && GetForegroundWindow() == hwnd ? ", window in the foreground" : "");
+      }
+      if (test_next_ > now) break;
+    }
+  }
+
   static void DrawTitleVersion() {
     static bool in_film = false;
     static std::chrono::steady_clock::time_point film_start;
@@ -5363,9 +5974,10 @@ class PerfectDarkApp : public rex::ReXApp {
     const float fade = std::clamp((seconds - 1.0f) / 2.0f, 0.0f, 1.0f);
     if (fade <= 0.0f) return;
     ImGuiIO& io = ImGui::GetIO();
-    const float scale = io.DisplaySize.y / 720.0f;
+    const PictureRect pic = PicturePixels(io);  // inside the picture, not on a bar
+    const float scale = pic.h / 720.0f;
     const float size = 15.0f * scale;
-    const ImVec2 pos(16.0f * scale, io.DisplaySize.y - size - 14.0f * scale);
+    const ImVec2 pos(pic.x + 16.0f * scale, pic.y + pic.h - size - 14.0f * scale);
     ImGui::GetForegroundDrawList()->AddText(ImGui::GetFont(), size, pos,
                                             IM_COL32(255, 255, 255, static_cast<int>(90.0f * fade)),
                                             "v" PD_VERSION);
@@ -5612,8 +6224,10 @@ class PerfectDarkApp : public rex::ReXApp {
           {kRenderScaleRestartStrings + 2 * 32, "3x (requires restart)\n"},
           {kLblUpscaling, "Upscaling\n"},
           {kUpscalingStrings + 0 * 16, "Off\n"},
-          {kUpscalingStrings + 1 * 16, "Sharpen\n"},
-          {kUpscalingStrings + 2 * 16, "FSR\n"},
+          {kUpscalingStrings + 1 * 16, "FSR\n"},
+          {kLblAspectRatio, "Aspect Ratio\n"},
+          {kAspectStrings + 0 * 16, "16:9\n"},
+          {kAspectStrings + 1 * 16, "4:3\n"},
           {kLblGamepadControls, "Gamepad\n"},  // box is fixed-width; longer clips
           {kLblPcControls, "PC Controls\n"},
           {kLblMouseSens, "Mouse Sensitivity\n"},
@@ -5626,6 +6240,31 @@ class PerfectDarkApp : public rex::ReXApp {
       };
       for (const StrDef& d : kStrings) {
         WriteGuestBytes(mem, d.addr, d.text, strlen(d.text) + 1);
+      }
+      if (!color_strings_) color_strings_ = mem->SystemHeapAlloc(64 + kColorLevels * 16);
+      if (color_strings_) {
+        WriteGuestBytes(mem, color_strings_, "Vivid Colours\n", 15);
+        WriteGuestBytes(mem, color_strings_ + 32, "Black Level\n", 13);
+        for (int i = 0; i < kColorLevels; ++i) {
+          WriteGuestBytes(mem, color_strings_ + 64 + uint32_t(i) * 16, kColorLevelNames[i],
+                          strlen(kColorLevelNames[i]) + 1);
+        }
+      }
+      if (!sharp_strings_) sharp_strings_ = mem->SystemHeapAlloc(32 + kSharpLevels * 16);
+      if (sharp_strings_) {
+        WriteGuestBytes(mem, sharp_strings_, "Sharpness\n", 11);
+        for (int i = 0; i < kSharpLevels; ++i) {
+          WriteGuestBytes(mem, sharp_strings_ + 32 + uint32_t(i) * 16, kSharpLevelNames[i],
+                          strlen(kSharpLevelNames[i]) + 1);
+        }
+      }
+      if (!api_strings_) api_strings_ = mem->SystemHeapAlloc(64 + 2 * 32);
+      if (api_strings_) {
+        WriteGuestBytes(mem, api_strings_, "Graphics API\n", 14);
+        for (uint32_t i = 0; i < 2; ++i) {
+          WriteGuestBytes(mem, api_strings_ + 32 + i * 16, kApiNames[i], strlen(kApiNames[i]) + 1);
+          WriteGuestBytes(mem, api_strings_ + 64 + i * 32, kApiRestartNames[i], strlen(kApiRestartNames[i]) + 1);
+        }
       }
       if (!bind_label_strings_.load()) {
         bind_label_strings_ = mem->SystemHeapAlloc(kBindRowSlots * kBindRowStride);
@@ -5876,13 +6515,22 @@ class PerfectDarkApp : public rex::ReXApp {
       uint32_t label_addr;   // filled in below
       uint32_t handler_addr;
     };
+    // Settings > Graphics, top to bottom: the screen (window mode first, as
+    // resolution depends on it), the picture's sharpness in the order it is
+    // made (render, scale up, sharpen), colour, the FPS overlay, the API; the
+    // game's own rows follow (2-Player Screen Split moved to Display Options).
     RowDef rows[] = {
-        {"Resolution", &PdLabelResolution, &PdResolutionMenuHandler, 0, 0},
         {"Game Display", &PdLabelGameDisplay, &PdGameDisplayMenuHandler, 0, 0},
+        {"Resolution", &PdLabelResolution, &PdResolutionMenuHandler, 0, 0},
+        {"Aspect Ratio", &PdLabelAspectRatio, &PdAspectRatioMenuHandler, 0, 0},
         {"Vsync", &PdLabelVsync, &PdVsyncMenuHandler, 0, 0},
-        {"Show FPS", &PdLabelShowFps, &PdShowFpsMenuHandler, 0, 0},
         {"Render Scale", &PdLabelRenderScale, &PdRenderScaleMenuHandler, 0, 0},
         {"Upscaling", &PdLabelUpscaling, &PdUpscalingMenuHandler, 0, 0},
+        {"Sharpness", &PdLabelSharpness, &PdSharpnessMenuHandler, 0, 0},
+        {"Vivid Colours", &PdColorLabel<0>, &PdColorMenuHandler<0>, 0, 0},
+        {"Black Level", &PdColorLabel<1>, &PdColorMenuHandler<1>, 0, 0},
+        {"Show FPS", &PdLabelShowFps, &PdShowFpsMenuHandler, 0, 0},
+        {"Graphics API", &PdLabelApi, &PdApiMenuHandler, 0, 0},
     };
     for (RowDef& r : rows) {
       r.label_addr = fd->AllocateThunk(r.label_fn, 0);
@@ -5923,18 +6571,11 @@ class PerfectDarkApp : public rex::ReXApp {
         ++count;
       }
 
+      // Our rows first, then the game's own, in their own order.
       uint32_t dest = scratch;
-      for (int i = 0; i < count; ++i) {
-        for (int w = 0; w < 5; ++w) {
-          WriteGuestU32(mem, dest + i * 20 + w * 4,
-                        ReadGuestU32(mem, items + i * 20 + w * 4));
-        }
-      }
-
-      // Appended rows.
       int added = 0;
       for (const RowDef& r : rows) {
-        uint32_t ni = dest + (count + added) * 20;
+        uint32_t ni = dest + added * 20;
         WriteGuestU32(mem, ni + 0, kTypeSpinner << 24);
         WriteGuestU32(mem, ni + 4, 0);
         WriteGuestU32(mem, ni + 8, r.label_addr);
@@ -5942,6 +6583,27 @@ class PerfectDarkApp : public rex::ReXApp {
         WriteGuestU32(mem, ni + 16, r.handler_addr);
         ++added;
       }
+      // The game's "2-Player Screen Split" row moves to Display Options as
+      // "Screen Split" (AddLanguageRow; user's request 2026-11-06): kept aside
+      // here, not copied.
+      int kept = 0;
+      for (int i = 0; i < count; ++i) {
+        const uint32_t label = ReadGuestU32(mem, items + i * 20 + 8);
+        REXLOG_INFO("[menu_patch] dlg 0x{:08X}: game row {} label 0x{:08X}", dlg, i, label);
+        if (label == kScreenSplitLabelFn) {
+          if (!screen_split_found_) {
+            for (int w = 0; w < 5; ++w) screen_split_item_[w] = ReadGuestU32(mem, items + i * 20 + w * 4);
+            screen_split_found_ = true;
+          }
+          continue;
+        }
+        for (int w = 0; w < 5; ++w) {
+          WriteGuestU32(mem, dest + (added + kept) * 20 + w * 4,
+                        ReadGuestU32(mem, items + i * 20 + w * 4));
+        }
+        ++kept;
+      }
+      count = kept;
 
       // Terminator.
       uint32_t te = dest + (count + added) * 20;
@@ -5967,20 +6629,24 @@ class PerfectDarkApp : public rex::ReXApp {
       // type-0x0C spinners, it will not call a function pointer. Feeding it a
       // thunk address makes the game resolve some unrelated string ("Game ...")
       // and drop rows whose lookup fails, which is why the label thunks did not
-      // work here. So repurpose two N64-era strings that the XBLA build never
-      // shows; both are longer than the replacement, so they overwrite in place.
+      // work here. So repurpose N64-era text ids that the XBLA build never
+      // shows, pointing their table entries at our own labels (OverrideText).
       const uint32_t kGamepadTid = 0x566B;   // was "Controller Pak Menu"
       const uint32_t kPcCtrlTid = 0x5670;    // was "Controller Pak 1"
       const uint32_t kGraphicsTid = 0x5671;  // was "Controller Pak 2"
       const uint32_t kLayoutTid = 0x5672;    // was "Controller Pak 3"
       const uint32_t kInterfaceTid = 0x566D;  // was "Choose Controller Pak to Edit:"
-      REXLOG_INFO("[menu_patch] label strings replaced: {} {} {} {} {}",
-                  ReplaceTextById(mem, kGamepadTid, "Controller Pak Menu\n", "Gamepad Controls\n"),
-                  ReplaceTextById(mem, kPcCtrlTid, "Controller Pak 1\n", "Keyboard & Mouse\n"),
-                  ReplaceTextById(mem, kGraphicsTid, "Controller Pak 2\n", "Graphics\n"),
-                  ReplaceTextById(mem, kLayoutTid, "Controller Pak 3\n", "Button Layout\n"),
-                  ReplaceTextById(mem, kInterfaceTid, "Choose Controller Pak to Edit:\n",
-                                  "Display Interface\n"));
+      const uint32_t kUpdatesTid = 0x5673;    // was "Controller Pak 4"
+      REXLOG_INFO("[menu_patch] label strings replaced: {} {} {} {} {} {}",
+                  OverrideText(mem, kGamepadTid, "Gamepad Controls\n"),
+                  OverrideText(mem, kPcCtrlTid, "Keyboard & Mouse\n"),
+                  OverrideText(mem, kGraphicsTid, "Graphics\n"),
+                  OverrideText(mem, kLayoutTid, "Button Layout\n"),
+                  OverrideText(mem, kInterfaceTid, "Display Interface\n"),
+                  OverrideText(mem, kUpdatesTid, "Check for Updates\n"));
+      // Check for Updates: the last Settings row, a press row (no dialog flag)
+      // whose handler opens the update box (HANDOVER 4bs).
+      const uint32_t update_handler = fd->AllocateThunk(&PdCheckUpdatesHandler, 0);
       const uint32_t kTypeSubmenu = 0x04;
 
       uint32_t lbl_gamepad = fd->AllocateThunk(&PdLabelGamepadControls, 0);
@@ -6188,6 +6854,7 @@ class PerfectDarkApp : public rex::ReXApp {
               built.push_back(row);
             }
             for (int i : others) built.push_back(rows[i]);
+            if (update_handler) built.push_back({kTypeSubmenu << 24, 0, kUpdatesTid, ctrl_param3, update_handler});
             for (int i = visible; i < count; ++i) built.push_back(rows[i]);
 
             const int out = int(built.size());
@@ -6232,6 +6899,7 @@ class PerfectDarkApp : public rex::ReXApp {
     }
     RemoveDeadConsoleRows();
     ArrangeControlsMenus();
+    AddLanguageRow();
     REXLOG_INFO("[menu_patch] done - now open Settings > Video");
   }
 
@@ -6521,7 +7189,18 @@ class PerfectDarkApp : public rex::ReXApp {
                                                        ? std::string("1")
                                                        : config_resolution_scale_);
     }
+    // A Language chosen during a mission is written for the next start but not
+    // set under the running game (see "Language").
+    if (pending_language_) {
+      rex::cvar::SetFlagByName("user_language", std::to_string(pending_language_));
+    }
+    // Plume's gpu = d3d12 / vulkan is this run's, not the player's: the file keeps theirs.
+    if (gpu_forced_) rex::cvar::SetFlagByName("gpu", config_gpu_);
     rex::cvar::SaveConfig(app->config_path());
+    if (gpu_forced_) rex::cvar::SetFlagByName("gpu", forced_gpu_);
+    if (pending_language_) {
+      rex::cvar::SetFlagByName("user_language", std::to_string(running_language_));
+    }
     if (render_scale_set_) rex::cvar::SetFlagByName("resolution_scale", running_scale);
     if (built_in) rex::cvar::SetFlagByName("net_relay_server", relay);
   }
@@ -6541,6 +7220,10 @@ class PerfectDarkApp : public rex::ReXApp {
   static inline bool render_scale_set_ = false;        // this run chose resolution_scale
   static inline int running_render_scale_ = 0;         // what this run renders at
   static inline int pending_render_scale_index_ = -1;  // chosen, applies next start
+  static inline int running_renderer_ = 0;             // 0 Plume, 1 Classic, this run
+  static inline std::string config_gpu_;               // the player's gpu setting
+  static inline bool gpu_forced_ = false;              // this run set gpu for Plume ...
+  static inline std::string forced_gpu_;               // ... to this (d3d12 or vulkan)
 
   struct GpuForScale {
     bool known = false;
@@ -6701,6 +7384,67 @@ class PerfectDarkApp : public rex::ReXApp {
                        v.dwMinorVersion, v.dwBuildNumber, ubr);
   }
 
+  // Windows settings that change frame pacing (issue #1), from the registry:
+  // hardware-accelerated GPU scheduling, the power plan and Game Mode.
+  static std::string WindowsPacingText() {
+    auto dword = [](HKEY root, const wchar_t* key, const wchar_t* name, DWORD* out) {
+      DWORD size = sizeof(*out);
+      return RegGetValueW(root, key, name, RRF_RT_REG_DWORD, nullptr, out, &size) == ERROR_SUCCESS;
+    };
+    DWORD value = 0;
+    std::string hags = "not set";
+    if (dword(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+              L"HwSchMode", &value)) {
+      hags = value == 2 ? "on" : value == 1 ? "off" : fmt::format("{}", value);
+    }
+    std::string plan = "unknown";
+    wchar_t guid[64] = {};
+    DWORD size = sizeof(guid);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                     L"SYSTEM\\CurrentControlSet\\Control\\Power\\User\\PowerSchemes",
+                     L"ActivePowerScheme", RRF_RT_REG_SZ, nullptr, guid, &size) == ERROR_SUCCESS) {
+      std::string id = Utf8(guid);
+      for (auto& c : id) c = char(std::tolower(static_cast<unsigned char>(c)));
+      plan = id == "381b4222-f694-41f0-9685-ff5bb260df2e"   ? "Balanced"
+             : id == "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c" ? "High performance"
+             : id == "e9a42b02-d5df-448d-aa00-03f14749eb61" ? "Ultimate Performance"
+             : id == "a1841308-3541-4fab-bc81-f71556f20b4a" ? "Power saver"
+                                                            : "custom " + id;
+    }
+    std::string game_mode = "default (on)";
+    if (dword(HKEY_CURRENT_USER, L"Software\\Microsoft\\GameBar", L"AutoGameModeEnabled", &value)) {
+      game_mode = value ? "on" : "off";
+    }
+    // The system timer now (100 ns units): plain Sleep(1) lasts this long or more.
+    std::string timer = "unknown";
+    using NtQueryTimerResolutionFn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
+    if (HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll")) {
+      if (auto query = reinterpret_cast<NtQueryTimerResolutionFn>(
+              ::GetProcAddress(ntdll, "NtQueryTimerResolution"))) {
+        ULONG coarsest = 0, finest = 0, current = 0;
+        if (query(&coarsest, &finest, &current) == 0) {
+          timer = fmt::format("{:.3f} ms (finest {:.3f})", current / 10000.0, finest / 10000.0);
+        }
+      }
+    }
+    return fmt::format("hardware GPU scheduling {}, power plan {}, Game Mode {}, timer {}", hags,
+                       plan, game_mode, timer);
+  }
+
+  // What this run was started with after the exe (a tester .bat's settings).
+  static std::string CommandLineArgsText() {
+    const wchar_t* p = GetCommandLineW();
+    if (*p == L'"') {
+      ++p;
+      while (*p && *p != L'"') ++p;
+      if (*p) ++p;
+    } else {
+      while (*p && *p != L' ' && *p != L'\t') ++p;
+    }
+    while (*p == L' ' || *p == L'\t') ++p;
+    return Utf8(p);
+  }
+
   static std::string CpuText() {
     int regs[4] = {};
     char brand[49] = {};
@@ -6790,6 +7534,10 @@ class PerfectDarkApp : public rex::ReXApp {
                   gpu.driver.empty() ? "unknown" : gpu.driver);
     }
     for (const auto& line : DisplayLines()) REXLOG_INFO("[system] {}", line);
+    REXLOG_INFO("[system] {}", WindowsPacingText());
+    if (const std::string args = CommandLineArgsText(); !args.empty()) {
+      REXLOG_INFO("[system] started with: {}", args);
+    }
     auto flag = [](const char* name) { return rex::cvar::GetFlagByName(name); };
     REXLOG_INFO("[system] settings: gpu {}, fullscreen {}, vsync {}, render scale {}x, "
                 "upscaling {}, smooth game clock {}",
@@ -6831,7 +7579,41 @@ class PerfectDarkApp : public rex::ReXApp {
   void OnPreSetup(rex::RuntimeConfig& config) override {
     (void)config;
     PdInstallCrashReport();
+    // A test build (its version contains "test") is for one bug report: the
+    // detailed log is always on and the pacing experiment always off, whatever
+    // perfect_dark.toml says, so the player only has to play and send the log.
+    if (std::string_view(PD_VERSION).find("test") != std::string_view::npos) {
+      rex::cvar::SetFlagByName("diagnostics", "true");
+      rex::cvar::SetFlagByName("present_pace_to_guest_vblank", "false");
+      REXLOG_INFO("[system] test build: diagnostics on, paced presentation off");
+    }
+    PdPreferPerformanceCores();
+    // Plume (pd_native_gpu.cpp) shares its frames with the SDK presenter's
+    // device, so the Xenos plugin starts on Plume's API: Direct3D 12, or
+    // Vulkan with gpu_native_api = vulkan. The player's own gpu setting is kept
+    // for the file (SavePcSettings) and for Classic.
+    running_renderer_ = RendererChoice();
+    config_gpu_ = rex::cvar::GetFlagByName("gpu");
+    if (running_renderer_ == 0) {
+      forced_gpu_ = ApiChoice() == 1 ? "vulkan" : "d3d12";
+      std::string why;
+      if (forced_gpu_ == "vulkan" && !pd::native_vk::VulkanUsable(why)) {
+        // (The setting stays Vulkan: Settings > Graphics shows it as waiting.)
+        REXLOG_WARN("[native] Graphics API Vulkan cannot run here ({}): using DirectX 12", why);
+        forced_gpu_ = "d3d12";
+      }
+      running_api_index_ = forced_gpu_ == "vulkan" ? 1 : 0;
+      rex::cvar::SetFlagByName("gpu", forced_gpu_);
+      gpu_forced_ = true;
+      REXLOG_INFO("[native] renderer Plume: gpu = {} (setting {})", forced_gpu_, config_gpu_);
+    } else {
+      REXLOG_INFO("[native] renderer Classic: gpu = {}", config_gpu_);
+    }
+    SyncPresentAspect();
     config_resolution_scale_ = ReadConfigResolutionScale(config_path());
+    running_language_ = ConfiguredLanguage();
+    REXLOG_INFO("[system] game text language {}{}", running_language_,
+                GameTextIsEnglish() ? " (English)" : "");
     running_render_scale_ = RenderScaleChoice();
     rex::cvar::SetFlagByName("resolution_scale", std::to_string(running_render_scale_));
     render_scale_set_ = true;
@@ -6840,7 +7622,7 @@ class PerfectDarkApp : public rex::ReXApp {
 
   // Front end (title, attract film, the Institute's menus) with no networked
   // match: restarting loses nothing there.
-  static bool RenderScaleRestartIsSafe() {
+  static bool RestartIsSafe() {
     namespace netplay = rex::kernel::xam::netplay;
     if (netplay::IsHostingSession() || netplay::IsJoinedSession()) return false;
     PerfectDarkApp* app = current_instance_;
@@ -6852,7 +7634,7 @@ class PerfectDarkApp : public rex::ReXApp {
 
   // Starts a fresh copy of the game with the same command line and ends this
   // one at once (a normal shutdown can stall and leave the old window up).
-  [[noreturn]] static void RestartGame() {
+  [[noreturn]] static void RestartGame(const char* setting) {
     wchar_t exe[32768] = {};
     GetModuleFileNameW(nullptr, exe, 32768);
     std::wstring command = GetCommandLineW();
@@ -6864,10 +7646,10 @@ class PerfectDarkApp : public rex::ReXApp {
       AllowSetForegroundWindow(process.dwProcessId);
       CloseHandle(process.hThread);
       CloseHandle(process.hProcess);
-      REXLOG_INFO("[render_scale] restarting to apply the new Render Scale");
+      REXLOG_INFO("[system] restarting to apply the new {}", setting);
     } else {
-      REXLOG_ERROR("[render_scale] could not restart (error {}); applies next start",
-                   GetLastError());
+      REXLOG_ERROR("[system] could not restart (error {}); {} applies next start",
+                   GetLastError(), setting);
     }
     TerminateProcess(GetCurrentProcess(), 0);
     for (;;) {
@@ -6885,34 +7667,332 @@ class PerfectDarkApp : public rex::ReXApp {
       pending_render_scale_index_ = -1;
       return;
     }
-    if (RenderScaleRestartIsSafe()) {
-      RestartGame();
+    if (RestartIsSafe()) {
+      RestartGame("Render Scale");
     }
     pending_render_scale_index_ = index;
     rex::kernel::xam::netplay::ShowNotice(
         "Render Scale changes the next time the game starts.");
   }
 
-  // ---- Upscaling (Settings > Video; HANDOVER 4an) ----------------------------
-  // How the rendered picture is scaled to the window: Off (bilinear, the
-  // original look), Sharpen (AMD CAS: contrast-adaptive sharpening, and its
-  // own resampling when the sizes differ) or FSR (AMD FSR 1: edge-adaptive
-  // upscaling plus sharpening). FSR is the one that matters with Render Scale
-  // 1x on a large screen; with the picture already at the window's size it
-  // only sharpens. present_effect in the SDK; applied at once.
-  static int UpscalingIndex() {
-    const std::string effect = rex::cvar::GetFlagByName("present_effect");
-    if (effect == "cas") return 1;
-    if (effect == "fsr") return 2;
-    return 0;
+  // ---- Renderer (HANDOVER 4bk, 4bq) -------------------------------------------
+  // Plume (the native Direct3D 12 renderer, gpu_native, the default since
+  // 0.9.0a) or Classic (the emulated Xbox 360 GPU, on gpu = auto/d3d12/vulkan),
+  // read once at start. There is no menu row for it: Classic stays a
+  // perfect_dark.toml fallback (gpu_native = false), as in the GoldenEye port.
+  static int RendererChoice() { return rex::cvar::GetFlagByName("gpu_native") == "true" ? 0 : 1; }
+
+  // ---- Graphics API (Settings > Graphics; HANDOVER 4br) ----------------------
+  // Plume draws with DirectX 12 (gpu_native_api = auto, the default) or Vulkan
+  // (vulkan), read once at start (OnPreSetup also starts the presenter on it).
+  // Like Render Scale, a change restarts the game from the front end, or waits
+  // for the next start during a mission; the other choice reads "(requires
+  // restart)". A Vulkan choice that cannot run on this PC (VulkanUsable) runs
+  // DirectX 12 and keeps showing Vulkan as waiting. Classic (gpu_native =
+  // false) ignores it.
+  static inline uint32_t api_strings_ = 0;  // guest: label (32), 2 values (16 each), 2 restart values (32 each)
+  static inline int running_api_index_ = 0;  // 0 DirectX 12, 1 Vulkan, this run
+  static inline int pending_api_index_ = -1;
+  static constexpr const char* kApiNames[2] = {"DirectX 12\n", "Vulkan\n"};
+  static constexpr const char* kApiRestartNames[2] = {"DirectX 12 (requires restart)\n", "Vulkan (requires restart)\n"};
+  static int ApiChoice() { return rex::cvar::GetFlagByName("gpu_native_api") == "vulkan" ? 1 : 0; }
+
+  static void ApplyApiIndex(int index) {
+    if (index < 0 || index > 1) return;
+    rex::cvar::SetFlagByName("gpu_native_api", index ? "vulkan" : "auto");
+    SavePcSettings();
+    if (index == running_api_index_ || running_renderer_ != 0) {
+      pending_api_index_ = -1;
+      return;
+    }
+    if (RestartIsSafe()) {
+      RestartGame("Graphics API");
+    }
+    pending_api_index_ = index;
+    rex::kernel::xam::netplay::ShowNotice("Graphics API changes the next time the game starts.");
   }
 
-  static void ApplyUpscalingIndex(int index) {
-    static const char* const kEffects[] = {"bilinear", "cas", "fsr"};
-    if (index < 0 || index > 2 || index == UpscalingIndex()) return;
-    rex::cvar::SetFlagByName("present_effect", kEffects[index]);
+  static void PdLabelApi(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = api_strings_; }
+
+  // Same op protocol as PdResolutionMenuHandler.
+  static void PdApiMenuHandler(PPCContext& ctx, uint8_t* /*base*/) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t op = ctx.r3.u32;
+    const uint32_t data = ctx.r5.u32;
+    uint32_t ret = 0;
+    switch (op) {
+      case 1:
+        if (mem) WriteGuestU32(mem, data, 2);
+        break;
+      case 3: {
+        uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        if (i > 1) i = 0;
+        ret = int(i) == running_api_index_ || running_renderer_ != 0 ? api_strings_ + 32 + i * 16
+                                                                     : api_strings_ + 64 + i * 32;
+        break;
+      }
+      case 6: {
+        uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        if (i > 1) i = 0;
+        ApplyApiIndex(int(i));
+        break;
+      }
+      case 7:
+        if (mem) WriteGuestU32(mem, data, uint32_t(pending_api_index_ >= 0 ? pending_api_index_ : ApiChoice()));
+        break;
+      default:
+        break;
+    }
+    ctx.r3.u64 = ret;
+  }
+
+  // ---- Language (Settings > Display; HANDOVER 4bb) ---------------------------
+  // The game carries English, French, German, Italian and Spanish text (and
+  // Japanese, not offered: its font is untested) and picks one at start-up
+  // from the console's language setting, which the SDK answers from
+  // user_language (1 English, 3 German, 4 French, 5 Spanish, 6 Italian). The
+  // game reads it again in many places while it runs, so the setting is
+  // never changed under a running game: a new choice restarts the game from
+  // the front end, or during a mission waits for the next start (it is only
+  // written to perfect_dark.toml, see SavePcSettings). The port's own labels
+  // stay in English. Names are Windows-1252, as the game's text is.
+  struct LanguageChoice {
+    uint32_t id;
+    const char* name;
+  };
+  static constexpr LanguageChoice kLanguages[] = {
+      {1, "English\n"},  {4, "Fran\xE7" "ais\n"}, {3, "Deutsch\n"},
+      {6, "Italiano\n"}, {5, "Espa\xF1" "ol\n"},
+  };
+  static constexpr int kLanguageCount = int(sizeof(kLanguages) / sizeof(kLanguages[0]));
+  static inline uint32_t running_language_ = 1;   // what this run's text is in
+  static inline uint32_t pending_language_ = 0;   // chosen, applies next start (0 none)
+  static inline uint32_t language_strings_ = 0;   // guest: label, then the names (16 bytes each)
+  static inline uint32_t camera_bob_label_ = 0;   // guest: "Camera Bob"
+
+  // Camera Bob (pd_view_bob, src/main.cpp PdViewBobHold): Off holds the camera
+  // level and steady while walking. Saved only when off (SaveConfig skips defaults).
+  static void PdLabelCameraBob(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = camera_bob_label_; }
+  static bool GetPcCameraBob() { return REXCVAR_GET(pd_view_bob); }
+  static void SetPcCameraBob(bool enabled) {
+    if (rex::cvar::SetFlagByName("pd_view_bob", enabled ? "true" : "false")) SavePcSettings();
+  }
+  static void PdCameraBobMenuHandler(PPCContext& ctx, uint8_t*) {
+    PdTwoStateHandler(ctx, kStrOff, kStrOn, &GetPcCameraBob, &SetPcCameraBob);
+  }
+
+  // The game falls back to English for anything but 2-6 (sub_8226CA60).
+  static bool GameTextIsEnglish() { return running_language_ < 2 || running_language_ > 6; }
+
+  static uint32_t ConfiguredLanguage() {
+    const std::string v = rex::cvar::GetFlagByName("user_language");
+    return v.empty() ? 1u : uint32_t(std::strtoul(v.c_str(), nullptr, 10));
+  }
+
+  static int LanguageIndex(uint32_t id) {
+    for (int i = 0; i < kLanguageCount; ++i) {
+      if (kLanguages[i].id == id) return i;
+    }
+    return 0;  // Japanese or anything else set by hand shows as English
+  }
+
+  static void ApplyLanguageIndex(int index) {
+    if (index < 0 || index >= kLanguageCount) return;
+    const uint32_t id = kLanguages[index].id;
+    if (id == running_language_) {
+      pending_language_ = 0;
+      SavePcSettings();
+      return;
+    }
+    pending_language_ = id;
     SavePcSettings();
-    REXLOG_INFO("[upscaling] present_effect = {}", kEffects[index]);
+    if (RestartIsSafe()) RestartGame("Language");
+    rex::kernel::xam::netplay::ShowNotice("Language changes the next time the game starts.");
+  }
+
+  // Same op protocol as PdResolutionMenuHandler.
+  static void PdLabelLanguage(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = language_strings_; }
+  static void PdLanguageMenuHandler(PPCContext& ctx, uint8_t* /*base*/) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t op = ctx.r3.u32;
+    const uint32_t data = ctx.r5.u32;
+    uint32_t ret = 0;
+    switch (op) {
+      case 1:
+        if (mem) WriteGuestU32(mem, data, uint32_t(kLanguageCount));
+        break;
+      case 3: {
+        uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        if (i >= uint32_t(kLanguageCount)) i = 0;
+        ret = language_strings_ + 16 + i * 16;
+        break;
+      }
+      case 6: {
+        const uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        ApplyLanguageIndex(int(i));
+        break;
+      }
+      case 7:
+        if (mem) {
+          const uint32_t shown = pending_language_ ? pending_language_ : running_language_;
+          WriteGuestU32(mem, data, uint32_t(LanguageIndex(shown)));
+        }
+        break;
+      default:
+        break;
+    }
+    ctx.r3.u64 = ret;
+  }
+
+  // Settings > Display Interface (the three Display Options pages, title
+  // 0x56CB): Language and Camera Bob rows after the page's last checkbox, ahead
+  // of the Restore Default Settings row one of them ends with.
+  // The game's split-screen row ("2-Player Screen Split", label function
+  // 0x821AE370 = li r3,0x56DA), moved from Video Options to Display Options
+  // under the name "Screen Split" (its own handler, flags and values kept).
+  static constexpr uint32_t kScreenSplitLabelFn = 0x821AE370;
+  static inline uint32_t screen_split_item_[5] = {};
+  static inline bool screen_split_found_ = false;
+  static inline uint32_t screen_split_label_ = 0;  // guest "Screen Split\n"
+  static void PdLabelScreenSplit(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = screen_split_label_; }
+
+  static void AddLanguageRow() {
+    PerfectDarkApp* app = current_instance_;
+    if (!app || !app->runtime() || !app->runtime()->memory()) return;
+    auto* mem = app->runtime()->memory();
+    auto* fd = app->runtime()->function_dispatcher();
+    if (!fd) return;
+    constexpr uint32_t kDisplayOptionsTid = 0x56CB;
+    constexpr uint32_t kTypeCheckbox = 0x09;
+    constexpr uint32_t kTypeEnd = 0x1D;
+    language_strings_ = mem->SystemHeapAlloc(16 + 16 * kLanguageCount);
+    const uint32_t label = fd->AllocateThunk(&PdLabelLanguage, 0);
+    const uint32_t handler = fd->AllocateThunk(&PdLanguageMenuHandler, 0);
+    camera_bob_label_ = mem->SystemHeapAlloc(16);
+    const uint32_t bob_label = fd->AllocateThunk(&PdLabelCameraBob, 0);
+    const uint32_t bob_handler = fd->AllocateThunk(&PdCameraBobMenuHandler, 0);
+    if (!language_strings_ || !label || !handler || !camera_bob_label_ || !bob_label || !bob_handler) {
+      REXLOG_INFO("[menu_patch] FAILED to set up the Language and Camera Bob rows");
+      return;
+    }
+    WriteGuestBytes(mem, camera_bob_label_, "Camera Bob\n", 12);
+    // Screen Split after Camera Bob, when the Video Options patch found it.
+    uint32_t split_label = 0;
+    if (screen_split_found_) {
+      screen_split_label_ = mem->SystemHeapAlloc(16);
+      split_label = screen_split_label_ ? fd->AllocateThunk(&PdLabelScreenSplit, 0) : 0;
+      if (split_label) WriteGuestBytes(mem, screen_split_label_, "Screen Split\n", 14);
+    }
+    if (!split_label) REXLOG_INFO("[menu_patch] no Screen Split row for Display Options");
+    WriteGuestBytes(mem, language_strings_, "Language\n", 10);
+    for (int i = 0; i < kLanguageCount; ++i) {
+      WriteGuestBytes(mem, language_strings_ + 16 + uint32_t(i) * 16, kLanguages[i].name,
+                      std::strlen(kLanguages[i].name) + 1);
+    }
+    std::map<uint32_t, uint32_t> relocated;  // old items -> new items
+    int pages = 0;
+    ForEachCommittedRegion(mem, [&](uint32_t region_addr, uint32_t region_size) {
+      for (uint32_t a = region_addr; a + 24 <= region_addr + region_size; a += 4) {
+        if (ReadGuestU32(mem, a) != 0x01000000 || ReadGuestU32(mem, a + 4) != kDisplayOptionsTid) {
+          continue;
+        }
+        const uint32_t items = ReadGuestU32(mem, a + 8);
+        if (items < 0x82000000 || items >= 0x826E0000 - 20) continue;
+        auto it = relocated.find(items);
+        if (it == relocated.end()) {
+          int count = 0;
+          int last_checkbox = -1;
+          while (count < 24) {
+            const uint32_t type = ReadGuestU32(mem, items + uint32_t(count) * 20) >> 24;
+            if (type == kTypeEnd || type == 0) break;
+            if (type == kTypeCheckbox) last_checkbox = count;
+            ++count;
+          }
+          if (count >= 24 || last_checkbox < 0) continue;
+          const uint32_t dest = mem->SystemHeapAlloc(uint32_t(count + 4) * 20);
+          if (!dest) continue;
+          uint32_t out = dest;
+          auto spinner = [&](uint32_t at, uint32_t row_label, uint32_t row_handler) {
+            WriteGuestU32(mem, at + 0, 0x0C000000);
+            WriteGuestU32(mem, at + 4, 0);
+            WriteGuestU32(mem, at + 8, row_label);
+            WriteGuestU32(mem, at + 12, 0);
+            WriteGuestU32(mem, at + 16, row_handler);
+          };
+          for (int i = 0; i < count; ++i, out += 20) {
+            CopyMenuItem(mem, items + uint32_t(i) * 20, out);
+            if (i == last_checkbox) {
+              out += 20;
+              spinner(out, label, handler);
+              out += 20;
+              spinner(out, bob_label, bob_handler);
+              if (split_label) {
+                out += 20;
+                for (int w = 0; w < 5; ++w) WriteGuestU32(mem, out + uint32_t(w) * 4, screen_split_item_[w]);
+                WriteGuestU32(mem, out + 8, split_label);
+              }
+            }
+          }
+          WriteMenuEnd(mem, out);
+          it = relocated.emplace(items, dest).first;
+        }
+        WriteGuestU32(mem, a + 8, it->second);
+        ++pages;
+      }
+    });
+    REXLOG_INFO("[menu_patch] Language and Camera Bob rows: {} Display Options page(s), {} item array(s); "
+                "text is {}",
+                pages, relocated.size(), kLanguages[LanguageIndex(running_language_)].name);
+  }
+
+  // ---- Upscaling and Sharpness (Settings > Video; HANDOVER 4an, 4bi) --------
+  // Upscaling: how the rendered picture is scaled to the window, Off (bilinear,
+  // the original look) or FSR (AMD FSR 1: edge-adaptive upscaling, the one that
+  // matters with Render Scale 1x on a large screen). Sharpness: Off, Low, Medium
+  // or High, at any Render Scale - AMD CAS (contrast-adaptive sharpening, with
+  // its own resampling when the sizes differ) with Upscaling Off, FSR's own
+  // sharpening with FSR. All SDK presenter settings (present_effect,
+  // present_cas_additional_sharpness, present_fsr_sharpness_reduction),
+  // applied at once. Up to 0.9.0 Upscaling was Off / Sharpen / FSR: "Sharpen"
+  // (CAS at 0) now reads as Upscaling Off with Sharpness Low.
+  static constexpr int kSharpLevels = 4;
+  // CAS additional sharpness for Low, Medium, High ([0] unused: Off is bilinear).
+  static constexpr double kCasSharpness[kSharpLevels] = {0.0, 0.0, 0.5, 1.0};
+  // FSR sharpness reduction in stops (less is sharper; 0.2 is FSR's default).
+  static constexpr double kFsrReduction[kSharpLevels] = {2.0, 1.0, 0.2, 0.0};
+  static constexpr const char* kSharpLevelNames[kSharpLevels] = {"Off\n", "Low\n", "Medium\n", "High\n"};
+  static inline uint32_t sharp_strings_ = 0;  // guest: the Sharpness label (32 bytes), 4 values (16 bytes)
+
+  static int UpscalingIndex() { return rex::cvar::GetFlagByName("present_effect") == "fsr" ? 1 : 0; }
+
+  static int SharpnessIndex() {
+    const std::string effect = rex::cvar::GetFlagByName("present_effect");
+    if (effect == "fsr") return NearestLevel(kFsrReduction, CvarDouble("present_fsr_sharpness_reduction", 0.2));
+    if (effect != "cas") return 0;
+    const double cas = CvarDouble("present_cas_additional_sharpness", 0.0);
+    int best = 1;
+    for (int i = 2; i < kSharpLevels; ++i) {
+      if (std::fabs(kCasSharpness[i] - cas) < std::fabs(kCasSharpness[best] - cas)) best = i;
+    }
+    return best;
+  }
+
+  // Sets the presenter for an Upscaling and a Sharpness choice.
+  static void ApplyPresentChoice(int upscaling, int sharpness) {
+    if (upscaling == 1) {
+      rex::cvar::SetFlagByName("present_effect", "fsr");
+      rex::cvar::SetFlagByName("present_fsr_sharpness_reduction", fmt::format("{}", kFsrReduction[sharpness]));
+    } else if (sharpness > 0) {
+      rex::cvar::SetFlagByName("present_effect", "cas");
+      rex::cvar::SetFlagByName("present_cas_additional_sharpness", fmt::format("{}", kCasSharpness[sharpness]));
+    } else {
+      rex::cvar::SetFlagByName("present_effect", "bilinear");
+    }
+    SavePcSettings();
+    REXLOG_INFO("[upscaling] present_effect = {}, Sharpness {}", rex::cvar::GetFlagByName("present_effect"),
+                sharpness);
     PerfectDarkApp* app = current_instance_;
     if (!app) return;
     app->app_context().CallInUIThreadDeferred([]() {
@@ -6921,6 +8001,151 @@ class PerfectDarkApp : public rex::ReXApp {
         graphics->presenter()->ReloadGuestOutputPaintConfigFromCVarsFromUIThread();
       }
     });
+  }
+
+  static void ApplyUpscalingIndex(int index) {
+    if (index < 0 || index > 1 || index == UpscalingIndex()) return;
+    ApplyPresentChoice(index, SharpnessIndex());
+  }
+
+  static void ApplySharpnessIndex(int index) {
+    if (index < 0 || index >= kSharpLevels || index == SharpnessIndex()) return;
+    ApplyPresentChoice(UpscalingIndex(), index);
+  }
+
+  static void PdLabelSharpness(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = sharp_strings_; }
+
+  // ---- Screenshots (F12; HANDOVER 4bc) --------------------------------------
+  // F12 saves the game's frame as a PNG in resources\userdata\screenshots: the
+  // picture as the game drew it, at the Render Scale resolution, without the
+  // window's scaling, upscaling or letterbox. The presenter copies the frame
+  // back from the GPU (both backends); the PNG is written by Windows' own
+  // encoder (WIC) on a thread of its own, so the game does not wait for it.
+  static bool WritePng(const std::filesystem::path& path, const rex::ui::RawImage& image) {
+    // RawImage rows are R8 G8 B8 X8; the encoder takes B8 G8 R8.
+    const uint32_t w = image.width, h = image.height;
+    const UINT stride = (w * 3 + 3) & ~3u;
+    std::vector<uint8_t> bgr(size_t(stride) * h);
+    for (uint32_t y = 0; y < h; ++y) {
+      const uint8_t* in = image.data.data() + y * image.stride;
+      uint8_t* out = bgr.data() + size_t(y) * stride;
+      for (uint32_t x = 0; x < w; ++x, in += 4, out += 3) {
+        out[0] = in[2];
+        out[1] = in[1];
+        out[2] = in[0];
+      }
+    }
+    IWICImagingFactory* factory = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+    bool ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                         IID_PPV_ARGS(&factory))) &&
+              SUCCEEDED(factory->CreateStream(&stream)) &&
+              SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) &&
+              SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) &&
+              SUCCEEDED(encoder->Initialize(stream, WICBitmapEncoderNoCache)) &&
+              SUCCEEDED(encoder->CreateNewFrame(&frame, nullptr)) &&
+              SUCCEEDED(frame->Initialize(nullptr)) && SUCCEEDED(frame->SetSize(w, h)) &&
+              SUCCEEDED(frame->SetPixelFormat(&format)) &&
+              IsEqualGUID(format, GUID_WICPixelFormat24bppBGR) &&
+              SUCCEEDED(frame->WritePixels(h, stride, UINT(bgr.size()), bgr.data())) &&
+              SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
+    if (frame) frame->Release();
+    if (encoder) encoder->Release();
+    if (stream) stream->Release();
+    if (factory) factory->Release();
+    return ok;
+  }
+
+  static void TakeScreenshot() {
+    PerfectDarkApp* app = current_instance_;
+    auto* graphics = ConcreteGraphics();
+    if (!app || app->config_path().empty() || !graphics || !graphics->presenter()) return;
+    rex::ui::RawImage image;
+    if (!graphics->presenter()->CaptureGuestOutput(image) || !image.width || !image.height) {
+      REXLOG_WARN("[screenshot] no frame to capture");
+      return;
+    }
+    const std::filesystem::path folder =
+        std::filesystem::path(app->config_path()).parent_path() / "screenshots";
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    const std::time_t now = std::time(nullptr);
+    std::tm local = {};
+    localtime_s(&local, &now);
+    char stamp[32];
+    std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H-%M-%S", &local);
+    std::filesystem::path path = folder / (std::string("Perfect Dark ") + stamp + ".png");
+    for (int n = 2; std::filesystem::exists(path, ec); ++n) {
+      path = folder / (std::string("Perfect Dark ") + stamp + " (" + std::to_string(n) + ").png");
+    }
+    std::thread([image = std::move(image), path]() {
+      const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+      if (WritePng(path, image)) {
+        REXLOG_INFO("[screenshot] {} x {} saved to {}", image.width, image.height,
+                    path.filename().string());
+        rex::kernel::xam::netplay::ShowNotice("Screenshot saved to resources\\userdata\\screenshots");
+      } else {
+        REXLOG_WARN("[screenshot] could not write {}", path.string());
+      }
+      if (com) CoUninitialize();
+    }).detach();
+  }
+
+  // ---- Aspect Ratio (Settings > Video; HANDOVER 4ay) -------------------------
+  // 16:9 (the Xbox version) or 4:3: the game's own N64 screen-ratio switch gives
+  // the views the 4:3 field of view (PdHookScreenRatio), and the SDK presenter
+  // shows the frame in a 4:3 box with bars at the sides (present_aspect_ratio).
+  // Both take effect at once; nothing restarts.
+  static int AspectRatioIndex() {
+    return rex::cvar::GetFlagByName("pd_aspect_ratio") == "4:3" ? 1 : 0;
+  }
+
+  // present_aspect_ratio follows pd_aspect_ratio (startup and every change).
+  static void SyncPresentAspect() {
+    rex::cvar::SetFlagByName("present_aspect_ratio", AspectRatioIndex() == 1 ? "4:3" : "auto");
+  }
+
+  static void ApplyAspectRatioIndex(int index) {
+    if (index < 0 || index > 1 || index == AspectRatioIndex()) return;
+    rex::cvar::SetFlagByName("pd_aspect_ratio", index == 1 ? "4:3" : "16:9");
+    SyncPresentAspect();
+    SavePcSettings();
+    REXLOG_INFO("[aspect] picture shape {}", index == 1 ? "4:3" : "16:9");
+  }
+
+  // Same op protocol as PdResolutionMenuHandler.
+  static void PdAspectRatioMenuHandler(PPCContext& ctx, uint8_t* /*base*/) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t op = ctx.r3.u32;
+    const uint32_t data = ctx.r5.u32;
+    uint32_t ret = 0;
+    switch (op) {
+      case 1:
+        if (mem) WriteGuestU32(mem, data, 2);
+        break;
+      case 3: {
+        uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        if (i > 1) i = 0;
+        ret = kAspectStrings + i * 16;
+        break;
+      }
+      case 6: {
+        uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        if (i > 1) i = 0;
+        ApplyAspectRatioIndex(int(i));
+        break;
+      }
+      case 7:
+        if (mem) WriteGuestU32(mem, data, uint32_t(AspectRatioIndex()));
+        break;
+      default:
+        break;
+    }
+    ctx.r3.u64 = ret;
   }
 
   // Same op protocol as PdResolutionMenuHandler.
@@ -6932,22 +8157,146 @@ class PerfectDarkApp : public rex::ReXApp {
     uint32_t ret = 0;
     switch (op) {
       case 1:
-        if (mem) WriteGuestU32(mem, data, 3);
+        if (mem) WriteGuestU32(mem, data, 2);
         break;
       case 3: {
         uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
-        if (i > 2) i = 0;
+        if (i > 1) i = 0;
         ret = kUpscalingStrings + i * 16;
         break;
       }
       case 6: {
         uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
-        if (i > 2) i = 0;
+        if (i > 1) i = 0;
         ApplyUpscalingIndex(int(i));
         break;
       }
       case 7:
         if (mem) WriteGuestU32(mem, data, uint32_t(UpscalingIndex()));
+        break;
+      default:
+        break;
+    }
+    ctx.r3.u64 = ret;
+  }
+
+  // Same op protocol as PdResolutionMenuHandler.
+  static void PdSharpnessMenuHandler(PPCContext& ctx, uint8_t* /*base*/) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t op = ctx.r3.u32;
+    const uint32_t data = ctx.r5.u32;
+    uint32_t ret = 0;
+    switch (op) {
+      case 1:
+        if (mem) WriteGuestU32(mem, data, uint32_t(kSharpLevels));
+        break;
+      case 3: {
+        uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        if (i >= uint32_t(kSharpLevels)) i = 0;
+        ret = sharp_strings_ + 32 + i * 16;
+        break;
+      }
+      case 6: {
+        uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        if (i >= uint32_t(kSharpLevels)) i = 0;
+        ApplySharpnessIndex(int(i));
+        break;
+      }
+      case 7:
+        if (mem) WriteGuestU32(mem, data, uint32_t(SharpnessIndex()));
+        break;
+      default:
+        break;
+    }
+    ctx.r3.u64 = ret;
+  }
+
+  // ---- Vivid Colours / Black Level (Settings > Graphics; HANDOVER 4bd) -----
+  // The finished frame was drawn for a CRT and looks flat on a panel. Vivid
+  // Colours raises saturation and, a little, contrast (around a dark grey, as
+  // the game is dark); Black Level takes a floor off the blacks so black is
+  // black without crushing the shadows above it. Off, Light, Normal, Heavy;
+  // both Off by default. The SDK applies them in the gamma ramp pass
+  // (color_saturation, color_contrast, color_black_level), live, and
+  // screenshots get them too.
+  static constexpr int kColorLevels = 4;
+  static constexpr double kVividSaturation[kColorLevels] = {1.0, 1.15, 1.30, 1.50};
+  static constexpr double kVividContrast[kColorLevels] = {1.0, 1.03, 1.06, 1.10};
+  static constexpr double kBlackLevel[kColorLevels] = {0.0, 0.02, 0.04, 0.07};
+  static constexpr const char* kColorLevelNames[kColorLevels] = {"Off\n", "Light\n", "Normal\n",
+                                                                 "Heavy\n"};
+  static inline uint32_t color_strings_ = 0;  // guest: 2 labels (32 bytes), 4 values (16 bytes)
+
+  static double CvarDouble(const char* name, double fallback) {
+    const std::string v = rex::cvar::GetFlagByName(name);
+    return v.empty() ? fallback : std::atof(v.c_str());
+  }
+
+  // The level whose value is nearest the setting (hand-edited values round).
+  static int NearestLevel(const double* levels, double value) {
+    int best = 0;
+    for (int i = 1; i < kColorLevels; ++i) {
+      if (std::fabs(levels[i] - value) < std::fabs(levels[best] - value)) best = i;
+    }
+    return best;
+  }
+
+  static int VividIndex() {
+    return NearestLevel(kVividSaturation, CvarDouble("color_saturation", 1.0));
+  }
+  static int BlackLevelIndex() {
+    return NearestLevel(kBlackLevel, CvarDouble("color_black_level", 0.0));
+  }
+
+  static void ApplyVividIndex(int index) {
+    if (index < 0 || index >= kColorLevels) return;
+    rex::cvar::SetFlagByName("color_saturation", fmt::format("{}", kVividSaturation[index]));
+    rex::cvar::SetFlagByName("color_contrast", fmt::format("{}", kVividContrast[index]));
+    SavePcSettings();
+    REXLOG_INFO("[color] Vivid Colours {}", index);
+  }
+
+  static void ApplyBlackLevelIndex(int index) {
+    if (index < 0 || index >= kColorLevels) return;
+    rex::cvar::SetFlagByName("color_black_level", fmt::format("{}", kBlackLevel[index]));
+    SavePcSettings();
+    REXLOG_INFO("[color] Black Level {}", index);
+  }
+
+  // Same op protocol as PdResolutionMenuHandler; which = 0 Vivid, 1 Black Level.
+  template <int which>
+  static void PdColorLabel(PPCContext& ctx, uint8_t*) {
+    ctx.r3.u64 = color_strings_ + uint32_t(which) * 32;
+  }
+  template <int which>
+  static void PdColorMenuHandler(PPCContext& ctx, uint8_t* /*base*/) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t op = ctx.r3.u32;
+    const uint32_t data = ctx.r5.u32;
+    uint32_t ret = 0;
+    switch (op) {
+      case 1:
+        if (mem) WriteGuestU32(mem, data, uint32_t(kColorLevels));
+        break;
+      case 3: {
+        uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        if (i >= uint32_t(kColorLevels)) i = 0;
+        ret = color_strings_ + 64 + i * 16;
+        break;
+      }
+      case 6: {
+        const int i = mem ? int(ReadGuestU32(mem, data)) : 0;
+        if (which == 0) {
+          ApplyVividIndex(i);
+        } else {
+          ApplyBlackLevelIndex(i);
+        }
+        break;
+      }
+      case 7:
+        if (mem) WriteGuestU32(mem, data, uint32_t(which == 0 ? VividIndex() : BlackLevelIndex()));
         break;
       default:
         break;
@@ -7134,20 +8483,58 @@ inline void PerfectDarkInputTracker::OnDraw(ImGuiIO& /*io*/) {
   PerfectDarkApp::TickStoryComplete();
   PerfectDarkApp::TickFrameStats();
   PerfectDarkApp::TickMenuMouse();
+  PerfectDarkApp::TickCutsceneSkip();
   PerfectDarkApp::DrawMenuCursor();
   PerfectDarkApp::TickMatchDetails();
   PerfectDarkApp::DrawPrivateMatchNotice();
   PerfectDarkApp::TickControllerPrompts();
   PerfectDarkApp::TickTitlePrompt();
+  PerfectDarkApp::TickTextOverrides();
   PerfectDarkApp::DrawTitleVersion();
+  PerfectDarkApp::TickTestPipe();
   if (app_) app_->TickMatchPicker();
+  if (app_) app_->TickUpdateDialog();
 
   if (app_ && app_->HasWindowFocus()) {
     bool f9_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (f9_down && !f9_was_down_ && PerfectDarkApp::DeveloperMenusEnabled()) {
+    if (f9_down && !f9_was_down_ && PerfectDarkApp::DeveloperMenusEnabled() && !REXCVAR_GET(pd_light_capture)) {
       app_->OpenSettingsDialog();
     }
     f9_was_down_ = f9_down;
+
+    // F12 saves a screenshot (see "Screenshots").
+    const bool f12_shot = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+    if (f12_shot && !f12_shot_was_down_) PerfectDarkApp::TakeScreenshot();
+    f12_shot_was_down_ = f12_shot;
+
+    // Lighting capture (pd_light_capture): F9 or Insert logs the next frame's
+    // draws - under Plume each draw's shaders and constants
+    // (gpu_native_trace_frame), under Classic the lighting summary
+    // (gpu_draw_capture). Take one with the room lit and one dark, from the same
+    // spot. (F9 then no longer opens the developer settings panel.)
+    const bool capture_down = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0 || f9_down;
+    if (capture_down && !capture_was_down_ && REXCVAR_GET(pd_light_capture) &&
+        !rex::cvar::GetFlagByName("pd_light_watch").empty()) {
+      // pd_light_watch = "<hex pattern>": the first press watches writes to it,
+      // the next lists the code that made them.
+      static bool watching = false;
+      if (!watching) {
+        watching = PerfectDarkApp::WatchPattern(rex::cvar::GetFlagByName("pd_light_watch"), 0x400) > 0;
+      } else {
+        pd_watch::DisarmMemoryWriteWatch();
+        watching = false;
+      }
+      MessageBeep(MB_OK);
+    } else if (capture_down && !capture_was_down_ && REXCVAR_GET(pd_light_capture)) {
+      static int captures = 0;
+      const bool plume = rex::cvar::GetFlagByName("gpu_native") == "true";
+      REXLOG_INFO("[light_capture] #{} ({}): {}", ++captures, plume ? "Plume" : "Classic",
+                  plume ? rex::cvar::SetFlagByName("gpu_native_trace_frame", "-1")
+                        : rex::cvar::SetFlagByName("gpu_draw_capture", "4000"));
+      PerfectDarkApp::DumpGuestMemory(captures);
+      MessageBeep(MB_OK);  // heard: the capture was taken
+    }
+    capture_was_down_ = capture_down;
 
     // Everything below is a developer diagnostic (see pd_dev_hotkeys).
     if (!REXCVAR_GET(pd_dev_hotkeys)) return;
@@ -7883,4 +9270,190 @@ inline void PerfectDarkMatchPicker::OnClose() {
   if (app_) {
     app_->OnMatchPickerClosed();
   }
+}
+
+// ---- Check for Updates dialog ----------------------------------------------
+inline void PerfectDarkUpdateDialog::PollInput(bool edges[kKeyCount], bool* any_held) {
+  static const int kKeys[kKeyCount][3] = {
+      {VK_UP, 'W', 0},
+      {VK_DOWN, 'S', 0},
+      {VK_RETURN, 'E', VK_SPACE},
+      {VK_ESCAPE, VK_BACK, '1'},
+  };
+  static const WORD kPad[kKeyCount] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_A,
+                                       XINPUT_GAMEPAD_B};
+  const bool focused = app_ && app_->HasWindowFocus();
+  XINPUT_STATE pad{};
+  const bool pad_ok = focused && XInputGetState(0, &pad) == ERROR_SUCCESS;
+  *any_held = false;
+  for (int k = 0; k < kKeyCount; ++k) {
+    bool down = false;
+    for (int vk : kKeys[k]) {
+      if (focused && vk && (GetAsyncKeyState(vk) & 0x8000)) down = true;
+    }
+    if (pad_ok && (pad.Gamepad.wButtons & kPad[k])) down = true;
+    edges[k] = primed_ && down && !was_down_[k];
+    was_down_[k] = down;
+    *any_held = *any_held || down;
+  }
+  if (PerfectDarkApp::test_dialog_down_.exchange(false)) edges[kDown] = true;
+  if (PerfectDarkApp::test_dialog_press_.exchange(false)) edges[kConfirm] = true;
+  primed_ = true;
+}
+
+inline void PerfectDarkUpdateDialog::OnDraw(ImGuiIO& io) {
+  using namespace pd_ui;
+  using State = PerfectDarkApp::UpdateState;
+  if (!opened_) {
+    ImGui::OpenPopup("##PerfectDarkUpdate");
+    opened_ = true;
+  }
+  const PerfectDarkApp::UpdateStatus status = PerfectDarkApp::CurrentUpdateStatus();
+  const bool offer = status.state == State::kAvailable && !blocked_;
+  // The text and the rows for the current answer.
+  std::string line1, line2;
+  std::vector<const char*> labels;
+  const std::string current = PD_VERSION;
+  switch (status.state) {
+    case State::kIdle:
+    case State::kChecking:
+      line1 = "Asking GitHub for the latest release...";
+      labels = {"Cancel"};
+      break;
+    case State::kUpToDate:
+      line1 = "Perfect Dark is up to date (v" + current + ").";
+      labels = {"OK"};
+      break;
+    case State::kFailed:
+      line1 = "Could not check for updates: " + status.error + ".";
+      line2 = "Check your internet connection and try again later.";
+      labels = {"OK"};
+      break;
+    case State::kNoLauncher:
+      line1 = "Updates work in the release folder: Perfect Dark.exe beside the resources folder.";
+      labels = {"OK"};
+      break;
+    case State::kAvailable:
+      if (blocked_) {
+        line1 = "Updating closes the game.";
+        line2 = "Quit to the main menu (and leave any network game) first, then try again.";
+        labels = {"OK"};
+      } else {
+        line1 = "Version " + status.latest + " is available. You have " + current + ".";
+        line2 = "The game closes, the update downloads" +
+                (status.size ? fmt::format(" ({:.0f} MB)", status.size / 1048576.0) : std::string()) +
+                " and installs, then you can play. Your saves and settings are kept.";
+        labels = {"Update now", "Not now"};
+      }
+      break;
+  }
+  const int rows = int(labels.size());
+  if (selected_ >= rows) selected_ = 0;
+
+  bool edges[kKeyCount] = {};
+  bool any_held = false;
+  PollInput(edges, &any_held);
+  if (chosen_ < 0) {
+    if (edges[kUp]) selected_ = (selected_ + rows - 1) % rows;
+    if (edges[kDown]) selected_ = (selected_ + 1) % rows;
+    if (edges[kConfirm]) chosen_ = selected_;
+    if (edges[kBack]) chosen_ = rows - 1;
+  }
+  bool finish = false;
+  if (chosen_ >= 0 && !any_held) {
+    if (offer && chosen_ == 0) {
+      if (PerfectDarkApp::RestartIsSafe()) PerfectDarkApp::StartUpdater();
+      blocked_ = true;  // asks to quit to the main menu first
+      selected_ = 0;
+    } else {
+      finish = true;
+    }
+    chosen_ = finish ? chosen_ : -1;
+  }
+
+  ImGuiViewport* viewport = ImGui::GetMainViewport();
+  const ImVec2 center = viewport ? ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                          viewport->WorkPos.y + viewport->WorkSize.y * 0.5f)
+                                 : ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+  ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  const float scale = std::max(1.0f, io.DisplaySize.y / 720.0f);
+  ImFont* font = ImGui::GetFont();
+  const float font_size = 20.0f * scale, heading_size = 26.0f * scale;
+  const float window_width = 640.0f * scale;
+  const float kSideMargin = 26.0f * scale;
+  const float wrap = window_width - kSideMargin * 2.0f;
+  ImGui::SetNextWindowSize(ImVec2(window_width, 0), ImGuiCond_Always);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f * scale);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 255));
+  const bool still_open =
+      ImGui::BeginPopupModal("##PerfectDarkUpdate", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
+  if (still_open) {
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    const ImVec2 window_pos = ImGui::GetWindowPos();
+    const float kRowHeight = 50.0f * scale, kRowSpacing = 10.0f * scale;
+    const float heading_y = window_pos.y + 20.0f * scale;
+    const float accent_y = heading_y + heading_size + 8.0f * scale;
+    const float text1_y = accent_y + 14.0f * scale;
+    const float h1 = font->CalcTextSizeA(font_size, FLT_MAX, wrap, line1.c_str()).y;
+    const float text2_y = text1_y + h1 + 8.0f * scale;
+    const float h2 = line2.empty() ? 0.0f : font->CalcTextSizeA(font_size, FLT_MAX, wrap, line2.c_str()).y;
+    const float rows_top = text2_y + h2 + 22.0f * scale;
+    const float content_height = (rows_top - window_pos.y) + rows * kRowHeight + (rows - 1) * kRowSpacing + 24.0f * scale;
+    const ImVec2 window_end(window_pos.x + window_width, window_pos.y + content_height);
+    ImGui::Dummy(ImVec2(window_width, content_height));
+    draw_list->PushClipRect(window_pos, window_end, true);
+    const ImVec2 card_min(window_pos.x + 8 * scale, window_pos.y + 6 * scale);
+    const ImVec2 card_max(window_end.x - 8 * scale, window_end.y - 6 * scale);
+    draw_list->AddRectFilledMultiColor(card_min, card_max, kCardTop, kCardTop, kCardBottom, kCardBottom);
+    draw_list->AddRect(card_min, card_max, kCardBorder, 12.0f * scale, 0, 2.0f * scale);
+    draw_list->PopClipRect();
+    draw_list->AddText(font, heading_size, ImVec2(window_pos.x + kSideMargin, heading_y), kTextSelected,
+                       "CHECK FOR UPDATES");
+    draw_list->AddLine(ImVec2(window_pos.x + kSideMargin, accent_y), ImVec2(window_end.x - kSideMargin, accent_y),
+                       kAccentCyan, 2.0f * scale);
+    draw_list->AddText(font, font_size, ImVec2(window_pos.x + kSideMargin, text1_y), kTextNormal, line1.c_str(),
+                       nullptr, wrap);
+    if (!line2.empty())
+      draw_list->AddText(font, font_size, ImVec2(window_pos.x + kSideMargin, text2_y), kTextDim, line2.c_str(),
+                         nullptr, wrap);
+    float row_y = rows_top;
+    for (int row = 0; row < rows; ++row) {
+      const ImVec2 row_pos(window_pos.x + kSideMargin, row_y);
+      const ImVec2 row_size(window_width - kSideMargin * 2.0f, kRowHeight);
+      const ImVec2 row_max(row_pos.x + row_size.x, row_pos.y + row_size.y);
+      const bool selected = row == selected_;
+      if (selected) {
+        draw_list->AddRectFilledMultiColor(row_pos, row_max, kRowSelectedTop, kRowSelectedTop, kRowSelectedBottom,
+                                           kRowSelectedBottom);
+        draw_list->AddRect(row_pos, row_max, kRowSelectedBorder, 6.0f * scale, 0, 2.0f * scale);
+      } else {
+        draw_list->AddRectFilled(row_pos, row_max, kRowIdle, 6.0f * scale);
+        draw_list->AddRect(row_pos, row_max, kRowIdleBorder, 6.0f * scale, 0, 1.5f * scale);
+      }
+      const float text_width = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, labels[row]).x;
+      draw_list->AddText(font, font_size,
+                         ImVec2(row_pos.x + (row_size.x - text_width) * 0.5f, row_pos.y + (row_size.y - font_size) * 0.5f),
+                         selected ? kTextSelected : kTextNormal, labels[row]);
+      ImGui::PushID(row);
+      ImGui::SetCursorScreenPos(row_pos);
+      if (ImGui::InvisibleButton("row", row_size) && chosen_ < 0) {
+        selected_ = row;
+        chosen_ = row;
+      }
+      ImGui::PopID();
+      row_y += kRowHeight + kRowSpacing;
+    }
+    if (finish) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
+  ImGui::PopStyleColor(1);
+  ImGui::PopStyleVar(3);
+  if (finish || !still_open) Close();
+}
+
+inline void PerfectDarkUpdateDialog::OnClose() {
+  REXLOG_INFO("[update] box closed");
+  if (app_) app_->OnUpdateDialogClosed();
 }

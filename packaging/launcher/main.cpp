@@ -6,8 +6,8 @@
 //   Perfect Dark.exe --setup          open the setup window
 //
 // For automated tests (no window):
-//   --setup --unattended [--package <file or folder>] [--extras fullscreen,shortcut,cheats,story,multiplayer]
-//           [--shortcut-folder <dir>]
+//   --setup --unattended [--package <file or folder>] [--extras fullscreen,shortcut,cheats,story,multiplayer,autoaim]
+//           [--language en|fr|de|it|es] [--shortcut-folder <dir>]
 //   Exit code 0 imported, 1 failed, 2 several packages found (pass --package), 3 none found.
 //
 // Any other arguments are passed on to the game.
@@ -31,7 +31,8 @@ namespace {
 
 using namespace pd;
 
-int RunUnattended(const Paths& p, const SetupOptions& options, const std::wstring& extras) {
+int RunUnattended(const Paths& p, const SetupOptions& options, const std::wstring& extras,
+                  const std::wstring& language) {
   Log(L"Unattended setup");
   std::vector<Source> found;
   std::wstring why;
@@ -55,6 +56,10 @@ int RunUnattended(const Paths& p, const SetupOptions& options, const std::wstrin
   want.cheats = extras.find(L"cheats") != std::wstring::npos;
   want.story = extras.find(L"story") != std::wstring::npos;
   want.multiplayer = extras.find(L"multiplayer") != std::wstring::npos;
+  want.autoaim = extras.find(L"autoaim") != std::wstring::npos;
+  for (const LanguageChoice& l : kLanguages) {
+    if (language == l.code) want.language = l.id;
+  }
   // As on a first setup: unticked extras change nothing; never replace a shortcut that is not ours.
   const std::wstring note = ApplyExtras(p, want, Extras{}, options.shortcut_folder, nullptr);
   if (!note.empty()) Log(L"Unattended: " + note);
@@ -66,19 +71,23 @@ int RunUnattended(const Paths& p, const SetupOptions& options, const std::wstrin
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-  bool setup = false, unattended = false;
-  std::wstring extras;
+  bool setup = false, unattended = false, update = false;
+  std::wstring extras, language;
   SetupOptions options;
   for (int i = 1; i < argc; ++i) {
     const std::wstring arg = argv[i];
     if (arg == L"--setup") {
       setup = true;
+    } else if (arg == L"--update") {
+      update = true;
     } else if (arg == L"--unattended") {
       unattended = true;
     } else if (arg == L"--package" && i + 1 < argc) {
       options.package = argv[++i];
     } else if (arg == L"--extras" && i + 1 < argc) {
       extras = argv[++i];
+    } else if (arg == L"--language" && i + 1 < argc) {
+      language = argv[++i];
     } else if (arg == L"--shortcut-folder" && i + 1 < argc) {
       options.shortcut_folder = argv[++i];
     } else {
@@ -86,6 +95,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
   }
   if (argv) LocalFree(argv);
+  // Holding Shift while opening Perfect Dark.exe opens the setup window, the
+  // same as --setup: the easy way back to it once the game is installed.
+  if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) setup = true;
 
   const Paths p = MakePaths();
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -95,6 +107,25 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   // put back, or cleared away, first (a cheap check: one folder lookup).
   std::wstring missing;
   RecoverInterruptedSwap(p);
+  RecoverInterruptedUpdate(p);
+  // --update (Help & Options > Check for Updates in the game, once the player
+  // chose Update): the latest release replaces the program files.
+  if (update) {
+    HANDLE update_mutex = CreateMutexW(nullptr, TRUE, L"Local\\PerfectDarkUpdate");
+    if (update_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+      CloseHandle(update_mutex);
+      CoUninitialize();
+      return 0;
+    }
+    LogTo(p.logs);
+    const int code = RunUpdateWindow(instance, p);
+    if (update_mutex) {
+      ReleaseMutex(update_mutex);
+      CloseHandle(update_mutex);
+    }
+    CoUninitialize();
+    return code;
+  }
   const bool installed = IsInstalled(p, &missing);
   if (installed && !setup && options.package.empty()) {
     if (GetFileAttributesW(p.config.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -132,7 +163,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   LogTo(p.logs);
   options.forced = installed;
   options.reason = installed ? L"--setup" : L"missing " + missing;
-  const int code = unattended ? RunUnattended(p, options, extras) : RunSetupWindow(instance, p, options);
+  const int code = unattended ? RunUnattended(p, options, extras, language) : RunSetupWindow(instance, p, options);
   if (mutex) {
     ReleaseMutex(mutex);
     CloseHandle(mutex);

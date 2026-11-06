@@ -2,3 +2,9 @@
 	path = rexglue-sdk
 	url = https://github.com/rexglue/rexglue-sdk.git
 	shallow = true
+[submodule "thirdparty/XenosRecomp"]
+	path = thirdparty/XenosRecomp
+	url = https://github.com/hedge-dev/XenosRecomp.git
+[submodule "thirdparty/plume"]
+	path = thirdparty/plume
+	url = https://github.com/zolaware/plume.git

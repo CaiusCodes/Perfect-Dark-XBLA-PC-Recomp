@@ -32,14 +32,15 @@ namespace {
 using namespace Gdiplus;
 
 // ------------------------------------------------------------- layout --
-constexpr float kW = 640, kH = 668;
+constexpr float kW = 640, kH = 736;
 constexpr float kUiScale = 1.1f;  // drawn 10% larger than the 96-DPI layout
 constexpr float kRowsY = 236, kRowPitch = 30;   // candidate rows when several packages are found
 constexpr int kMaxRows = 4;
 constexpr float kExtrasCapsY = 390, kExtrasCardY = 410, kExtraFirst = 422, kExtraPitch = 34;
-constexpr int kExtraCount = 5;
+constexpr int kExtraCount = 6;
+constexpr float kLanguageY = kExtraFirst + kExtraCount * kExtraPitch;  // the row after the extras
 
-enum Control { kNone = -1, kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kExtra3, kExtra4, kRow0 };
+enum Control { kNone = -1, kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kExtra3, kExtra4, kExtra5, kLanguage, kRow0 };
 
 enum class Mode { Idle, Choosing, Importing, Ready };
 
@@ -77,12 +78,22 @@ struct ExtraDef {
   const wchar_t* title;
   const wchar_t* detail;
 };
+// The position of a language in kLanguages; Japanese or anything else set by
+// hand counts as English.
+int LanguageIndex(uint32_t id) {
+  for (int i = 0; i < 5; ++i) {
+    if (kLanguages[i].id == id) return i;
+  }
+  return 0;
+}
+
 const ExtraDef kExtraDefs[kExtraCount] = {
     {L"Start in fullscreen", L"You can switch at any time in Settings > Graphics."},
     {L"Create desktop shortcut", L"Adds a Perfect Dark icon to your desktop that opens this folder's game."},
     {L"All cheats unlocked", L"Every cheat is available in the Cheats menu. You still switch each one on."},
     {L"100% story completion", L"Marks every mission complete in your save. Stays after unticking."},
     {L"Unlock all multiplayer content", L"Every Combat Simulator weapon, character, scenario and option."},
+    {L"Auto-Aim on", L"New players start with Auto-Aim on, as on the Xbox. Handy on Steam Deck."},
 };
 
 class SetupWindow {
@@ -204,13 +215,15 @@ void SetupWindow::ApplyScale(UINT dpi, const RECT* suggested) {
 RectL SetupWindow::ControlRect(Control id) const {
   switch (id) {
     case kBrowse: return {456, 236, 124, 34};
-    case kLeft: return {330, 610, 104, 38};
-    case kPlay: return {446, 602, 154, 52};
+    case kLeft: return {330, 678, 104, 38};
+    case kPlay: return {446, 670, 154, 52};
+    case kLanguage: return {52, kLanguageY - 3, 548, kExtraPitch};
     case kExtra0:
     case kExtra1:
     case kExtra2:
     case kExtra3:
-    case kExtra4: return {52, kExtraFirst + (id - kExtra0) * kExtraPitch - 3, 548, kExtraPitch};
+    case kExtra4:
+    case kExtra5: return {52, kExtraFirst + (id - kExtra0) * kExtraPitch - 3, 548, kExtraPitch};
     default: {
       const int row = id - kRow0;
       return {58, kRowsY + row * kRowPitch, 392, kRowPitch - 2};
@@ -227,13 +240,15 @@ bool SetupWindow::Enabled(Control id) const {
     case kExtra1:
     case kExtra2:
     case kExtra3:
-    case kExtra4: return true;
+    case kExtra4:
+    case kExtra5:
+    case kLanguage: return true;
     default: return mode_ == Mode::Choosing && id - kRow0 < static_cast<int>(candidates_.size());
   }
 }
 
 Control SetupWindow::HitTest(float x, float y) const {
-  std::vector<Control> ids = {kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kExtra3, kExtra4};
+  std::vector<Control> ids = {kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kExtra3, kExtra4, kExtra5, kLanguage};
   if (mode_ == Mode::Choosing) {
     for (int i = 0; i < static_cast<int>(candidates_.size()) && i < kMaxRows; ++i)
       ids.push_back(static_cast<Control>(kRow0 + i));
@@ -446,8 +461,8 @@ void SetupWindow::Paint(HDC dc) {
     // Extras: a painted checkbox, a title and a one-line explanation each.
     PaintText(g, std::wstring(L"OPTIONAL EXTRAS  ") + kDot + L"  APPLIED WHEN YOU PRESS PLAY", caps_.get(),
               tone::Cyan, RectF(40, kExtrasCapsY, 560, 18));
-    PaintCard(g, 40, kExtrasCardY, 560, 12 + kExtraCount * kExtraPitch);
-    const bool on[kExtraCount] = {want_.fullscreen, want_.shortcut, want_.cheats, want_.story, want_.multiplayer};
+    PaintCard(g, 40, kExtrasCardY, 560, 12 + (kExtraCount + 1) * kExtraPitch);
+    const bool on[kExtraCount] = {want_.fullscreen, want_.shortcut, want_.cheats, want_.story, want_.multiplayer, want_.autoaim};
     for (int i = 0; i < kExtraCount; ++i) {
       const float y = kExtraFirst + i * kExtraPitch;
       if (hover_ == kExtra0 + i) {
@@ -478,9 +493,38 @@ void SetupWindow::Paint(HDC dc) {
       PaintText(g, kExtraDefs[i].detail, row_detail_.get(), tone::Muted, RectF(92, y + 17, 500, 16));
     }
 
+    // Language: the game's text, picked by clicking through the five.
+    {
+      const float y = kLanguageY;
+      const RectL r = ControlRect(kLanguage);
+      if (hover_ == kLanguage) {
+        GraphicsPath hoverShape;
+        RoundedPath(hoverShape, r.x, r.y, r.w, r.h, 6);
+        SolidBrush hover(Hex(tone::Cyan, 22));
+        g.FillPath(&hover, &hoverShape);
+      }
+      // A small globe in the checkbox column.
+      Pen globe(Hex(tone::Cyan, 200), 1.3f);
+      g.DrawEllipse(&globe, 62.0f, y + 3, 18.0f, 18.0f);
+      g.DrawEllipse(&globe, 67.0f, y + 3, 8.0f, 18.0f);
+      g.DrawLine(&globe, 62.0f, y + 12, 80.0f, y + 12);
+      PaintText(g, L"Game language", row_title_.get(), tone::Text, RectF(92, y - 1, 300, 20));
+      PaintText(g, L"Menus, briefings and subtitles. The PC port's own labels stay in English.", row_detail_.get(),
+                tone::Muted, RectF(92, y + 17, 380, 16));
+      const wchar_t* name = kLanguages[LanguageIndex(want_.language)].name;
+      GraphicsPath pill;
+      RoundedPath(pill, 478, y + 2, 110, 24, 12);
+      SolidBrush pillFill(Hex(tone::Field));
+      g.FillPath(&pillFill, &pill);
+      Pen pillEdge(Hex(tone::Cyan, hover_ == kLanguage ? 230 : 130), 1.2f);
+      g.DrawPath(&pillEdge, &pill);
+      PaintText(g, std::wstring(L"\u2039  ") + name + L"  \u203A", row_title_.get(), tone::Cyan,
+                RectF(478, y + 4, 110, 20), StringAlignmentCenter);
+    }
+
     // Footer and the two buttons.
     PaintText(g, std::wstring(L"Xbox LIVE Arcade  ") + kDot + L"  Title ID 584109C2", foot_.get(), tone::Muted,
-              RectF(40, 625, 270, 16));
+              RectF(40, 693, 270, 16));
     const wchar_t* left = mode_ == Mode::Importing ? (cancel_.load() ? L"Cancelling" : L"Cancel") : L"Close";
     PaintButton(g, kLeft, left, Enabled(kLeft), false, button_.get());
     PaintButton(g, kPlay, L"PLAY", Enabled(kPlay), true, play_.get());
@@ -743,6 +787,8 @@ void SetupWindow::Click(Control id) {
     case kExtra2: want_.cheats = !want_.cheats; break;
     case kExtra3: want_.story = !want_.story; break;
     case kExtra4: want_.multiplayer = !want_.multiplayer; break;
+    case kExtra5: want_.autoaim = !want_.autoaim; break;
+    case kLanguage: want_.language = kLanguages[(LanguageIndex(want_.language) + 1) % 5].id; break;
     default:
       if (id >= kRow0 && id - kRow0 < static_cast<int>(candidates_.size())) StartImport(candidates_[id - kRow0]);
       break;

@@ -120,7 +120,7 @@ END
     & $clang /nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /DNOMINMAX "/DPD_LAUNCHER_VERSION=$Version" `
         $mapSource $mapWork `
         "/I$sourceDir" "/Fo$work\" @sources "/Fe$Output" /link /SUBSYSTEM:WINDOWS `
-        user32.lib gdi32.lib gdiplus.lib shell32.lib ole32.lib uuid.lib bcrypt.lib $resPath
+        user32.lib gdi32.lib gdiplus.lib shell32.lib ole32.lib uuid.lib bcrypt.lib winhttp.lib $resPath
     if ($LASTEXITCODE -ne 0) { throw 'clang-cl failed for the launcher' }
     Write-Host ('Built {0} ({1:N0} bytes)' -f $Output, (Get-Item -LiteralPath $Output).Length)
 }

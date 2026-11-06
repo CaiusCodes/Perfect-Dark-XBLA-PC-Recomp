@@ -14,6 +14,9 @@ You need your own copy of Perfect Dark XBLA: the Xbox 360 package for
 
   Perfect Dark (Xbox LIVE Arcade)
   Xbox 360 Title ID: 584109C2
+  Package file: 4287CC74C591DB37B577DAEA43BB6E51692D7A8E58 (the 2010
+  release) or 8292DB976888C5DCD68C695F11B3DFED5F4512E858 (the re-release).
+  Both carry the same game; other builds are refused.
 
 The first time you start the game it reads the package you provide, checks
 that it is the supported version and imports the game data from it into this
@@ -39,16 +42,24 @@ FIRST-TIME SETUP
    as it is accepted. You can cancel it at any time.
 4. Tick any extras you want (all optional, all off unless ticked):
      Start in fullscreen, Create desktop shortcut, All cheats unlocked,
-     100% story completion, Unlock all multiplayer content.
+     100% story completion, Unlock all multiplayer content, Auto-Aim on.
    All cheats unlocked makes every cheat available in the Cheats menu; you
    still switch on the ones you want. 100% story completion marks every
    mission complete on every difficulty (missions you never finished show a
    best time of 59:59; real times are kept). It is written into your save,
-   so it stays after you untick it.
+   so it stays after you untick it. Auto-Aim on starts new players with
+   Auto-Aim on, as on the Xbox (handy on a Steam Deck); players you already
+   have keep theirs, set in Player Setup > Control.
+   Game language picks the language of the game's menus, briefings and
+   subtitles: English, French, German, Italian or Spanish (click it to
+   change). You can also change it in the game, in Help & Options >
+   Settings > Display Interface > Language. The PC port's own menu labels
+   stay in English.
 5. Click "Play" once it says READY TO PLAY. The extras you ticked are applied
    at that moment.
 
 From then on, opening "Perfect Dark.exe" starts the game straight away.
+Hold Shift while opening it to get the setup window back.
 The launcher only reads your package; it never changes, moves or deletes it,
 and it is not needed again. Nothing is installed outside this folder and no
 administrator rights are needed. It does not download anything and does
@@ -74,15 +85,23 @@ drive works too). To back up your progress, copy resources\userdata.
 SETUP AGAIN, UPDATING AND OLDER RELEASES
 ----------------------------------------
 
-To change your extras or import your package again, start the game with
---setup (for example from a shortcut whose target ends in
+To change your extras or import your package again, hold Shift while
+opening "Perfect Dark.exe" (keep holding until the window appears), or start
+it with --setup (for example from a shortcut whose target ends in
 "Perfect Dark.exe" --setup). Importing again replaces resources\assets only;
 saves and settings in resources\userdata are kept. If a needed file goes
 missing, opening Perfect Dark.exe shows the setup window again by itself.
 
-To update, extract a new release over this folder (your resources\assets
-and resources\userdata are kept), or into a new folder: setup finds the old
-copy next to it and imports from it.
+To update, open Help & Options > Settings > Check for Updates in the game. It asks
+GitHub for the latest release (only when you choose it; nothing else is sent).
+If there is a newer one, Update now closes the game; the launcher downloads
+the release, checks it against the checksum GitHub publishes, replaces the
+program files (Perfect Dark.exe, README.txt, licenses and resources\runtime)
+and offers Play. Your game data, saves and settings in resources\assets and
+resources\userdata are never touched. You can still update by hand: extract a
+new release over this folder (your resources\assets and resources\userdata
+are kept), or into a new folder: setup finds the old copy next to it and
+imports from it.
 
 Coming from an older release (Setup Perfect Dark.exe and a Game folder):
 extract this release into the old release folder or next to it. The launcher
@@ -141,6 +160,18 @@ DISPLAY
   Game Display (Windowed / Fullscreen), Vsync and Show FPS. Changes apply
   immediately.
 
+  The game is drawn by Plume, a renderer that draws it natively with
+  DirectX 12, or with Vulkan: Settings > Graphics > Graphics API (the game
+  restarts to switch). DirectX 12 is the default; try Vulkan if DirectX 12
+  gives you trouble on your graphics driver. If your PC cannot run Vulkan,
+  the game stays on DirectX 12.
+
+  If something looks wrong or the game will not start drawing, the Classic
+  renderer of earlier versions (an emulated Xbox 360 graphics chip) is still
+  there: close the game, open resources\userdata\perfect_dark.toml in Notepad,
+  add the line  gpu_native = false  and start the game again. Remove the line
+  to go back to Plume.
+
   Render Scale (Settings > Graphics) sets the internal rendering sharpness:
   1x, 2x or 3x the Xbox's 1280 x 720. It starts at 1x; higher looks sharper
   and needs a stronger graphics card. The scales other than the current one
@@ -148,10 +179,21 @@ DISPLAY
   during a mission or a match, applies it the next time the game starts.
 
   Upscaling (Settings > Graphics, next to Render Scale) sets how the picture is
-  scaled to your window or screen: Off (smooth, the original look), Sharpen
-  (AMD CAS sharpening) or FSR (AMD FSR 1 upscaling). FSR helps most with
-  Render Scale 1x on a large screen, the fast setting for a slower graphics
-  card or integrated graphics. Changes apply at once.
+  scaled to your window or screen: Off (smooth, the original look) or FSR
+  (AMD FSR 1 upscaling). FSR helps most with Render Scale 1x on a large
+  screen, the fast setting for a slower graphics card or integrated graphics.
+  Sharpness, below it, sharpens the picture: Off, Low, Medium or High (AMD
+  CAS sharpening, or FSR's own sharpening when Upscaling is FSR). It works at
+  any Render Scale and helps most at 1x. Changes apply at once. The old
+  "Sharpen" choice carries over as Sharpness Low.
+
+  Vivid Colours and Black Level (Settings > Graphics) adjust the finished
+  picture, which was made for old TVs and can look flat on a modern screen.
+  Vivid Colours makes colours richer; Black Level makes black truly black
+  without losing the shadows above it. Each is Off, Light, Normal or Heavy,
+  both start Off, and changes apply at once.
+
+  F12 saves a screenshot to resources\userdata\screenshots.
 
   The graphics API is chosen automatically: Direct3D 12 on NVIDIA cards,
   Vulkan on others. To pick one yourself, set gpu = "d3d12" or
@@ -263,16 +305,19 @@ TROUBLESHOOTING
     Windows may show "Windows protected your PC". Choose More info, then Run
     anyway.
   - The launcher rejects the package: choose the Perfect Dark game package
-    itself, not a title update, save or theme. The reason is shown in the
-    window and in resources\runtime\logs\setup.log.
+    itself, not a title update, save or theme. Only the two package files
+    named at the top of this file work. The reason is shown in the window
+    and in resources\runtime\logs\setup.log.
   - The launcher says a file in resources\runtime is missing: the download is
     incomplete or something removed a file. Extract the whole ZIP again
     (your resources\assets and resources\userdata are kept).
 
 REPORTING A PROBLEM
   Every time the game runs it writes a log to resources\runtime\logs
-  (perfect_dark_001.log and so on; the 20 newest are kept). When reporting a
-  problem, send the newest one. It starts with your Windows version,
+  (perfect_dark_001.log and so on; the 20 newest are kept). To report a
+  problem, open an Issue at
+  https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp/issues
+  and attach the newest one. It starts with your Windows version,
   processor, graphics card, driver, screen and main settings; it holds no
   saves or passwords. If the game crashed, the log ends with a [crash] line,
   and a crash-<date>-<time>.dmp file is written beside it: send that too.
@@ -284,7 +329,7 @@ REPORTING A PROBLEM
     2. Change "diagnostics = false" to "diagnostics = true" (add the line if
        it is not there) and save.
     3. Play until the problem has happened a few times, then close the game.
-    4. Send the newest log from resources\runtime\logs.
+    4. Attach the newest log from resources\runtime\logs to your Issue.
     5. Set it back to false afterwards.
   The detailed log records every slow frame and what the game was waiting
   on, how the game, the graphics card and the screen kept time, and in

@@ -24,14 +24,26 @@ namespace {
 
 // The port is a static recompilation of one specific build of the game
 // program: its code is compiled into the game exe and the package supplies
-// the data that build expects. Only a package carrying that exact build works.
+// the data that build expects. Only a package carrying that build works.
+// It was sold in two packages: the 2010 release (4287CC74..., version 1.3)
+// and a re-release signed for the late-2010 dashboard (8292DB97..., version
+// 1.4). Their default.xex files differ only in the header (version, media ID,
+// required system version, signature); the game code is byte-identical.
 constexpr uint32_t kTitleId = 0x584109C2;
 constexpr uint32_t kContentType = 0x000D0000;  // Xbox LIVE Arcade title
-constexpr const char* kXexSha256 = "530FEFF718B6C1649B7D1E4AD2FD342E9037DB058361EBBB0A2109F1CFBDB6EB";
+struct KnownXex {
+  const char* sha256;
+  const wchar_t* name;
+};
+constexpr KnownXex kKnownXex[] = {
+    {"530FEFF718B6C1649B7D1E4AD2FD342E9037DB058361EBBB0A2109F1CFBDB6EB", L"the 2010 release, version 1.3"},
+    {"77F8F2C5FAB157FBF46BF0081524715C19A385ECCB19E3C717A04F5EF30DBCBB", L"the re-release, version 1.4"},
+};
 const wchar_t* const kRequiredGameFiles[] = {L"default.xex", L"ArcadeInfo.xml", L"DataFiles\\PackedSegFile"};
 const wchar_t* const kRuntimeFiles[] = {L"Perfect Dark.exe",  L"rexruntime.dll",    L"rexgpu-xenos.dll",
                                         L"msvcp140.dll",      L"msvcp140_atomic_wait.dll",
-                                        L"vcruntime140.dll",  L"vcruntime140_1.dll"};
+                                        L"vcruntime140.dll",  L"vcruntime140_1.dll",
+                                        L"dxcompiler.dll",    L"dxil.dll"};  // DXC: Plume's shaders
 const wchar_t* const kGameExeName = L"Perfect Dark.exe";
 const wchar_t* const kShortcutName = L"Perfect Dark.lnk";
 const wchar_t* const kShortcutDescription = L"Perfect Dark (XBLA PC port)";
@@ -91,17 +103,55 @@ class Sha256 {
   BCRYPT_HASH_HANDLE hash_ = nullptr;
 };
 
-std::string HashFile(const fs::path& path) {
+// The first bytes of the file go to *head (up to its size), for DescribeXex.
+std::string HashFile(const fs::path& path, std::vector<uint8_t>* head = nullptr) {
   HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                             FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file == INVALID_HANDLE_VALUE) return {};
   Sha256 sha;
   std::vector<uint8_t> buffer(1 << 20);
   DWORD got = 0;
-  while (ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &got, nullptr) && got > 0)
+  bool first = true;
+  while (ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &got, nullptr) && got > 0) {
+    if (head && first) head->assign(buffer.begin(), buffer.begin() + std::min<size_t>(got, head->size()));
+    first = false;
     sha.Add(buffer.data(), got);
+  }
   CloseHandle(file);
   return sha.Hex();
+}
+
+const KnownXex* FindKnownXex(const std::string& sha256) {
+  for (const KnownXex& known : kKnownXex) {
+    if (sha256 == known.sha256) return &known;
+  }
+  return nullptr;
+}
+
+// "version 0.0.1.4, media ID 3077A693", read from the start of a default.xex
+// (its header is not encrypted), so a log shows which build a refused package holds.
+std::wstring DescribeXex(const std::vector<uint8_t>& head) {
+  if (head.size() < 0x18 || memcmp(head.data(), "XEX2", 4) != 0) return L"not an Xbox 360 program";
+  const uint32_t count = BE32(head.data() + 0x14);
+  for (uint32_t i = 0; i < count && 0x18 + (i + 1) * 8 <= head.size(); ++i) {
+    const uint8_t* entry = head.data() + 0x18 + i * 8;
+    if (BE32(entry) != 0x00040006) continue;  // execution info
+    const uint32_t at = BE32(entry + 4);
+    if (at + 8 > head.size()) break;
+    const uint32_t media = BE32(head.data() + at);
+    const uint32_t version = BE32(head.data() + at + 4);
+    wchar_t text[80];
+    swprintf(text, 80, L"version %u.%u.%u.%u, media ID %08X", version >> 28, (version >> 24) & 0xF,
+             (version >> 8) & 0xFFFF, version & 0xFF, media);
+    return text;
+  }
+  return L"no version information";
+}
+
+std::wstring XexLogLine(const std::string& sha256, const std::vector<uint8_t>& head) {
+  const KnownXex* known = FindKnownXex(sha256);
+  return L"SHA-256 " + Widen(sha256) + L" (" + DescribeXex(head) + L"): " +
+         (known ? std::wstring(known->name) : std::wstring(L"not a build this port supports"));
 }
 
 // ------------------------------------------------------- embedded files --
@@ -597,6 +647,7 @@ ImportResult Import(const Paths& p, const Source& source, const fs::path& saves_
   int total_files = 0;
   std::vector<fs::path> previous_files;
   const fs::path previous_assets = source.path / L"assets";
+  std::string xex_hash;
   if (source.kind == SourceKind::Package) {
     std::wstring why;
     uint64_t bytes = 0;
@@ -608,13 +659,18 @@ ImportResult Import(const Paths& p, const Source& source, const fs::path& saves_
         return fail(L"This package does not contain " + std::wstring(name) + L". It may be damaged or incomplete.");
     }
     Sha256 sha;
-    if (!package->Read(*package->Find(L"default.xex"), [&](const uint8_t* d, size_t n) { sha.Add(d, n); return true; }, &why))
-      return fail(why);
-    const std::string hash = sha.Hex();
-    Log(L"default.xex SHA-256 " + Widen(hash));
-    if (hash != kXexSha256)
-      return fail(L"This Perfect Dark package carries a different build of the game program than the one this port "
-                  L"was made from, so it cannot be used. Nothing was changed.");
+    std::vector<uint8_t> head;
+    auto sink = [&](const uint8_t* d, size_t n) {
+      if (head.size() < 0x4000) head.insert(head.end(), d, d + std::min(n, 0x4000 - head.size()));
+      sha.Add(d, n);
+      return true;
+    };
+    if (!package->Read(*package->Find(L"default.xex"), sink, &why)) return fail(why);
+    xex_hash = sha.Hex();
+    Log(L"default.xex " + XexLogLine(xex_hash, head));
+    if (!FindKnownXex(xex_hash))
+      return fail(L"This package holds a build of the game program this port cannot use. Use the package named "
+                  L"4287CC74… or 8292DB97… instead. Nothing was changed.");
     total = package->total_file_bytes();
     for (const stfs::Entry& e : package->entries()) total_files += e.directory ? 0 : 1;
   } else {
@@ -622,9 +678,10 @@ ImportResult Import(const Paths& p, const Source& source, const fs::path& saves_
       if (!FileExists(previous_assets / name))
         return fail(L"The previous install is missing " + std::wstring(name) + L". Choose your Xbox 360 package instead.");
     }
-    const std::string hash = HashFile(previous_assets / L"default.xex");
-    Log(L"previous default.xex SHA-256 " + Widen(hash));
-    if (hash != kXexSha256)
+    std::vector<uint8_t> head(0x4000);
+    xex_hash = HashFile(previous_assets / L"default.xex", &head);
+    Log(L"previous default.xex " + XexLogLine(xex_hash, head));
+    if (!FindKnownXex(xex_hash))
       return fail(L"The previous install holds a different build of the game program. Choose your Xbox 360 package instead.");
     for (fs::recursive_directory_iterator it(previous_assets, fs::directory_options::skip_permission_denied, ec), end;
          !ec && it != end; it.increment(ec)) {
@@ -713,14 +770,14 @@ ImportResult Import(const Paths& p, const Source& source, const fs::path& saves_
   for (const wchar_t* name : kRequiredGameFiles) {
     if (!FileExists(p.staging / name)) return fail(L"After importing, " + std::wstring(name) + L" is missing.");
   }
-  if (HashFile(p.staging / L"default.xex") != kXexSha256)
+  if (HashFile(p.staging / L"default.xex") != xex_hash)
     return fail(L"The imported default.xex does not match the package. The disk may be failing; try again.");
 
   // 4. This port patches nothing in the game's files: its PC menu wording and
   // fixes are applied inside the game as it runs. The marker goes in last, so
   // only a complete copy is ever "installed".
   const std::string marker = "version = " + Narrow(kVersion) + "\nsource = " + Narrow(Describe(source)) +
-                             "\ndefault_xex_sha256 = " + kXexSha256 + "\n";
+                             "\ndefault_xex_sha256 = " + xex_hash + "\n";
   if (!WriteAll(p.staging / kMarkerName, marker)) return fail(L"Could not write to resources\\.import.");
   if (cancel.load()) return cancelled();
 
@@ -804,6 +861,8 @@ const char* const kKeyFullscreen = "fullscreen";
 const char* const kKeyCheats = "pd_unlock_all_cheats";
 const char* const kKeyStory = "pd_story_complete";
 const char* const kKeyMultiplayer = "pd_unlock_all_multiplayer";
+const char* const kKeyAutoAim = "pd_default_auto_aim";
+const char* const kKeyLanguage = "user_language";
 
 fs::path ShortcutPath(const fs::path& folder) {
   if (!folder.empty()) return folder / kShortcutName;
@@ -866,6 +925,11 @@ bool ConfigIsTrue(const Paths& p, const char* key) {
 
 }  // namespace
 
+const LanguageChoice kLanguages[5] = {
+    {1, L"English", L"en"},  {4, L"Fran\u00E7ais", L"fr"}, {3, L"Deutsch", L"de"},
+    {6, L"Italiano", L"it"}, {5, L"Espa\u00F1ol", L"es"},
+};
+
 Extras CurrentExtras(const Paths& p, const fs::path& shortcut_folder) {
   Extras e;
   std::string value;
@@ -874,6 +938,11 @@ Extras CurrentExtras(const Paths& p, const fs::path& shortcut_folder) {
   e.cheats = ConfigIsTrue(p, kKeyCheats);
   e.story = ConfigIsTrue(p, kKeyStory);
   e.multiplayer = ConfigIsTrue(p, kKeyMultiplayer);
+  e.autoaim = ConfigIsTrue(p, kKeyAutoAim);
+  if (ReadConfig(p, kKeyLanguage, &value)) {
+    const unsigned long id = std::strtoul(value.c_str(), nullptr, 10);
+    if (id != 0) e.language = static_cast<uint32_t>(id);
+  }
   e.shortcut = OurShortcut(p, ShortcutPath(shortcut_folder));
   return e;
 }
@@ -894,6 +963,11 @@ std::wstring ApplyExtras(const Paths& p, const Extras& want, const Extras& was, 
   set(want.cheats, was.cheats, kKeyCheats, L"all cheats unlocked");
   set(want.story, was.story, kKeyStory, L"100% story completion");
   set(want.multiplayer, was.multiplayer, kKeyMultiplayer, L"all multiplayer content");
+  set(want.autoaim, was.autoaim, kKeyAutoAim, L"Auto-Aim on");
+  if (want.language != was.language) {
+    WriteConfig(p, kKeyLanguage, std::to_string(want.language));
+    Log(L"Game language: " + std::to_wstring(want.language));
+  }
   if (want.shortcut != was.shortcut) {
     const fs::path link = ShortcutPath(shortcut_folder);
     if (link.empty()) {

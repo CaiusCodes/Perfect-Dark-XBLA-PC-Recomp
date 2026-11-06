@@ -7,6 +7,8 @@
 # Xbox 360 package files (named by their 40-character content hash) and dumps.
 /[0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]*
 *.bin
+# The Plume renderer's pipeline list (shader hashes and states, no game data).
+!/packaging/native_pipelines.bin
 
 # Code translated from default.xex by the ReXGlue code generator. Derived
 # from the game's program, so never committed; only the SDK boilerplate

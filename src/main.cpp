@@ -6,12 +6,15 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/diag_timing.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 
 #include <dbghelp.h>
 
 #include <algorithm>
 #include <csignal>
 #include <filesystem>
+#include <thread>
 #include <vector>
 
 #pragma comment(lib, "dbghelp.lib")
@@ -36,12 +39,33 @@ REXCVAR_DEFINE_BOOL(pd_story_complete, false, "PerfectDark",
                     "time)");
 REXCVAR_DEFINE_BOOL(pd_unlock_all_multiplayer, false, "PerfectDark",
                     "Unlock every Combat Simulator arena, weapon, character and option");
+// The launcher's "Auto-Aim on" extra (HANDOVER 4az). The port starts new and default
+// control settings with Auto-Aim off (PdHookAutoAimOff*); this keeps the Xbox's on.
+// Settings a player already has are not changed: Player Setup > Control sets those.
+REXCVAR_DEFINE_BOOL(pd_default_auto_aim, false, "PerfectDark",
+                    "New and default control settings start with Auto-Aim on");
 
 // Settings > Video > Render Scale (PerfectDarkApp::OnPreSetup, HANDOVER 4ai).
 REXCVAR_DEFINE_STRING(pd_render_scale, "1", "PerfectDark",
                       "Internal rendering sharpness: 1, 2 or 3 times the Xbox's 1280 x 720; "
                       "applied when the game starts (an old \"auto\" is 1)")
     .allowed({"1", "2", "3", "auto"});
+
+// Settings > Video > Aspect Ratio (PerfectDarkApp::ApplyAspectRatioIndex, HANDOVER 4ay).
+// The game still has the N64's screen-ratio switch (optionsGetScreenRatio,
+// sub_821DC2E0): every view's aspect is its width over its height times 0.75,
+// and times 4/3 again when the ratio is 16:9, which the Xbox version always
+// returns. For 4:3 the hook answers "normal", so the 3D view gets the N64's
+// 4:3 field of view, and the SDK presenter shows the 16:9 frame squeezed to a
+// 4:3 box with bars at the sides (present_aspect_ratio). Both apply at once.
+REXCVAR_DEFINE_STRING(pd_aspect_ratio, "16:9", "PerfectDark",
+                      "Picture shape: 16:9 (the Xbox version) or 4:3 (the N64's field of view, "
+                      "with bars at the sides)")
+    .allowed({"16:9", "4:3"});
+
+bool PdAspect43() {
+  return REXCVAR_GET(pd_aspect_ratio) == "4:3";
+}
 
 // Which one-time updates of an older release's perfect_dark.toml this file
 // has had (PerfectDarkApp::MigrateSettings, HANDOVER 4ak).
@@ -78,6 +102,51 @@ uint32_t PdRoomBrightnessFloor(uint32_t brightness) {
   const uint32_t floor = uint32_t(REXCVAR_GET(pd_dark_room_visibility) * 255.0 + 0.5);
   return value < floor ? floor : value;
 }
+
+// Camera Bob (Settings > Display Interface, pd_view_bob). The head update sub_820F0150 (the
+// N64's bheadUpdate) builds the eye's offset (r1+80), look (r1+112) and up (r1+96)
+// vectors from Joanna's walk animation and idle breathing, then hands them on at
+// 0x820F068C (smoothed into player+968/+980/+992). Head Roll only decides whether
+// the camera turns by the look and up vectors (sub_820F26D0), so with it off the eye
+// still bobs. Off, the eye stays at the resting height (player+1052, its value
+// standing still) looking straight ahead with no roll; the offset's x and z stay, as
+// they are what moves Joanna (the walk code sub_820EF018 reads player+968/+976).
+REXCVAR_DEFINE_BOOL(pd_view_bob, true, "PerfectDark",
+                    "Camera bob while walking (off = the camera stays level and steady)");
+
+void PdViewBobHold(uint8_t* base, uint32_t sp) {
+  if (REXCVAR_GET(pd_view_bob)) return;
+  auto load = [base](uint32_t a) {
+    uint32_t v;
+    std::memcpy(&v, base + a, 4);
+    return __builtin_bswap32(v);
+  };
+  auto store = [base](uint32_t a, float f) {
+    uint32_t v;
+    std::memcpy(&v, &f, 4);
+    v = __builtin_bswap32(v);
+    std::memcpy(base + a, &v, 4);
+  };
+  const uint32_t player = load(0x82648BF8u + 1188);  // g_Vars.currentplayer
+  if (!player) return;
+  const uint32_t rest = load(player + 1052);
+  float height;
+  std::memcpy(&height, &rest, 4);
+  store(sp + 84, height);
+  store(sp + 112, 0.0f);
+  store(sp + 116, 0.0f);
+  store(sp + 120, 1.0f);
+  store(sp + 96, 0.0f);
+  store(sp + 100, 1.0f);
+  store(sp + 104, 0.0f);
+}
+
+// Lighting capture for bug reports (perfect_dark_app.h, F9 or Insert): off by default.
+REXCVAR_DEFINE_BOOL(pd_light_capture, false, "PerfectDark",
+                    "F9 or Insert logs one frame's draws and lighting constants (for lighting bug reports)");
+REXCVAR_DEFINE_STRING(pd_light_watch, "", "PerfectDark",
+                      "With pd_light_capture: F9 watches writes to this hex byte pattern in the game's memory, "
+                      "F9 again lists the code that made them (lighting investigation)");
 
 REXCVAR_DEFINE_BOOL(pd_menu_mouse, true, "PerfectDark",
                     "Use the mouse in menus: point at a row to highlight it, left button "
@@ -144,6 +213,10 @@ bool PdExtraAllCheats() {
 
 bool PdExtraAllMultiplayer() {
   return REXCVAR_GET(pd_unlock_all_multiplayer);
+}
+
+bool PdDefaultAutoAim() {
+  return REXCVAR_GET(pd_default_auto_aim);
 }
 
 // CPU use (HANDOVER 4ah). Three game threads waited by spinning: on the Xbox
@@ -231,6 +304,31 @@ LONG WINAPI PdCrashFilter(EXCEPTION_POINTERS* info) {
                                     record->ExceptionInformation[0] ? "writing" : "reading",
                                     record->ExceptionInformation[1])
                       : std::string());
+  // A guest thread: its registers and the return addresses up its stack (each frame's
+  // back chain at 0(r1), the caller's saved LR 8 bytes below the next frame), read only
+  // from committed guest pages.
+  if (rex::runtime::ThreadState* ts = rex::runtime::ThreadState::Get(); ts && ts->context()) {
+    const PPCContext& c = *ts->context();
+    uint8_t* mem = rex::system::kernel_state() && rex::system::kernel_state()->memory()
+                       ? rex::system::kernel_state()->memory()->virtual_membase()
+                       : nullptr;
+    const auto load = [mem](uint32_t address, uint32_t& value) {
+      MEMORY_BASIC_INFORMATION mbi{};
+      if (!mem || !address || !VirtualQuery(mem + address, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+      std::memcpy(&value, mem + address, 4);
+      value = __builtin_bswap32(value);
+      return true;
+    };
+    std::string callers;
+    uint32_t frame = c.r1.u32, back = 0, lr = 0;
+    for (int i = 0; i < 8 && load(frame, back) && back > frame; ++i, frame = back) {
+      if (load(back - 8, lr)) callers += fmt::format(" {:08X}", lr);
+    }
+    REXLOG_CRITICAL("[crash] guest lr {:08X} ctr {:08X} r1 {:08X} r3 {:08X} r4 {:08X} r5 {:08X} r11 {:08X} r30 {:08X} "
+                    "r31 {:08X}; callers{}",
+                    uint32_t(c.lr), c.ctr.u32, c.r1.u32, c.r3.u32, c.r4.u32, c.r5.u32, c.r11.u32, c.r30.u32, c.r31.u32,
+                    callers);
+  }
   const std::wstring dir = CrashLogsFolder();
   SYSTEMTIME now;
   GetLocalTime(&now);
@@ -267,10 +365,77 @@ void PdInstallCrashReport() {
   std::signal(SIGABRT, PdAbortHandler);
 }
 
+// Hybrid CPUs (HANDOVER 4ba). Intel 12th gen and later mix fast performance cores
+// with slow efficiency cores, and Windows 10 does not tell them apart: the game's
+// threads, which sleep between frames, woke on efficiency cores and missed vblanks
+// (an i9-12900K on Windows 10 ran ~46 fps with the GPU 45% busy). The process is
+// kept on the cores of the highest efficiency class; on a CPU with one kind of
+// core this does nothing.
+REXCVAR_DEFINE_BOOL(prefer_performance_cores, true, "PerfectDark",
+                    "On a CPU with performance and efficiency cores, keep the game on the "
+                    "performance cores");
+
+void PdPreferPerformanceCores() {
+  ULONG size = 0;
+  GetSystemCpuSetInformation(nullptr, 0, &size, GetCurrentProcess(), 0);
+  std::vector<uint8_t> buffer(size);
+  if (size == 0 ||
+      !GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+                                  size, &size, GetCurrentProcess(), 0)) {
+    REXLOG_INFO("[system] CPU sets not available: cores left to Windows");
+    return;
+  }
+  std::vector<std::pair<ULONG, BYTE>> sets;  // id, efficiency class
+  BYTE top = 0, bottom = 255;
+  for (ULONG offset = 0; offset < size;) {
+    const auto* entry = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+    if (entry->Size == 0) break;
+    if (entry->Type == CpuSetInformation) {
+      const BYTE efficiency = entry->CpuSet.EfficiencyClass;
+      sets.emplace_back(entry->CpuSet.Id, efficiency);
+      top = std::max(top, efficiency);
+      bottom = std::min(bottom, efficiency);
+    }
+    offset += entry->Size;
+  }
+  if (sets.empty() || top == bottom) {
+    REXLOG_INFO("[system] CPU cores: one kind ({} logical processors), no core preference",
+                sets.size());
+    return;
+  }
+  std::vector<ULONG> fast;
+  for (const auto& [id, efficiency] : sets) {
+    if (efficiency == top) fast.push_back(id);
+  }
+  if (!REXCVAR_GET(prefer_performance_cores)) {
+    REXLOG_INFO("[system] hybrid CPU: {} of {} logical processors are performance cores; "
+                "prefer_performance_cores is off, so all are used",
+                fast.size(), sets.size());
+    return;
+  }
+  if (SetProcessDefaultCpuSets(GetCurrentProcess(), fast.data(), ULONG(fast.size()))) {
+    REXLOG_INFO("[system] hybrid CPU: game kept on the {} performance-core logical processors "
+                "of {}",
+                fast.size(), sets.size());
+  } else {
+    REXLOG_WARN("[system] hybrid CPU: keeping the game on the performance cores failed ({})",
+                GetLastError());
+  }
+}
+
+namespace {
+// The game thread's time in the GPU-completion poll, for its frame split in the
+// stutter log (PdNoteGameFrame). Counted per thread: six waits share the poll.
+thread_local int64_t t_gpu_poll_ticks = 0;
+thread_local uint64_t t_gpu_poll_cycles = 0;
+thread_local uint32_t t_gpu_poll_waits = 0;
+}  // namespace
+
 void PdGpuWaitBackoff() {
   if (!REXCVAR_GET(pd_sleep_in_waits)) return;
   thread_local int64_t wait_start = 0;
   thread_local int64_t last_poll = 0;
+  thread_local uint64_t last_poll_cycles = 0;
   static const int64_t freq = [] {
     LARGE_INTEGER f;
     QueryPerformanceFrequency(&f);
@@ -278,8 +443,18 @@ void PdGpuWaitBackoff() {
   }();
   LARGE_INTEGER now;
   QueryPerformanceCounter(&now);
+  const int64_t start = now.QuadPart;
+  const bool timing = rex::diag::TimingLogOn();
+  const uint64_t cycles = timing ? rex::diag::ThreadCycles() : 0;
   // Polls within one wait come microseconds apart; a gap over 2 ms means a new wait.
-  if (now.QuadPart - last_poll > freq / 500) wait_start = now.QuadPart;
+  if (now.QuadPart - last_poll > freq / 500) {
+    wait_start = now.QuadPart;
+    ++t_gpu_poll_waits;
+  } else if (timing && last_poll && last_poll_cycles) {
+    // The guest's own poll code between two calls is part of the wait too.
+    t_gpu_poll_ticks += now.QuadPart - last_poll;
+    t_gpu_poll_cycles += cycles - last_poll_cycles;
+  }
   if (now.QuadPart - wait_start < freq / 2000) {
     SwitchToThread();
   } else {
@@ -287,6 +462,12 @@ void PdGpuWaitBackoff() {
   }
   QueryPerformanceCounter(&now);
   last_poll = now.QuadPart;
+  last_poll_cycles = 0;
+  if (timing) {
+    last_poll_cycles = rex::diag::ThreadCycles();
+    t_gpu_poll_ticks += now.QuadPart - start;
+    t_gpu_poll_cycles += last_poll_cycles - cycles;
+  }
 }
 
 // Game clock (HANDOVER 4aj). The port's osGetCount (perfect_dark_recomp.12.cpp
@@ -382,12 +563,15 @@ int32_t PdLegalScreenTicks() {
 // heard something different (user, 2026-10-27). Now the host's pick rules:
 //  - the host publishes the track slot it chose (netplay::SetHostValue; joined
 //    PCs ask for it twice a second);
-//  - a joined PC that already has the host's new pick plays it instead of its
-//    own; if its own pick came first, the next frame after the host's arrives
-//    runs the track out (elapsed = length) and the game's own track change
-//    picks again, now the host's;
-//  - near the end of a track a joined PC holds the track for up to 3 s
-//    while it waits for the host's next pick, instead of playing a track of its own.
+//  - a joined PC plays the host's pick from the last 10 s instead of its own.
+//    At a match's start (both PCs pick as the stage starts, the host's arriving
+//    a few hundred ms later) it waits up to 1.5 s for it;
+//  - with track changes during the match (the music tick's switch, kMpMusicOn,
+//    set by match setup sub_821D28A0; off in the network matches tested, which
+//    keep one track all match), a new host pick that arrives after a joined
+//    PC's own runs its track out (elapsed = length) so the game picks again,
+//    and near the end of a track a joined PC holds it for up to 3 s while it
+//    waits for the host's next pick (HANDOVER 4ar, 4bj).
 // Both PCs need this build; a host without it never answers, and nothing changes.
 REXCVAR_DEFINE_BOOL(pd_mp_music_sync, true, "PerfectDark",
                     "In a network match, play the host's multiplayer music track on every PC "
@@ -404,6 +588,12 @@ constexpr uint32_t kTrackSlots = 48;            // the soundtrack bitmask holds 
 constexpr auto kHostPickFresh = std::chrono::seconds(10);
 constexpr auto kMostHold = std::chrono::seconds(3);
 
+constexpr uint32_t kGVarsLevelFrames = 0x82648BF8 + 0x0C;  // g_Vars lvframenum
+// At a match's start the game picks while both PCs start the stage together; the
+// host's pick reaches a joined PC within a few hundred ms (it asks twice a second).
+constexpr auto kStartWait = std::chrono::milliseconds(1500);
+constexpr uint32_t kStartFrames = 600;  // "the start": the first 10 s of the stage
+
 uint32_t mp_music_used_seq = 0;  // the host pick this PC last played
 std::chrono::steady_clock::time_point mp_music_hold_since;
 
@@ -414,11 +604,15 @@ void SetGuestU32(uint8_t* base, uint32_t address, uint32_t value) {
   *reinterpret_cast<uint32_t*>(base + address) = _byteswap_ulong(value);
 }
 
-// A new pick of the host's, set within the last few seconds.
-bool NewHostPick(rex::kernel::xam::netplay::HostValue* host) {
+// The host's pick, set within the last few seconds (used before or not).
+bool RecentHostPick(rex::kernel::xam::netplay::HostValue* host) {
   if (!rex::kernel::xam::netplay::LatestHostValue(host)) return false;
-  return host->seq != mp_music_used_seq && host->value < kTrackSlots &&
-         std::chrono::steady_clock::now() - host->set_at < kHostPickFresh;
+  return host->value < kTrackSlots && std::chrono::steady_clock::now() - host->set_at < kHostPickFresh;
+}
+
+// A recent pick of the host's that this PC has not played yet.
+bool NewHostPick(rex::kernel::xam::netplay::HostValue* host) {
+  return RecentHostPick(host) && host->seq != mp_music_used_seq;
 }
 }  // namespace
 
@@ -434,7 +628,16 @@ void PdMpChooseTrack(PPCContext& ctx, uint8_t* base) {
   }
   if (!netplay::IsJoinedSession()) return;
   netplay::HostValue host;
-  if (!NewHostPick(&host)) {
+  bool found = RecentHostPick(&host);
+  if (!found && GuestU32(base, kGVarsLevelFrames) < kStartFrames) {
+    // The match is starting: the host is picking now too; its pick is on the way.
+    const auto until = std::chrono::steady_clock::now() + kStartWait;
+    while (!found && std::chrono::steady_clock::now() < until) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      found = RecentHostPick(&host);
+    }
+  }
+  if (!found) {
     REXLOG_INFO("[mp_music] own pick, slot {}, until the host's arrives", own);
     return;
   }
@@ -513,7 +716,17 @@ void PdNoteGameFrame(uint8_t* base) {
     if (network_clock) ++network_frames;
   }
   last_frame = now.QuadPart;
-  if (!window_start) window_start = now.QuadPart;
+  // The game thread's own split over the window (issue #1): how much of each
+  // frame it spent in the GPU-completion poll, and how much it was on a CPU.
+  static uint64_t window_tsc = 0, window_cycles = 0;
+  if (!window_start) {
+    window_start = now.QuadPart;
+    window_tsc = rex::diag::TscNow();
+    window_cycles = rex::diag::ThreadCycles();
+    t_gpu_poll_ticks = 0;
+    t_gpu_poll_cycles = 0;
+    t_gpu_poll_waits = 0;
+  }
   if (now.QuadPart - window_start >= 10 * freq) {
     const double seconds = double(now.QuadPart - window_start) / double(freq);
     REXLOG_INFO("[timing] game steps: {} frames, game time {:.2f}% of real time, {} double "
@@ -522,6 +735,25 @@ void PdNoteGameFrame(uint8_t* base) {
                 frames, double(steps) / (seconds * 60.0) * 100.0, doubles, long_frames, most,
                 network_frames ? fmt::format(", network clock for {} frames", network_frames)
                                : std::string());
+    const uint64_t tsc = rex::diag::TscNow();
+    const uint64_t cycles = rex::diag::ThreadCycles();
+    if (frames && tsc > window_tsc) {
+      const double wall_ms = seconds * 1000.0;
+      const double tsc_per_ms = double(tsc - window_tsc) / wall_ms;
+      const double n = double(frames);
+      const double poll_ms = double(t_gpu_poll_ticks) * 1000.0 / double(freq);
+      const double cpu_ms = double(cycles - window_cycles) / tsc_per_ms;
+      const double poll_cpu_ms = double(t_gpu_poll_cycles) / tsc_per_ms;
+      REXLOG_INFO("[timing] game thread per frame: {:.2f} ms = waiting for the GPU {:.2f} ms (on a "
+                  "CPU {:.2f} ms, {:.1f} waits a frame), the rest {:.2f} ms (on a CPU {:.2f} ms)",
+                  wall_ms / n, poll_ms / n, poll_cpu_ms / n, double(t_gpu_poll_waits) / n,
+                  (wall_ms - poll_ms) / n, (cpu_ms - poll_cpu_ms) / n);
+    }
+    window_tsc = tsc;
+    window_cycles = cycles;
+    t_gpu_poll_ticks = 0;
+    t_gpu_poll_cycles = 0;
+    t_gpu_poll_waits = 0;
     window_start = now.QuadPart;
     frames = steps = doubles = long_frames = network_frames = 0;
     most = 0;
@@ -532,6 +764,33 @@ bool PdIdleSleep() {
   if (!REXCVAR_GET(pd_sleep_in_waits)) return false;
   SleepHalfMillisecond();
   return true;
+}
+
+// A network match's frame wait (sub_8214D6C8, the loop at 0x8214D8A8 that reads the
+// match clock until the next frame is due), each time it is about to go round again.
+// Under Xenos the game thread has spent the frame waiting for the GPU before it gets
+// here, so the loop seldom turns; with gpu_native nothing else waits and it spun
+// through most of every frame (a native host: 16.6 ms on a CPU per 16.7 ms frame,
+// 2026-11-03). Yield for the first 0.5 ms of a wait, then sleep in 0.5 ms steps.
+void PdNetFrameWaitBackoff() {
+  if (!REXCVAR_GET(pd_sleep_in_waits)) return;
+  thread_local int64_t wait_start = 0;
+  thread_local int64_t last_poll = 0;
+  static const int64_t freq = [] {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return f.QuadPart;
+  }();
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  if (now.QuadPart - last_poll > freq / 500) wait_start = now.QuadPart;  // a new wait
+  if (now.QuadPart - wait_start < freq / 2000) {
+    SwitchToThread();
+  } else {
+    SleepHalfMillisecond();
+  }
+  QueryPerformanceCounter(&now);
+  last_poll = now.QuadPart;
 }
 
 // Menu rows the game skips (greyed out or hidden): called from the dialog tick in

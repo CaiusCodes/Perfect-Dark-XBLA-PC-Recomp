@@ -1,0 +1,41 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+index dcae4e3..8e04e04 100644
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -250,6 +250,10 @@ namespace plume {
+         if (dxgiFormat == DXGI_FORMAT_R24G8_TYPELESS) {
+             return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+         }
++        if (dxgiFormat == DXGI_FORMAT_R32_TYPELESS) {
++            // Depth target that is also sampled (created typeless).
++            return DXGI_FORMAT_R32_FLOAT;
++        }
+         return dxgiFormat;
+     }
+ 
+@@ -262,6 +266,9 @@ namespace plume {
+         if (dxgiFormat == DXGI_FORMAT_R24G8_TYPELESS) {
+             return DXGI_FORMAT_D24_UNORM_S8_UINT;
+         }
++        if (dxgiFormat == DXGI_FORMAT_R32_TYPELESS) {
++            return DXGI_FORMAT_D32_FLOAT;
++        }
+         return dxgiFormat;
+     }
+ 
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 11abda8..e3a1b7e 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -93,6 +93,11 @@ namespace plume {
+         VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
+         // Vulkan spec requires this to be enabled if supported by the driver.
+         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
++#   if defined(_WIN64)
++        // Images shared with another Vulkan device on the same GPU (an
++        // application's presenter): imported from a Win32 handle.
++        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
++#   endif
+     };
+ 
+     // Common functions.

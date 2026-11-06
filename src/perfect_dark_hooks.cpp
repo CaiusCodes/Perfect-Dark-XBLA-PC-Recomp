@@ -23,12 +23,16 @@ void PdNoteGameFrame(uint8_t* base);
 uint64_t PdTimerMicroseconds(uint64_t ticks);
 void PdGpuWaitBackoff();
 bool PdIdleSleep();
+void PdNetFrameWaitBackoff();
 bool PdMenuSkipScanWanted(uint32_t dialog);
 void PdMenuSkipNote(uint32_t item, uint32_t skipped);
 bool PdExtraAllCheats();
 bool PdExtraAllMultiplayer();
+bool PdDefaultAutoAim();
 uint32_t PdRoomBrightnessFloor(uint32_t brightness);
+bool PdAspect43();
 float PdDarkRoomObjectVisibility();
+void PdViewBobHold(uint8_t* base, uint32_t sp);
 int64_t PdMpUpdateRate();
 int64_t PdMpUpdateRateMin();
 int64_t PdMpFacingDelayMs();
@@ -104,19 +108,31 @@ bool PdHookIdleSleep(PPCRegister& r3) {
   return true;
 }
 
+// After the frame wait's `cmplw cr6,r9,r6` (sub_8214D6C8): it goes round again while
+// the frames counted (r9) are short of the step the game wants (r6). Only the network
+// clock's path waits for real time (g_Vars+0x731 set); the local one never turns.
+void PdHookNetFrameWait(PPCRegister& r9, PPCRegister& r6) {
+  if (r9.u32 < r6.u32 && HookBase()[0x82648BF8 + 0x731]) PdNetFrameWaitBackoff();
+}
+
 // ---- Controls ---------------------------------------------------------------------
 
+// The three Auto-Aim hooks do nothing when pd_default_auto_aim is on: the game's
+// own values (Auto-Aim on) stand.
 // After `ori r9,r11,2`: the Auto-Aim bit stays off.
 void PdHookAutoAimOffR9(PPCRegister& r9, PPCRegister& r11) {
+  if (PdDefaultAutoAim()) return;
   r9.u64 = r11.u64 & ~uint64_t(2);
 }
 // After `li r4,1` (default control settings): Auto-Aim off.
 void PdHookAutoAimOffR4(PPCRegister& r4) {
+  if (PdDefaultAutoAim()) return;
   r4.s64 = 0;
 }
 // After `ori r11,r11,9130` (a new profile's controls; 9130 includes Auto-Aim, 2): the
 // bit is kept only if the stored flags at r29 already had it, as `| 9128` would.
 void PdHookAutoAimOffProfile(PPCRegister& r11, PPCRegister& r29) {
+  if (PdDefaultAutoAim()) return;
   const uint32_t stored = LoadU32(HookBase(), r29.u32);
   r11.u64 = (r11.u64 & ~uint64_t(2)) | (stored & 2);
 }
@@ -165,6 +181,14 @@ bool PdHookAllCheats(PPCRegister& r3) {
 
 // ---- Graphics ---------------------------------------------------------------------
 
+// optionsGetScreenRatio: with Aspect Ratio 4:3 it answers 0 (normal), so views get the
+// 4:3 field of view; otherwise the game's own answer (16:9).
+bool PdHookScreenRatio(PPCRegister& r3) {
+  if (!PdAspect43()) return false;
+  r3.u64 = 0;
+  return true;
+}
+
 void PdHookRoomBrightness(PPCRegister& r3) {
   r3.u64 = PdRoomBrightnessFloor(r3.u32);
 }
@@ -185,6 +209,11 @@ void PdHookShadeAlpha(PPCRegister& r9, PPCRegister& f9, PPCRegister& f10, PPCReg
   std::memcpy(&bits, &a, 4);
   bits = __builtin_bswap32(bits);
   std::memcpy(HookBase() + r9.u32 + 6092, &bits, 4);
+}
+
+// Before the head update hands on its eye offset (r1+80), look (r1+112) and up (r1+96).
+void PdHookViewBobHold(PPCRegister& r1) {
+  PdViewBobHold(HookBase(), r1.u32);
 }
 
 // ---- Multiplayer ------------------------------------------------------------------

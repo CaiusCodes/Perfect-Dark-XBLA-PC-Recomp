@@ -26,7 +26,7 @@ tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
   newer; most PCs from 2015 onwards)
 - A graphics card with DirectX 12 or Vulkan support
 - Your own Perfect Dark Xbox Live Arcade package (the Xbox 360 game file for
-  Title ID `584109C2`)
+  Title ID `584109C2`, named `4287CC74…` or `8292DB97…`)
 
 ## Install and play
 
@@ -37,7 +37,8 @@ tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 2. Open **Perfect Dark.exe**. The first time, the setup window opens.
 3. Drag your package file onto the window or click **Browse Package**.
 4. Tick any optional extras: start in fullscreen, desktop shortcut, all cheats
-   unlocked, 100% story completion, unlock all multiplayer content.
+   unlocked, 100% story completion, unlock all multiplayer content, Auto-Aim on,
+   and the game language.
 5. Click **Play** once it says READY TO PLAY.
 
 ![Setup window](docs/screenshots/setup.png)
@@ -45,28 +46,58 @@ tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
 After setup opening `Perfect Dark.exe` starts the game straight away; the
 package is not needed again. Everything stays inside the extracted folder
 (`resources\assets` for the imported game data, `resources\userdata` for saves
-and settings), so it can be moved or backed up as a whole. To update, run a fresh install or
-extract a new release over the folder: your imported data, saves and settings are kept.
+and settings), so it can be moved or backed up as a whole.
 
-The launcher only reads your package and never changes it. It downloads nothing,
-needs no administrator rights and neither it nor the game contacts Xbox Live.
+**To update**, open Help & Options → Settings → **Check for Updates**. If a newer
+release is out, choose **Update now**: the game closes, the launcher downloads the
+release from this page, checks it against the checksum GitHub publishes, replaces
+the program files and offers Play. Your imported game data, saves and settings are
+never touched. You can also extract a new release over the folder by hand.
+
+**To open the setup window again** (to change extras or import again), hold
+**Shift** while opening `Perfect Dark.exe`.
+
+The launcher only reads your package and never changes it. It needs no
+administrator rights, and neither it nor the game contacts Xbox Live. The only
+time either asks the internet for anything is when you choose Check for Updates.
+
+## What's new in 0.9.1
+
+- **New renderer, Plume**: the game is now drawn natively with **DirectX 12** or
+  **Vulkan** instead of through an emulated Xbox 360 graphics chip. Smoother frame
+  pacing, much lower CPU load, and the stutter on Intel 12th–14th gen (hybrid core)
+  CPUs is gone. Pick the API in Settings → Graphics → **Graphics API**.
+- **Check for Updates** in Settings: update from inside the game (see above).
+- **Camera Bob** on/off (Settings → Display Interface).
+- **Skip cutscenes** with left click or the controller's A button, not only Start.
+- **Sharpness** setting (Off, Low, Medium, High) alongside Upscaling (Off or FSR).
+- A tidier **Graphics** page; **Screen Split** moved to Display Interface.
+- **Multiplayer music**: every player in a network match now hears the host's track.
+- The **re-release package** (`8292DB97…`) is accepted as well as the original.
+- Fixes: light flares flashing or showing through walls, the FPS counter showing
+  nothing, and on Vulkan the picture freezing after minimising and restoring the window.
 
 ## Features
 
 - **Native Windows PC build**: no emulator, runs as a normal Windows program
 - **Up to 4K**: windowed or fullscreen at your screen's resolution, with
-  **Render Scale** 1x, 2x or 3x the Xbox's 1280 × 720 (Settings → Graphics)
-  and **Upscaling**: Off, Sharpen (AMD CAS) or FSR (AMD FSR 1)
-- **Steady 60 FPS** (the game's own rate) with V-Sync, Direct3D 12 on
-  NVIDIA and Vulkan on AMD and Intel graphics cards are picked automatically
+  **Render Scale** 1x, 2x or 3x the Xbox's 1280 × 720 (Settings → Graphics),
+  **Upscaling** Off or FSR (AMD FSR 1) and **Sharpness** (AMD CAS)
+- **Steady 60 FPS** (the game's own rate) with V-Sync, drawn natively by the
+  Plume renderer with DirectX 12 (default) or Vulkan
 - **Keyboard and mouse**: raw mouse look with rebindable keys and the mouse support in every menu
 - **Xbox controller** support working alongside keyboard and mouse; button
   prompts hide themselves when no controller is connected
-- **Settings menus** in Help & Options: Keyboard & Mouse, Gamepad Controls,
-  Graphics, Display Interface, Audio and Online
+- **Settings menus** in Help & Options: Audio, Graphics, Display Interface,
+  Keyboard & Mouse, Gamepad Controls, Online, Cheats and Check for Updates
+- **Camera Bob** on/off, and cutscenes skip with left click or A
 - **Leaderboards and achievements** kept on your PC
+- **Vivid Colours and Black Level** picture settings, and **F12 screenshots**
+- **Five languages**: English, French, German, Italian and Spanish, picked in
+  setup or in Settings > Display Interface (the PC port's own labels stay in English)
 - Optional extras in setup: **all cheats unlocked**, **100% story completion**
-  (every mission on every difficulty) and **all multiplayer content unlocked**
+  (every mission on every difficulty), **all multiplayer content unlocked**
+  and **Auto-Aim on** for new players (handy on Steam Deck)
 - **Portable**: one program to open, no installer; saves and settings stay in
   the game folder
 - **LAN and Virtual LAN multiplayer** for up to 8 players (12 with Simulants) 2 player Co-Operative
@@ -99,7 +130,8 @@ controller works as on the console.
 
 - The game clock no longer runs 2% fast and network matches no longer run
   0.25% fast with a double step every few seconds.
-- Light and sun flares no longer showing through walls and causing slow downs
+- Light and sun flares no longer show through walls, flash, or cause slowdowns.
+- No more uneven frame rate on Intel hybrid-core CPUs (12th–14th gen).
 - Rooms with their lights switched off are dark but visible again (they went
   completely black), with objects kept darker than the room.
 - Hosting a match no longer crashes after about three minutes in the lobby.
@@ -108,7 +140,8 @@ controller works as on the console.
   standing still reducing load.
 - Xbox LIVE leftovers removed: dead buttons, gamer cards, storage device prompts
   and messages that don't apply on PC.
-- Auto-Aim starts off, since the mouse aims; switch it on in Control settings.
+- Auto-Aim starts off, since the mouse aims; switch it on in Control settings,
+  or tick **Auto-Aim on** in setup so new players start with it (Steam Deck).
 - No Xbox LIVE Arcade logo at start-up; the Carrington Institute walk-in no
   longer turns Joanna with the mouse before the menu appears.
 - Other miscellaneous fixes.
@@ -120,17 +153,20 @@ controller works as on the console.
   time: choose *More info*, then *Run anyway*. Windows also asks for network
   access the first time you host or join a LAN or Direct Connect game; allow it
   on private and public networks (virtual LANs often count as public).
-- Only the Perfect Dark Xbox Live Arcade package with Title ID `584109C2` and
-  the exact game program this port was recompiled from is supported; setup
-  refuses other builds.
-- Not yet tested: matches eight players, local split-screen, Counter-Operative
-  over the network and AMD graphics cards on real hardware.
+- Two Perfect Dark Xbox Live Arcade packages work: `4287CC74…` (the 2010
+  release) and `8292DB97…` (the re-release). Both carry the game program this
+  port was recompiled from; setup refuses other builds.
+- Not yet tested: matches with eight players, local split-screen, Counter-Operative
+  over the network, and the Vulkan option on AMD and Intel graphics cards.
+- If something looks wrong with the new renderer, the Classic renderer of earlier
+  versions is still there: add `gpu_native = false` to
+  `resources\userdata\perfect_dark.toml` (see README.txt in the game folder).
 - At 144 or 165 Hz without G-Sync / FreeSync, 60 frames a second cannot be
   shown evenly; turn on G-Sync / FreeSync or set the screen to 120 Hz.
 
 ## Reporting a problem
 
-**When reporting an issue please attach your latest `resources\runtime\logs`.**
+**To report a problem, [open an Issue](https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp/issues/new/choose) and attach your newest log from `resources\runtime\logs`.**
 If the game crashed, the log ends with a `[crash]` line and 
 a `crash-<date>-<time>.dmp` is written beside it: attach that too.
 
@@ -140,7 +176,7 @@ comes and goes, a more detailed log helps most:
 1. Close the game and open `resources\userdata\perfect_dark.toml` in Notepad.
 2. Set `diagnostics = true` (add the line if it is not there) and save.
 3. Play until the problem has happened a few times then close the game.
-4. Open an Issue and attach the newest log from `resources\runtime\logs`.
+4. [Open an Issue](https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp/issues/new/choose) and attach the newest log from `resources\runtime\logs`.
 5. Set it back to `false` afterwards.
 
 ## For Developers

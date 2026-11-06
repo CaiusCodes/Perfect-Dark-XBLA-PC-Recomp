@@ -1,0 +1,107 @@
+# Native renderer research (checkpoint 2, branch native-renderer only): a counting
+# hook at the start of each D3D function the game uses (names: native\checkpoint1\
+# d3d_functions_pd.toml). The hooks live in src/pd_native_probe.cpp and do nothing
+# unless pd_native_probe = true.
+
+[[midasm_hook]]
+address = 0x82339D50  # D3DDevice_Swap
+name = "PdProbeSwap"
+
+[[midasm_hook]]
+address = 0x82332DF0  # D3DDevice_DrawVerticesUP (pDevice, PrimitiveType, VertexCount, pData, Stride)
+name = "PdProbeDrawUP"
+registers = ["r4", "r5"]
+
+[[midasm_hook]]
+address = 0x823333F0  # D3DDevice_DrawVertices (pDevice, PrimitiveType, StartVertex, VertexCount)
+name = "PdProbeDraw"
+registers = ["r4", "r6"]
+
+[[midasm_hook]]
+address = 0x82332E38  # D3DDevice_DrawIndexedVertices (pDevice, PrimitiveType, BaseVertexIndex, StartIndex, IndexCount)
+name = "PdProbeDrawIndexed"
+registers = ["r4", "r7"]
+
+[[midasm_hook]]
+address = 0x82333350  # the game's indexed-draw wrapper
+name = "PdProbeIndexedWrapper"
+
+[[midasm_hook]]
+address = 0x82332958  # D3DDevice_BeginVertices
+name = "PdProbeBeginVertices"
+
+[[midasm_hook]]
+address = 0x8232BB80  # D3DDevice_SetTexture
+name = "PdProbeSetTexture"
+
+[[midasm_hook]]
+address = 0x8232DB98  # D3DDevice_SetVertexShader
+name = "PdProbeSetVS"
+
+[[midasm_hook]]
+address = 0x8232D9D8  # D3DDevice_SetPixelShader
+name = "PdProbeSetPS"
+
+[[midasm_hook]]
+address = 0x8232F5A0  # D3DDevice_CreateVertexShader
+name = "PdProbeCreateVS"
+
+[[midasm_hook]]
+address = 0x8232F3B8  # the pixel-shader creator (calls XGSetPixelShaderHeader)
+name = "PdProbeCreatePS"
+
+[[midasm_hook]]
+address = 0x8232B928  # D3DDevice_CreateTexture
+name = "PdProbeCreateTexture"
+
+[[midasm_hook]]
+address = 0x82337B78  # D3DDevice_SetRenderTarget
+name = "PdProbeSetRT"
+
+[[midasm_hook]]
+address = 0x82337EC8  # D3DDevice_SetDepthStencilSurface
+name = "PdProbeSetDS"
+
+[[midasm_hook]]
+address = 0x8233B638  # D3DDevice_Resolve
+name = "PdProbeResolve"
+
+[[midasm_hook]]
+address = 0x82339480  # D3DDevice_Clear
+name = "PdProbeClear"
+
+[[midasm_hook]]
+address = 0x8233A640  # D3DDevice_BeginTiling
+name = "PdProbeBeginTiling"
+
+[[midasm_hook]]
+address = 0x8233A9B0  # D3DDevice_EndTiling
+name = "PdProbeEndTiling"
+
+[[midasm_hook]]
+address = 0x8233EE68  # D3DQuery_Issue
+name = "PdProbeQueryIssue"
+
+[[midasm_hook]]
+address = 0x8233F0F0  # D3DQuery_GetData (HANDOVER 4be)
+name = "PdProbeGetData"
+
+[[midasm_hook]]
+address = 0x8232DD68  # D3DDevice_SetVertexDeclaration
+name = "PdProbeSetDecl"
+
+[[midasm_hook]]
+address = 0x823372C0  # D3DDevice_SetStreamSource
+name = "PdProbeSetStream"
+
+[[midasm_hook]]
+address = 0x823373E0  # D3DDevice_SetIndices
+name = "PdProbeSetIndices"
+
+[[midasm_hook]]
+address = 0x8233DB08  # D3D_MakeSpace
+name = "PdProbeMakeSpace"
+
+[[midasm_hook]]
+address = 0x8234DF00  # the one caller of D3D_MakeSpace outside the D3D block
+name = "PdProbeOutsideRing"

@@ -1,0 +1,312 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 1c74034..984fcef 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -52,6 +52,14 @@ Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
+ TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
+ SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
+ 
++// Perfect Dark: vertex shaders fetch textures too, where only SampleLevel is
++// allowed (the translator's output defines XR_VERTEX_SHADER for them).
++#ifdef XR_VERTEX_SHADER
++#define XR_SAMPLE(texture, samplerState, texCoord) (texture).SampleLevel(samplerState, texCoord, 0)
++#else
++#define XR_SAMPLE(texture, samplerState, texCoord) (texture).Sample(samplerState, texCoord)
++#endif
++
+ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+ {
+     uint2 dimensions;
+@@ -62,7 +70,7 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++    return XR_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+ }
+ 
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+@@ -135,17 +143,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+     float h1y = h1(fy);
+ 
+     float4 r =
+-        g0(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
+-        g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
++        g0(fy) * (g0x * XR_SAMPLE(texture, samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
++            g1x * XR_SAMPLE(texture, samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
++        g1(fy) * (g0x * XR_SAMPLE(texture, samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
++            g1x * XR_SAMPLE(texture, samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
+ 
+     return r;
+ }
+ 
+ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+ {
+-    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++    return XR_SAMPLE(g_Texture3DDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
+ }
+ 
+ struct CubeMapData
+@@ -156,7 +164,7 @@ struct CubeMapData
+ 
+ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+ {
+-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++    return XR_SAMPLE(g_TextureCubeDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
+ }
+ 
+ float4 tfetchR11G11B10(uint4 value)
+@@ -183,7 +191,8 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
+ float4 cube(float4 value, inout CubeMapData cubeMapData)
+ {
+     uint index = cubeMapData.cubeMapIndex;
+-    cubeMapData.cubeMapDirections[index] = value.xyz;
++    // The CUBE instruction's first source is the direction swizzled (z, z, x, y).
++    cubeMapData.cubeMapDirections[index] = float3(value.z, value.w, value.x);
+     ++cubeMapData.cubeMapIndex;
+     
+     return float4(0.0, 0.0, 0.0, index);
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..e08a839 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -115,7 +115,13 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::TexCoord, 14 },
+     { DeclUsage::TexCoord, 15 },
+     { DeclUsage::Color, 0 },
+-    { DeclUsage::Color, 1 }
++    { DeclUsage::Color, 1 },
++    // Perfect Dark's shaders also pass these between the stages (its vertex
++    // shaders export oNormal0, its pixel shaders read iNormal0).
++    { DeclUsage::Normal, 0 },
++    { DeclUsage::Tangent, 0 },
++    { DeclUsage::Binormal, 0 },
++    { DeclUsage::Fog, 0 }
+ };
+ 
+ static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+@@ -265,6 +271,7 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     {
+         constName = fmt::format("s{}", instr.constIndex);
+         constNamePtr = constName.c_str();
++        undeclaredSamplers.insert(instr.constIndex);
+     }
+ 
+ #ifdef UNLEASHED_RECOMP
+@@ -764,7 +771,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             break;
+ 
+         case AluVectorOpcode::Cube:
+-            print("cube(r{}, cubeMapData)", instr.src1Register);
++            // The source with its swizzle (Perfect Dark keeps the direction in
++            // .yzw and swizzles it into place); cube() reads the hardware's
++            // (z, z, x, y) layout of it.
++            print("cube({}, cubeMapData)", op(VECTOR_0));
+             break;
+ 
+         case AluVectorOpcode::Max4:
+@@ -1187,11 +1197,32 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    samplerDefinesPos = out.size();
+     out += "\n#else\n\n";
+ 
+     println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
+     out += "{\n";
+ 
++    // Perfect Dark: the constants as the hardware has them, one register file,
++    // each name a fixed register in it. Declaring them as separate members broke
++    // where the game's tables overlap arrays (MatOffset[114] at c123 with
++    // BloodPatch at c234) and left indexing past an array's declared size to the
++    // compiler; the register file has neither problem. "xr-registers-used" is
++    // the end of the highest declared constant: the bytes the renderer uploads.
++    const char* registerFile = isPixelShader ? "g_PsRegisters" : "g_VsRegisters";
++    const uint32_t fileSize = isPixelShader ? 224 : 256;
++    uint32_t registersUsed = 0;
++    for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
++    {
++        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
++            constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
++        if (constantInfo->registerSet == RegisterSet::Float4)
++            registersUsed = std::max<uint32_t>(registersUsed, constantInfo->registerIndex + constantInfo->registerCount);
++    }
++    println("\tfloat4 {}[{}] : packoffset(c0);", registerFile, fileSize);
++    out += "};\n";
++    println("// xr-registers-used {}", std::min(registersUsed, fileSize));
++
+     for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
+     {
+         const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
+@@ -1200,23 +1231,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         if (constantInfo->registerSet == RegisterSet::Float4)
+         {
+             const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+-
+-            print("\tfloat4 {}", constantName);
+-
+-            if (constantInfo->registerCount > 1)
+-                print("[{}]", constantInfo->registerCount.get());
+-
+-            println(" : packoffset(c{});", constantInfo->registerIndex.get());
+-
++            const uint32_t reg = constantInfo->registerIndex;
+             if (constantInfo->registerCount > 1)
+             {
+-                uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
+-                println("#define {0}(INDEX) select((INDEX) < {1}, {0}[min(INDEX, {2})], 0.0)", constantName, tailCount, tailCount - 1);
++                const uint32_t tailCount = fileSize - reg;
++                println("#define {0}(INDEX) select((INDEX) < {1}, {2}[{3} + min(INDEX, {4})], 0.0)", constantName, tailCount,
++                    registerFile, reg, tailCount - 1);
++            }
++            else
++            {
++                println("#define {} {}[{}]", constantName, registerFile, reg);
+             }
+         }
+     }
+ 
+-    out += "};\n\n";
++    out += "\n";
+ 
+     out += "cbuffer SharedConstants : register(b2, space4)\n";
+     out += "{\n";
+@@ -1241,6 +1270,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    samplerMembersPos = out.size();
+     out += "\tDEFINE_SHARED_CONSTANTS();\n";
+     out += "};\n\n";
+ 
+@@ -1611,6 +1641,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             uint32_t count = 0;
+             uint32_t sequence = 0;
+             bool shouldReturn = false;
++            bool condExecOpen = false;
+             bool shouldCloseCurlyBracket = false;
+ 
+             switch (cfInstr.opcode)
+@@ -1630,7 +1661,34 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 address = cfInstr.condExec.address;
+                 count = cfInstr.condExec.count;
+                 sequence = cfInstr.condExec.sequence;
+-                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecEnd);
++                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
++                // GoldenEye: the block runs only while the bool constant equals the
++                // condition (cexec b129 / cexec !b129). It used to run unconditionally,
++                // so both halves of an if/else pair ran (the menu pixel shader
++                // multiplied its alpha by the texture twice).
++                if (count != 0)
++                {
++                    indent();
++                    const char* test = cfInstr.condExec.condition ? "!" : "=";
++                    auto findResult = boolConstants.find(cfInstr.condExec.boolAddress);
++                    if (findResult != boolConstants.end())
++                    {
++                        println("if ((g_Booleans & {}) {}= 0)", findResult->second, test);
++                    }
++                    else
++                    {
++                        uint32_t boolAddress = cfInstr.condExec.boolAddress;
++                        uint32_t bit = (boolAddress >= 128) ? (boolAddress - 128 + 16) : boolAddress;
++                        if (bit < 32)
++                            println("if ((g_Booleans & {}) {}= 0)", 1u << bit, test);
++                        else
++                            println("if (0 {}= 0)", test);
++                    }
++                    indent();
++                    out += "{\n";
++                    ++indentation;
++                    condExecOpen = true;
++                }
+                 break;
+ 
+             case ControlFlowOpcode::CondExecPred:
+@@ -1698,7 +1756,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                         if (findResult != boolConstants.end())
+                             println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                         else
+-                            println("if (b{} {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                        {
++                            // GoldenEye: bool registers missing from the constant table. Vertex
++                            // shaders use b0-b127 and pixel shaders b128-b255; g_Booleans packs
++                            // 16 of each the same way named ones are (pixel ones shifted by 16).
++                            uint32_t boolAddress = cfInstr.condJmp.boolAddress;
++                            uint32_t bit = (boolAddress >= 128) ? (boolAddress - 128 + 16) : boolAddress;
++                            if (bit < 32)
++                                println("if ((g_Booleans & {}) {}= 0)", 1u << bit, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                            else
++                                println("if (0 {}= 0)", cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
++                        }
+                     }
+ 
+                     if (simpleControlFlow)
+@@ -1792,6 +1860,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 instructionCode += 3;
+             }
+ 
++            if (condExecOpen)
++            {
++                --indentation;
++                indent();
++                out += "}\n";
++            }
++
+             if (shouldReturn)
+             {
+                 if (isPixelShader)
+@@ -1885,4 +1960,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ #endif
+ 
+     out += "}";
++
++    // Undeclared samplers, laid out as declared ones with register index N.
++    if (!undeclaredSamplers.empty())
++    {
++        std::string defines, members;
++        for (uint32_t index : undeclaredSamplers)
++        {
++            for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
++            {
++                defines += fmt::format("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})\n",
++                    index, TEXTURE_DIMENSIONS[j], j * 64 + index * 4);
++                members += fmt::format("\tuint s{}_Texture{}DescriptorIndex : packoffset(c{}.{});\n",
++                    index, TEXTURE_DIMENSIONS[j], j * 4 + index / 4, SWIZZLES[index % 4]);
++            }
++            defines += fmt::format("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})\n",
++                index, std::size(TEXTURE_DIMENSIONS) * 64 + index * 4);
++            members += fmt::format("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});\n",
++                index, 4 * std::size(TEXTURE_DIMENSIONS) + index / 4, SWIZZLES[index % 4]);
++        }
++        out.insert(samplerMembersPos, members);  // the later position first
++        out.insert(samplerDefinesPos, defines);
++    }
+ }
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index b2e317d..41af49f 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -3,6 +3,8 @@
+ #include "shader.h"
+ #include "shader_code.h"
+ 
++#include <set>
++
+ struct StringBuffer
+ {
+     std::string out;
+@@ -31,6 +33,11 @@ struct ShaderRecompiler : StringBuffer
+     std::unordered_map<uint32_t, const ConstantInfo*> float4Constants;
+     std::unordered_map<uint32_t, const char*> boolConstants;
+     std::unordered_map<uint32_t, const char*> samplers;
++    // Samplers the code fetches from that the constant table doesn't list
++    // (GoldenEye has a pixel shader with an empty table): declared as sN at
++    // the end, at these places in the output.
++    std::set<uint32_t> undeclaredSamplers;
++    size_t samplerDefinesPos = 0, samplerMembersPos = 0;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
+ 

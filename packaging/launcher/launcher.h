@@ -53,6 +53,10 @@ bool IsInstalled(const Paths& p, std::wstring* missing);
 // Puts back resources\assets from .assets-previous if an import was cut off
 // in the middle of swapping the folders. Safe to call any time.
 void RecoverInterruptedSwap(const Paths& p);
+// Puts back program files from an update cut off half-way (*.update-old with
+// no new file in its place) and clears what an update left behind
+// (update.cpp). Safe to call any time.
+void RecoverInterruptedUpdate(const Paths& p);
 // True while the game from this folder is running (its exe cannot be opened
 // for writing then).
 bool GameRunning(const Paths& p);
@@ -114,7 +118,16 @@ struct Extras {
   bool cheats = false;        // every cheat available in the Cheats menu
   bool story = false;         // 100% story completion
   bool multiplayer = false;   // all multiplayer content
+  bool autoaim = false;       // new control settings start with Auto-Aim on
+  uint32_t language = 1;      // the game's text (user_language): 1 English, 3 German, 4 French, 5 Spanish, 6 Italian
 };
+// The languages offered, in the order the setup window cycles through them.
+struct LanguageChoice {
+  uint32_t id;
+  const wchar_t* name;
+  const wchar_t* code;  // for --language
+};
+extern const LanguageChoice kLanguages[5];
 Extras CurrentExtras(const Paths& p, const fs::path& shortcut_folder);
 // Applies only what differs from `was`, writing only each extra's own key.
 // ask_replace is asked before an existing desktop shortcut that is not ours is
@@ -139,6 +152,9 @@ struct SetupOptions {
   std::wstring reason;       // why setup opened (a missing file), for the log
 };
 int RunSetupWindow(HINSTANCE instance, const Paths& p, const SetupOptions& options);
+// --update: downloads and installs the latest release (update.cpp). 0 when
+// updated or already up to date.
+int RunUpdateWindow(HINSTANCE instance, const Paths& p);
 
 // ---------------------------------------------------------------- utils --
 std::wstring FormatMB(uint64_t bytes);

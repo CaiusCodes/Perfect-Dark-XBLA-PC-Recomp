@@ -41,10 +41,10 @@ index 14f930b..9e92c6f 100644
      set(tag_major ${CMAKE_MATCH_1})
 diff --git a/include/rex/diag_timing.h b/include/rex/diag_timing.h
 new file mode 100644
-index 0000000..203ef8c
+index 0000000..b9ee3f4
 --- /dev/null
 +++ b/include/rex/diag_timing.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,95 @@
 +/**
 + * @file        rex/diag_timing.h
 + * @brief       Frame-timing diagnostics shared by the runtime and the GPU plugin.
@@ -63,7 +63,40 @@ index 0000000..203ef8c
 +#include <rex/cvar.h>
 +#include <rex/logging.h>
 +
++#if defined(_WIN32)
++#if defined(__clang__) || defined(__GNUC__)
++#include <x86intrin.h>
++#else
++#include <intrin.h>
++#endif
++extern "C" __declspec(dllimport) int __stdcall QueryThreadCycleTime(void* thread,
++                                                                     unsigned long long* cycles);
++#endif
++
 +namespace rex::diag {
++
++// The calling thread's time on a CPU so far, in time-stamp-counter ticks (0 off
++// Windows). Over a window, (difference) / (TscNow() difference) is the share of
++// that window the thread actually ran: a thread that is busy but gets little CPU
++// was preempted or descheduled, not slow.
++inline uint64_t ThreadCycles() {
++#if defined(_WIN32)
++  unsigned long long cycles = 0;
++  // (HANDLE)-2 is the pseudo handle GetCurrentThread() returns.
++  QueryThreadCycleTime(reinterpret_cast<void*>(static_cast<intptr_t>(-2)), &cycles);
++  return cycles;
++#else
++  return 0;
++#endif
++}
++
++inline uint64_t TscNow() {
++#if defined(_WIN32)
++  return __rdtsc();
++#else
++  return 0;
++#endif
++}
 +
 +// vblank_timing_log, read by name (the cvar lives in the runtime, while the GPU
 +// plugin is a separate DLL) and re-read at most twice a second so a hot path
@@ -108,7 +141,7 @@ index 0000000..203ef8c
 +
 +}  // namespace rex::diag
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
-index 6998a45..c897883 100644
+index 6998a45..2d41de5 100644
 --- a/include/rex/graphics/command_processor.h
 +++ b/include/rex/graphics/command_processor.h
 @@ -86,6 +86,11 @@ class CommandProcessor {
@@ -142,11 +175,40 @@ index 6998a45..c897883 100644
  
    uint32_t primary_buffer_ptr_ = 0;
    uint32_t primary_buffer_size_ = 0;
+@@ -281,6 +291,20 @@ class CommandProcessor {
+   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+   std::atomic<uint32_t> write_ptr_index_;
+ 
++  // Where this thread's frame goes (only counted while vblank_timing_log is on;
++  // a backend reads and logs them): waiting for the game to write commands, and
++  // in WAIT_REG_MEM, with this thread's CPU cycles in each (rex::diag::ThreadCycles).
++  double timing_idle_ms_ = 0.0;
++  uint64_t timing_idle_cycles_ = 0;
++  double timing_reg_wait_ms_ = 0.0;
++  uint64_t timing_reg_wait_cycles_ = 0;
++  uint32_t timing_reg_waits_ = 0;
++  // The sleeps inside those waits: how long each asked for and really took.
++  uint32_t timing_reg_sleeps_ = 0;
++  double timing_reg_sleep_ms_ = 0.0;
++  double timing_reg_sleep_max_ms_ = 0.0;
++  uint32_t timing_reg_sleep_asked_ms_ = 0;
++
+   // Some titles submit writes beyond the emulated register file range in PM4
+   // packets. Preserve these values so dependent packet logic can still observe
+   // them instead of dropping the write entirely.
 diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
-index d977ebe..7bc727f 100644
+index d977ebe..933d666 100644
 --- a/include/rex/graphics/d3d12/command_processor.h
 +++ b/include/rex/graphics/d3d12/command_processor.h
-@@ -416,7 +416,49 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -14,6 +14,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <deque>
+ #include <memory>
+ #include <optional>
+@@ -416,7 +417,67 @@ class D3D12CommandProcessor : public CommandProcessor {
    bool EndGuestOcclusionQuery(uint32_t sample_count_address,
                                xenos::xe_gpu_depth_sample_counts* sample_counts);
    bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
@@ -156,6 +218,24 @@ index d977ebe..7bc727f 100644
 +  // Resolves every snapshot recorded this frame with one GPU wait and writes
 +  // the final counts to the guest (occlusion_resolve_per_frame).
 +  void ResolveOcclusionSnapshots();
++  // occlusion_flush_us: submit early in frames that end with that wait.
++  void MaybeFlushForOcclusionOverlap();
++  std::chrono::steady_clock::time_point submission_open_time_;
++  bool occlusion_last_frame_had_snapshots_ = false;
++  uint64_t occlusion_overlap_flushes_ = 0;
++  // Time this thread spent blocked in CheckSubmissionFence (vblank_timing_log).
++  double fence_wait_ms_ = 0.0;
++  double fence_wait_frame_start_ms_ = 0.0;
++  double fence_wait_window_ms_ = 0.0;
++  uint64_t fence_wait_frames_over_2_ = 0;
++  // The whole frame of this thread, logged with the GPU time (vblank_timing_log):
++  // wall time and CPU cycles since the window began, time in IssueSwap, draws.
++  std::chrono::steady_clock::time_point timing_window_start_;
++  uint64_t timing_window_tsc_ = 0;
++  uint64_t timing_window_cycles_ = 0;
++  double timing_swap_ms_ = 0.0;
++  uint64_t timing_draws_ = 0;
++  void LogThreadFrameSplit(double frames);
 +  bool ResolveOcclusionQueryToGuest(uint32_t host_index,
 +                                    xenos::xe_gpu_depth_sample_counts* sample_counts);
 +  // Guest queries that were closed early because the guest began another
@@ -197,7 +277,30 @@ index d977ebe..7bc727f 100644
    uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
    void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
                                   uint64_t samples);
-@@ -656,6 +698,28 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -575,6 +636,10 @@ class D3D12CommandProcessor : public CommandProcessor {
+ 
+   struct ApplyGammaConstants {
+     uint32_t size[2];
++    // Colour adjustment, read only by the *_color pipelines.
++    float saturation;
++    float contrast;
++    float black;
+   };
+   enum class ApplyGammaRootParameter : UINT {
+     kConstants,
+@@ -589,6 +654,11 @@ class D3D12CommandProcessor : public CommandProcessor {
+   Microsoft::WRL::ComPtr<ID3D12PipelineState> apply_gamma_table_fxaa_luma_pipeline_;
+   Microsoft::WRL::ComPtr<ID3D12PipelineState> apply_gamma_pwl_pipeline_;
+   Microsoft::WRL::ComPtr<ID3D12PipelineState> apply_gamma_pwl_fxaa_luma_pipeline_;
++  // The same with colour adjustment (Vivid Colours / Black Level).
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> apply_gamma_table_color_pipeline_;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> apply_gamma_table_fxaa_luma_color_pipeline_;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> apply_gamma_pwl_color_pipeline_;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> apply_gamma_pwl_fxaa_luma_color_pipeline_;
+ 
+   struct FxaaConstants {
+     uint32_t size[2];
+@@ -656,6 +726,28 @@ class D3D12CommandProcessor : public CommandProcessor {
    std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
    std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
  
@@ -227,18 +330,41 @@ index d977ebe..7bc727f 100644
    Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
    Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_;
 diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
-index c72380a..1236b2e 100644
+index c72380a..419ec9a 100644
 --- a/include/rex/graphics/flags.h
 +++ b/include/rex/graphics/flags.h
-@@ -15,6 +15,8 @@
+@@ -15,10 +15,31 @@
  
  // GPU Core
  REXCVAR_DECLARE(bool, vsync);
 +REXCVAR_DECLARE(bool, fixed_guest_vblank);
 +REXCVAR_DECLARE(bool, occlusion_resolve_per_frame);
++REXCVAR_DECLARE(int32_t, occlusion_flush_us);
++REXCVAR_DECLARE(bool, gpu_precise_waits);
  REXCVAR_DECLARE(bool, clear_memory_page_state);
  REXCVAR_DECLARE(bool, half_pixel_offset);
  REXCVAR_DECLARE(bool, async_shader_compilation);
+ 
++// Colour adjustment of the finished frame, in the gamma ramp pass (both
++// backends; at the identity values the stock shaders run).
++REXCVAR_DECLARE(double, color_saturation);
++REXCVAR_DECLARE(double, color_contrast);
++REXCVAR_DECLARE(double, color_black_level);
++
++namespace rex::graphics {
++struct ColorAdjust {
++  float saturation = 1.0f;
++  float contrast = 1.0f;
++  float black = 0.0f;
++  bool active() const { return saturation != 1.0f || contrast != 1.0f || black != 0.0f; }
++};
++// The current settings, clamped to sane ranges.
++ColorAdjust GetColorAdjust();
++}  // namespace rex::graphics
++
+ // GPU Resolution / Readback / Queries
+ REXCVAR_DECLARE(int32_t, resolution_scale);
+ REXCVAR_DECLARE(int32_t, draw_resolution_scale_x);
 diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
 index 942450b..4f848f8 100644
 --- a/include/rex/graphics/graphics_system.h
@@ -332,10 +458,21 @@ index b05df6a..53fece4 100644
    std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;
    uint32_t trace_download_page_count_ = 0;
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 4b76791..0864e62 100644
+index 4b76791..d8512c9 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
-@@ -446,6 +446,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -381,6 +381,10 @@ class VulkanCommandProcessor : public CommandProcessor {
+   };
+   struct SwapApplyGammaConstants {
+     uint32_t size[2];
++    // Colour adjustment, read only by the colour pipelines.
++    float saturation;
++    float contrast;
++    float black;
+   };
+   enum SwapFxaaDescriptorSet : uint32_t {
+     kSwapFxaaDescriptorSetSource,
+@@ -446,6 +450,12 @@ class VulkanCommandProcessor : public CommandProcessor {
    void DisableHostOcclusionQueries();
    uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
    void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
@@ -348,7 +485,17 @@ index 4b76791..0864e62 100644
    void InvalidateAllVertexBufferResidency();
    void InvalidateVertexBufferResidency(uint32_t vfetch_index);
    void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
-@@ -747,6 +753,18 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -690,6 +700,9 @@ class VulkanCommandProcessor : public CommandProcessor {
+   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_ = VK_NULL_HANDLE;
+   VkPipeline swap_apply_gamma_compute_256_entry_table_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
+   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
++  // Gamma with colour adjustment (Vivid Colours / Black Level), by
++  // [pwl][fxaa luma][red/blue swap].
++  VkPipeline swap_apply_gamma_compute_color_pipelines_[2][2][2] = {};
+   VkPipeline swap_fxaa_pipeline_ = VK_NULL_HANDLE;
+   VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
+   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
+@@ -747,6 +760,18 @@ class VulkanCommandProcessor : public CommandProcessor {
      uint32_t host_index = UINT32_MAX;
      bool valid = false;
    } active_occlusion_query_;
@@ -1186,6 +1333,22 @@ index d5493a7..573db00 100644
  
  }  // namespace rex::system
 \ No newline at end of file
+diff --git a/include/rex/thread.h b/include/rex/thread.h
+index 30b207d..8c6f0a2 100644
+--- a/include/rex/thread.h
++++ b/include/rex/thread.h
+@@ -118,6 +118,11 @@ void Sleep(std::chrono::duration<Rep, Period> duration) {
+   Sleep(std::chrono::duration_cast<std::chrono::microseconds>(duration));
+ }
+ 
++// Sleeps about the given duration on a high-resolution timer where there is one
++// (Windows 10 1803+), so it does not depend on the process timer resolution: a
++// plain Sleep(1) lasts up to 15.6 ms when that is not raised.
++void PreciseSleep(std::chrono::microseconds duration);
++
+ enum class SleepResult {
+   kSuccess,
+   kAlerted,
 diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
 index a7ab6b3..0e2a21d 100644
 --- a/include/rex/ui/imgui_dialog.h
@@ -1298,7 +1461,7 @@ index e15e410..b9f236b 100644
 +
  }  // namespace rex::ui
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
-index afb4a30..2d2f0fa 100644
+index afb4a30..c25a848 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
 @@ -10,9 +10,19 @@
@@ -1321,7 +1484,17 @@ index afb4a30..2d2f0fa 100644
  #include <climits>
  #include <cmath>
  #include <condition_variable>
-@@ -367,6 +377,15 @@ class Presenter {
+@@ -334,6 +344,9 @@ class Presenter {
+   void SetWindowSurfaceFromUIThread(Window* new_window, Surface* new_surface);
+   void OnSurfaceMonitorUpdateFromUIThread(bool old_monitor_potentially_disconnected);
+   void OnSurfaceResizeFromUIThread();
++  // The window came back from being minimised: reconnects painting if it was
++  // dropped while the surface had no area (no resize event follows a restore).
++  void OnSurfaceRestoredFromUIThread();
+ 
+   // For calling from the platform paint event handler. Refreshes the surface
+   // connection if needed, and also paints if possible and if needed (if there
+@@ -367,6 +380,15 @@ class Presenter {
    }
    // For simplicity, may be called repeatedly even if no changes have been made.
    void SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config);
@@ -1337,7 +1510,7 @@ index afb4a30..2d2f0fa 100644
  
    void AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order);
    void RemoveUIDrawerFromUIThread(UIDrawer* drawer);
-@@ -977,6 +996,10 @@ class Presenter {
+@@ -977,6 +999,10 @@ class Presenter {
    // rather than being blank.
    bool guest_output_active_last_refresh_ = false;
  
@@ -1348,7 +1521,7 @@ index afb4a30..2d2f0fa 100644
    // Ordered by the Z order, and then by the time of addition.
    // Note: All the iteration logic involving this Z ordering must be the same as
    // in input handling (in the input listeners in the Window), but in reverse.
-@@ -1051,6 +1074,22 @@ class Presenter {
+@@ -1051,6 +1077,22 @@ class Presenter {
  
    std::thread dxgi_ui_tick_thread_;
  #endif  // XE_PLATFORM
@@ -1413,6 +1586,20 @@ index 99dea21..91c7e77 100644
  };
  
  class TouchEvent : public UIEvent {
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 947817f..604ea63 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -199,6 +199,9 @@ class VulkanDevice {
+     bool ext_1_3_KHR_maintenance4 = false;  // #414
+     // Has optional features not implied by this being true.
+     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
++    // Images shared with another device on the same GPU (Windows).
++    bool ext_1_1_KHR_external_memory = false;    // #73
++    bool ext_KHR_external_memory_win32 = false;  // #74
+   };
+ 
+   const Extensions& extensions() const { return extensions_; }
 diff --git a/include/rex/ui/window.h b/include/rex/ui/window.h
 index 00634da..6f60f26 100644
 --- a/include/rex/ui/window.h
@@ -1499,7 +1686,7 @@ index ae72b7a..9d0302a 100644
    } else {
      // Wait until another thread has finished updating the clock.
 diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
-index a9e42f0..6985cc8 100644
+index a9e42f0..583db2e 100644
 --- a/src/core/cvar.cpp
 +++ b/src/core/cvar.cpp
 @@ -60,6 +60,10 @@ std::unordered_map<std::string, size_t>& GetRegistryIndex() {
@@ -1513,7 +1700,47 @@ index a9e42f0..6985cc8 100644
  };
  
  std::unordered_map<std::string, PendingValues>& GetPendingValuesStorage() {
-@@ -227,6 +231,11 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
+@@ -67,6 +71,20 @@ std::unordered_map<std::string, PendingValues>& GetPendingValuesStorage() {
+   return pending;
+ }
+ 
++// Values given on the command line, and every value the config file held, by
++// flag name. SaveConfig writes a flag still at its command-line value as the
++// config file had it (or not at all), so a one-off --flag=value from a tester
++// .bat is not saved into the config as if it were a setting.
++std::unordered_map<std::string, std::string>& GetCommandLineValuesStorage() {
++  static std::unordered_map<std::string, std::string> values;
++  return values;
++}
++
++std::unordered_map<std::string, std::string>& GetConfigValuesStorage() {
++  static std::unordered_map<std::string, std::string> values;
++  return values;
++}
++
+ // Convert flag name to environment variable: gpu_vsync -> REX_GPU_VSYNC
+ std::string FlagNameToEnvVar(std::string_view name) {
+   std::string result = "REX_";
+@@ -97,6 +115,10 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
+         REXLOG_WARN("Config: unsupported type for key '{}'", full_key);
+         continue;
+       }
++      {
++        std::lock_guard lock(GetRegistryMutex());
++        GetConfigValuesStorage()[full_key] = value_str;
++      }
+ 
+       if (GetFlagInfo(full_key) == nullptr) {
+         std::lock_guard lock(GetRegistryMutex());
+@@ -218,6 +240,7 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
+     auto pending_it = pending.find(stored.name);
+     if (pending_it != pending.end() && pending_it->second.cmdline) {
+       stored.setter(*pending_it->second.cmdline);
++      GetCommandLineValuesStorage()[stored.name] = stored.getter();
+     }
+     auto env_value = rex::platform::env::get(FlagNameToEnvVar(stored.name));
+     if (env_value.has_value()) {
+@@ -227,6 +250,11 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
        if (pending_it->second.config) {
          stored.setter(*pending_it->second.config);
        }
@@ -1525,7 +1752,7 @@ index a9e42f0..6985cc8 100644
        pending.erase(pending_it);
      }
    }
-@@ -272,7 +281,11 @@ bool SetFlagByName(std::string_view name, std::string_view value) {
+@@ -272,7 +300,11 @@ bool SetFlagByName(std::string_view name, std::string_view value) {
    std::lock_guard lock(GetRegistryMutex());
    auto it = GetRegistryIndex().find(std::string(name));
    if (it == GetRegistryIndex().end()) {
@@ -1538,7 +1765,7 @@ index a9e42f0..6985cc8 100644
    }
  
    const auto& entry = GetRegistryStorage()[it->second];
-@@ -336,6 +349,12 @@ std::string GetFlagByName(std::string_view name) {
+@@ -336,6 +368,12 @@ std::string GetFlagByName(std::string_view name) {
    std::lock_guard lock(GetRegistryMutex());
    auto it = GetRegistryIndex().find(std::string(name));
    if (it == GetRegistryIndex().end()) {
@@ -1551,7 +1778,7 @@ index a9e42f0..6985cc8 100644
      return "";
    }
  
-@@ -475,24 +494,64 @@ bool HasNonDefaultValue(std::string_view name) {
+@@ -475,26 +513,82 @@ bool HasNonDefaultValue(std::string_view name) {
    return entry.getter() != entry.default_value;
  }
  
@@ -1607,18 +1834,38 @@ index a9e42f0..6985cc8 100644
 +  return out;
 +}
 +
++// The value SaveConfig writes for a flag: its current one, unless that is still
++// the command line's, which is for this run only; then the config file's value,
++// or nothing (false).
++bool SavedValue(const FlagEntry& entry, std::string* value) {
++  *value = entry.getter();
++  const auto& cmdline = GetCommandLineValuesStorage();
++  if (auto it = cmdline.find(entry.name); it != cmdline.end() && it->second == *value) {
++    const auto& config = GetConfigValuesStorage();
++    auto config_it = config.find(entry.name);
++    if (config_it == config.end()) return false;
++    *value = config_it->second;
++  }
++  return *value != entry.default_value;
++}
++
  std::string SerializeToTOML() {
    std::lock_guard lock(GetRegistryMutex());
    std::string result;
++  std::string value;
    for (const auto& entry : GetRegistryStorage()) {
-     if (entry.getter() != entry.default_value) {
+-    if (entry.getter() != entry.default_value) {
++    if (SavedValue(entry, &value)) {
        if (entry.type == FlagType::String) {
 -        result += entry.name + " = \"" + entry.getter() + "\"\n";
-+        result += entry.name + " = \"" + EscapeTOMLString(entry.getter()) + "\"\n";
++        result += entry.name + " = \"" + EscapeTOMLString(value) + "\"\n";
        } else {
-         result += entry.name + " = " + entry.getter() + "\n";
+-        result += entry.name + " = " + entry.getter() + "\n";
++        result += entry.name + " = " + value + "\n";
        }
-@@ -505,9 +564,9 @@ std::string SerializeToTOML(std::string_view category) {
+     }
+   }
+@@ -505,9 +599,9 @@ std::string SerializeToTOML(std::string_view category) {
    std::lock_guard lock(GetRegistryMutex());
    std::string result;
    for (const auto& entry : GetRegistryStorage()) {
@@ -1630,6 +1877,27 @@ index a9e42f0..6985cc8 100644
        } else {
          result += entry.name + " = " + entry.getter() + "\n";
        }
+@@ -538,11 +632,18 @@ std::vector<std::string> Init(int argc, char** argv) {
+     if (entry.type == FlagType::Boolean) {
+       app.add_flag_function(
+           "--" + entry.name + ",!--no-" + entry.name,
+-          [&entry](int64_t count) { entry.setter(count > 0 ? "true" : "false"); },
++          [&entry](int64_t count) {
++            entry.setter(count > 0 ? "true" : "false");
++            GetCommandLineValuesStorage()[entry.name] = entry.getter();
++          },
+           entry.description);
+     } else {
+       app.add_option_function<std::string>(
+-          "--" + entry.name, [&entry](const std::string& val) { entry.setter(val); },
++          "--" + entry.name,
++          [&entry](const std::string& val) {
++            entry.setter(val);
++            GetCommandLineValuesStorage()[entry.name] = entry.getter();
++          },
+           entry.description);
+     }
+   }
 diff --git a/src/core/logging.cpp b/src/core/logging.cpp
 index 1645848..cd7758e 100644
 --- a/src/core/logging.cpp
@@ -1648,6 +1916,59 @@ index 1645848..cd7758e 100644
  REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in seconds (0 = off)")
      .range(0, 60)
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 09b0cd9..36b23f7 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -171,6 +171,10 @@ void Sleep(std::chrono::microseconds duration) {
+   } while (ret == -1 && errno == EINTR);
+ }
+ 
++void PreciseSleep(std::chrono::microseconds duration) {
++  Sleep(duration);  // nanosleep is already precise
++}
++
+ // TODO(bwrsandman) Implement by allowing alert interrupts from IO operations
+ thread_local bool alertable_state_ = false;
+ bool DispatchCurrentThreadUserCallback();
+diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
+index 896dfec..70e9b18 100644
+--- a/src/core/threading_win.cpp
++++ b/src/core/threading_win.cpp
+@@ -13,6 +13,8 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
+ 
+ #include "platform_win.h"
+ 
++#include <algorithm>
++
+ #include <spdlog/spdlog.h>
+ 
+ #include <rex/assert.h>
+@@ -101,6 +103,24 @@ void Sleep(std::chrono::microseconds duration) {
+   }
+ }
+ 
++void PreciseSleep(std::chrono::microseconds duration) {
++  struct Timer {
++    HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                           TIMER_ALL_ACCESS);
++    ~Timer() {
++      if (handle) CloseHandle(handle);
++    }
++  };
++  thread_local Timer timer;
++  LARGE_INTEGER due;
++  due.QuadPart = -std::max<int64_t>(int64_t(duration.count()) * 10, 1);  // relative, 100 ns units
++  if (timer.handle && SetWaitableTimer(timer.handle, &due, 0, nullptr, nullptr, FALSE)) {
++    WaitForSingleObject(timer.handle, INFINITE);
++  } else {
++    Sleep(duration);
++  }
++}
++
+ SleepResult AlertableSleep(std::chrono::microseconds duration) {
+   if (SleepEx(static_cast<DWORD>(duration.count() / 1000), TRUE) == WAIT_IO_COMPLETION) {
+     return SleepResult::kAlerted;
 diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
 index 5cfea05..084d8f5 100644
 --- a/src/core/timer_queue.cpp
@@ -1797,10 +2118,53 @@ index a1b4dad..682b23d 100644
          *out_action = FileAction::kOverwritten;
          break;
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 60efcd3..e763ff7 100644
+index 60efcd3..6654ee9 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -44,6 +44,12 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -19,6 +20,7 @@
+ 
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
++#include <rex/diag_timing.h>
+ #include <rex/perf/counter.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/graphics/command_processor.h>
+@@ -37,6 +39,26 @@
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
++REXCVAR_DEFINE_DOUBLE(color_saturation, 1.0, "GPU",
++                      "Colour saturation of the finished frame (1 = unchanged)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_DOUBLE(color_contrast, 1.0, "GPU",
++                      "Contrast of the finished frame around a dark grey (1 = unchanged)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_DOUBLE(color_black_level, 0.0, "GPU",
++                      "Taken off the finished frame's blacks, so black is black (0 = unchanged)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++namespace rex::graphics {
++ColorAdjust GetColorAdjust() {
++  ColorAdjust a;
++  a.saturation = float(std::clamp(REXCVAR_GET(color_saturation), 0.0, 3.0));
++  a.contrast = float(std::clamp(REXCVAR_GET(color_contrast), 0.5, 2.0));
++  a.black = float(std::clamp(REXCVAR_GET(color_black_level), 0.0, 0.25));
++  return a;
++}
++}  // namespace rex::graphics
++
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+@@ -44,6 +66,25 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
  
  REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1810,10 +2174,23 @@ index 60efcd3..e763ff7 100644
 +                    "GPU flush and wait for every query (closing results stay pending, as on\n"
 +                    "real hardware, until the frame's resolve writes them)")
 +    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++// D3D12: HANDOVER 4be.
++REXCVAR_DEFINE_INT32(occlusion_flush_us, 1000, "GPU",
++                     "In frames that end with the occlusion resolve's GPU wait, submit the\n"
++                     "commands recorded so far every this many microseconds so the GPU works\n"
++                     "while the rest is recorded (0 = off)")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(gpu_precise_waits, true, "GPU",
++                    "Sleep on a high-resolution timer while the GPU commands wait for the game\n"
++                    "(WAIT_REG_MEM), so the wait ends on time whatever the Windows timer\n"
++                    "resolution; off = the old millisecond Sleep")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
  REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                        "Controls CPU readback of render-to-texture resolve results.\n"
-@@ -239,6 +245,11 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
+@@ -239,6 +280,11 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
    }
  }
  
@@ -1825,7 +2202,31 @@ index 60efcd3..e763ff7 100644
  void CommandProcessor::ClearCaches() {}
  
  void CommandProcessor::InvalidateGpuMemory() {}
-@@ -1097,6 +1108,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+@@ -290,6 +336,10 @@ void CommandProcessor::WorkerThreadMain() {
+       // We've run out of commands to execute.
+       // We spin here waiting for new ones, as the overhead of waiting on our
+       // event is too high.
++      const bool timing = rex::diag::TimingLogOn();
++      const auto idle_start = timing ? std::chrono::steady_clock::now()
++                                     : std::chrono::steady_clock::time_point{};
++      const uint64_t idle_cycles = timing ? rex::diag::ThreadCycles() : 0;
+       PrepareForWait();
+       uint32_t loop_count = 0;
+       do {
+@@ -306,6 +356,12 @@ void CommandProcessor::WorkerThreadMain() {
+       } while (worker_running_ && pending_fns_.empty() &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
++      if (timing) {
++        timing_idle_ms_ += std::chrono::duration<double, std::milli>(
++                               std::chrono::steady_clock::now() - idle_start)
++                               .count();
++        timing_idle_cycles_ += rex::diag::ThreadCycles() - idle_cycles;
++      }
+       if (!worker_running_ || !pending_fns_.empty()) {
+         continue;
+       }
+@@ -1097,6 +1153,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
    reader->AdvanceRead((count - 4) * sizeof(uint32_t));
  
    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
@@ -1833,7 +2234,40 @@ index 60efcd3..e763ff7 100644
  
    ++counter_;
    return true;
-@@ -1172,7 +1184,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1127,6 +1184,28 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+ 
+   bool is_memory = (wait_info & 0x10) != 0;
+ 
++  // Timed only when it has to wait (vblank_timing_log).
++  struct WaitTimer {
++    CommandProcessor* cp;
++    bool on = false;
++    std::chrono::steady_clock::time_point start;
++    uint64_t cycles = 0;
++    void Begin() {
++      if (on || !rex::diag::TimingLogOn()) return;
++      on = true;
++      start = std::chrono::steady_clock::now();
++      cycles = rex::diag::ThreadCycles();
++    }
++    ~WaitTimer() {
++      if (!on) return;
++      cp->timing_reg_wait_ms_ +=
++          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
++              .count();
++      cp->timing_reg_wait_cycles_ += rex::diag::ThreadCycles() - cycles;
++      ++cp->timing_reg_waits_;
++    }
++  } wait_timer{this};
++
+   bool matched = false;
+   do {
+     uint32_t value = 0;
+@@ -1169,14 +1248,35 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         break;
+     }
+     if (!matched) {
++      wait_timer.Begin();
        // Wait.
        if (wait >= 0x100) {
          PrepareForWait();
@@ -1845,8 +2279,30 @@ index 60efcd3..e763ff7 100644
            // User wants it fast and dangerous.
            rex::thread::MaybeYield();
          } else {
+-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++          // A plain Sleep's length follows the process timer resolution: up to
++          // 15.6 ms instead of 1 when Windows does not honour the 1 ms request,
++          // and the frame then misses its vblank (issue #1).
++          const auto sleep_start = std::chrono::steady_clock::now();
++          if (REXCVAR_GET(gpu_precise_waits)) {
++            rex::thread::PreciseSleep(std::chrono::milliseconds(wait / 0x100));
++          } else {
++            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++          }
++          if (wait_timer.on) {
++            const double ms = std::chrono::duration<double, std::milli>(
++                                  std::chrono::steady_clock::now() - sleep_start)
++                                  .count();
++            ++timing_reg_sleeps_;
++            timing_reg_sleep_ms_ += ms;
++            timing_reg_sleep_max_ms_ = std::max(timing_reg_sleep_max_ms_, ms);
++            timing_reg_sleep_asked_ms_ = wait / 0x100;
++          }
+         }
+         rex::thread::SyncMemory();
+         ReturnFromWait();
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index efed1b7..0f84811 100644
+index efed1b7..3d20fa9 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -10,10 +10,15 @@
@@ -1883,7 +2339,18 @@ index efed1b7..0f84811 100644
  REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
      .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
  
-@@ -172,9 +181,34 @@ void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+@@ -55,6 +64,10 @@ namespace shaders {
+ #include "../shaders/bytecode/d3d12_5_1/apply_gamma_pwl_fxaa_luma_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/apply_gamma_table_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_cs.h"
++#include "../shaders/bytecode/d3d12_5_1/apply_gamma_pwl_color_cs.h"
++#include "../shaders/bytecode/d3d12_5_1/apply_gamma_pwl_fxaa_luma_color_cs.h"
++#include "../shaders/bytecode/d3d12_5_1/apply_gamma_table_color_cs.h"
++#include "../shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_color_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/fxaa_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
+ #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
+@@ -172,9 +185,34 @@ void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
    render_target_cache_->RestoreEdramSnapshot(snapshot);
  }
  
@@ -1918,7 +2385,7 @@ index efed1b7..0f84811 100644
      return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
    }
  
-@@ -187,56 +221,237 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
+@@ -187,56 +225,279 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
    auto* sample_counts =
        memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_addr);
    if (!sample_counts) {
@@ -1958,6 +2425,9 @@ index efed1b7..0f84811 100644
 +          occlusion_pending_.back().has_query = true;
 +        }
 +      }
++    }
++    if (!is_end) {
++      WriteGuestOcclusionResult(sample_counts, occlusion_running_total_);
      }
 -    bool is_end_via_z_pass =
 -        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
@@ -1967,32 +2437,23 @@ index efed1b7..0f84811 100644
 -    if (is_end_via_z_pass || is_end_via_z_fail) {
 -      sample_counts->ZPass_A = fake_sample_count;
 -      sample_counts->Total_A = fake_sample_count;
-+    if (!is_end) {
-+      WriteGuestOcclusionResult(sample_counts, occlusion_running_total_);
-     }
 +    if (is_end) ++g_gpu_perf.zpd_closes;
 +    occlusion_pending_.push_back({sample_count_addr, 0, false});
 +    // A frame that never ends (loading) must not grow without bound, and the
 +    // query heap is a ring.
 +    if (occlusion_pending_.size() >= kMaxOcclusionQueries / 2) {
 +      ResolveOcclusionSnapshots();
-+    }
+     }
 +    BeginGuestOcclusionQuery(sample_count_addr);
      return true;
 -  };
--
++  }
+ 
 -  bool is_end_via_z_pass =
 -      sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
 -  bool is_end_via_z_fail =
 -      sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
 -  bool is_end = is_end_via_z_pass || is_end_via_z_fail;
-+  }
- 
--  if (!is_end) {
--    if (active_occlusion_query_.valid &&
--        active_occlusion_query_.sample_count_address != sample_count_addr) {
--      DisableHostOcclusionQueries();
--      return write_fallback_result();
 +  // ZPD snapshots a free-running Z-pass counter and the guest subtracts pairs of
 +  // them, so every interval has to be counted - dropping the ones between
 +  // coronas loses samples the guest includes, and everything reads as hidden.
@@ -2013,11 +2474,9 @@ index efed1b7..0f84811 100644
 +        occlusion_pending_.back().host_index = host_index;
 +        occlusion_pending_.back().has_query = true;
 +      }
-     }
--    if (!BeginGuestOcclusionQuery(sample_count_addr)) {
--      return write_fallback_result();
++    }
 +  }
-+
+ 
 +  if (is_end && occlusion_query_heap_ && occlusion_query_readback_ &&
 +      !occlusion_pending_.empty()) {
 +    ++g_gpu_perf.zpd_closes;
@@ -2049,7 +2508,8 @@ index efed1b7..0f84811 100644
 +          // with the total that was true at the moment it was taken.
 +          for (const auto& p : occlusion_pending_) {
 +            auto* block =
-+                memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(p.guest_addr);
++                p.guest_addr ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(p.guest_addr)
++                           : nullptr;
 +            if (block) {
 +              WriteGuestOcclusionResult(block, occlusion_running_total_);
 +            }
@@ -2060,32 +2520,30 @@ index efed1b7..0f84811 100644
 +          }
 +        }
 +      }
-     }
--    return true;
++    }
 +    occlusion_pending_.clear();
-   }
- 
--  if (!active_occlusion_query_.valid ||
--      active_occlusion_query_.sample_count_address != sample_count_addr) {
--    DisableHostOcclusionQueries();
--    return write_fallback_result();
++  }
++
 +  // Write the value for this snapshot, and remember where it went so it can be
 +  // corrected when the pair closes.
 +  WriteGuestOcclusionResult(sample_counts, occlusion_running_total_);
-+  if (!is_end) {
+   if (!is_end) {
+-    if (active_occlusion_query_.valid &&
+-        active_occlusion_query_.sample_count_address != sample_count_addr) {
+-      DisableHostOcclusionQueries();
+-      return write_fallback_result();
 +    occlusion_pending_.push_back({sample_count_addr, 0, false});
-   }
++  }
 +  BeginGuestOcclusionQuery(sample_count_addr);
 +  return true;
 +}
- 
--  if (!EndGuestOcclusionQuery(sample_count_addr, sample_counts)) {
--    return write_fallback_result();
++
 +// Closes any query still open at the frame boundary so one cannot leak across
 +// frames. Resolution happens per snapshot, in the handler above.
 +void D3D12CommandProcessor::ResolveOcclusionSnapshots() {
 +  if (occlusion_active_resolve_) return;
 +  occlusion_active_resolve_ = true;
++  occlusion_last_frame_had_snapshots_ = !occlusion_pending_.empty();
 +  const auto resolve_start = std::chrono::steady_clock::now();
 +  if (active_occlusion_query_.valid && occlusion_query_heap_) {
 +    uint32_t host_index = active_occlusion_query_.host_index;
@@ -2097,7 +2555,9 @@ index efed1b7..0f84811 100644
 +        occlusion_pending_.back().host_index = host_index;
 +        occlusion_pending_.back().has_query = true;
 +      }
-+    }
+     }
+-    if (!BeginGuestOcclusionQuery(sample_count_addr)) {
+-      return write_fallback_result();
 +  }
 +  bool resolved = false;
 +  if (!occlusion_pending_.empty() && occlusion_query_heap_ && occlusion_query_readback_) {
@@ -2121,15 +2581,23 @@ index efed1b7..0f84811 100644
 +                                  .count();
 +        resolved = submission_completed_ >= query_submission && occlusion_query_readback_mapping_;
 +      }
-+    }
+     }
+-    return true;
    }
+-
+-  if (!active_occlusion_query_.valid ||
+-      active_occlusion_query_.sample_count_address != sample_count_addr) {
+-    DisableHostOcclusionQueries();
+-    return write_fallback_result();
 +  // Replay in order: each snapshot gets the total that was true when it was
 +  // taken. If the resolve failed, snapshots still get the running total so no
 +  // closing snapshot is left pending forever.
 +  uint32_t zero_intervals = 0, small_intervals = 0, queries = 0;
 +  for (const auto& snapshot : occlusion_pending_) {
 +    auto* block =
-+        memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(snapshot.guest_addr);
++        snapshot.guest_addr
++            ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(snapshot.guest_addr)
++            : nullptr;
 +    if (block) {
 +      WriteGuestOcclusionResult(block, occlusion_running_total_);
 +    }
@@ -2161,7 +2629,7 @@ index efed1b7..0f84811 100644
 +      window_start = now;
 +      frames = snapshots = query_count = zeros = smalls = 0;
 +    }
-+  }
+   }
 +  if (!occlusion_pending_.empty()) {
 +    g_gpu_perf.resolve_ms += std::chrono::duration<double, std::milli>(
 +                                 std::chrono::steady_clock::now() - resolve_start)
@@ -2169,6 +2637,46 @@ index efed1b7..0f84811 100644
 +  }
 +  occlusion_pending_.clear();
 +  occlusion_active_resolve_ = false;
++}
+ 
+-  if (!EndGuestOcclusionQuery(sample_count_addr, sample_counts)) {
+-    return write_fallback_result();
++// occlusion_flush_us (HANDOVER 4be): in a frame that ends with the occlusion
++// resolve's GPU wait, hand the commands recorded so far to the GPU every
++// occlusion_flush_us, so it draws while this thread records the rest and the
++// wait at the swap covers only the last part. Without it the GPU got the frame
++// in 3-4 large submissions and the wait was most of the frame's GPU time,
++// added to this thread's own time (frames over 16.7 ms at higher Render Scale).
++void D3D12CommandProcessor::MaybeFlushForOcclusionOverlap() {
++  const int32_t flush_us = REXCVAR_GET(occlusion_flush_us);
++  if (flush_us <= 0 || !submission_open_ || !REXCVAR_GET(occlusion_resolve_per_frame) ||
++      !occlusion_query_resources_available_ ||
++      (occlusion_pending_.empty() && !occlusion_last_frame_had_snapshots_)) {
++    return;
++  }
++  const auto now = std::chrono::steady_clock::now();
++  if (now - submission_open_time_ < std::chrono::microseconds(flush_us)) {
++    return;
+   }
++  if (active_occlusion_query_.valid && occlusion_query_heap_ && !occlusion_pending_.empty()) {
++    // The open query measures the interval after the last snapshot. End it
++    // for this submission and continue the same interval with a new query in
++    // the next one: a pending entry with no guest block adds its samples to
++    // the running total without writing anywhere.
++    const uint32_t address = active_occlusion_query_.sample_count_address;
++    const uint32_t host_index = active_occlusion_query_.host_index;
++    active_occlusion_query_ = {};
++    deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
++                                       host_index);
++    occlusion_pending_.back().host_index = host_index;
++    occlusion_pending_.back().has_query = true;
++    EndSubmission(false);
++    occlusion_pending_.push_back({0, 0, false});
++    BeginGuestOcclusionQuery(address);
++  } else {
++    EndSubmission(false);
++  }
++  ++occlusion_overlap_flushes_;
 +}
  
 -  return true;
@@ -2191,7 +2699,7 @@ index efed1b7..0f84811 100644
  }
  
  bool D3D12CommandProcessor::PushTransitionBarrier(ID3D12Resource* resource,
-@@ -946,6 +1161,8 @@ bool D3D12CommandProcessor::SetupContext() {
+@@ -946,6 +1207,8 @@ bool D3D12CommandProcessor::SetupContext() {
          "the emulator, reducing to {}x{}",
          draw_resolution_scale_x, draw_resolution_scale_y);
    }
@@ -2200,11 +2708,64 @@ index efed1b7..0f84811 100644
  
    shared_memory_ = std::make_unique<D3D12SharedMemory>(*this, *memory_, trace_writer_);
    if (!shared_memory_->Initialize()) {
-@@ -1917,6 +2134,28 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -1363,6 +1626,28 @@ bool D3D12CommandProcessor::SetupContext() {
+         "perceptual luma output");
+     return false;
+   }
++  // Colour adjustment variants (apply_gamma_color.cs.hlsl). Optional: without
++  // them the frame is shown unadjusted.
++  *(apply_gamma_table_color_pipeline_.ReleaseAndGetAddressOf()) =
++      ui::d3d12::util::CreateComputePipeline(device, shaders::apply_gamma_table_color_cs,
++                                             sizeof(shaders::apply_gamma_table_color_cs),
++                                             apply_gamma_root_signature_.Get());
++  *(apply_gamma_table_fxaa_luma_color_pipeline_.ReleaseAndGetAddressOf()) =
++      ui::d3d12::util::CreateComputePipeline(device, shaders::apply_gamma_table_fxaa_luma_color_cs,
++                                             sizeof(shaders::apply_gamma_table_fxaa_luma_color_cs),
++                                             apply_gamma_root_signature_.Get());
++  *(apply_gamma_pwl_color_pipeline_.ReleaseAndGetAddressOf()) =
++      ui::d3d12::util::CreateComputePipeline(device, shaders::apply_gamma_pwl_color_cs,
++                                             sizeof(shaders::apply_gamma_pwl_color_cs),
++                                             apply_gamma_root_signature_.Get());
++  *(apply_gamma_pwl_fxaa_luma_color_pipeline_.ReleaseAndGetAddressOf()) =
++      ui::d3d12::util::CreateComputePipeline(device, shaders::apply_gamma_pwl_fxaa_luma_color_cs,
++                                             sizeof(shaders::apply_gamma_pwl_fxaa_luma_color_cs),
++                                             apply_gamma_root_signature_.Get());
++  if (!apply_gamma_table_color_pipeline_ || !apply_gamma_table_fxaa_luma_color_pipeline_ ||
++      !apply_gamma_pwl_color_pipeline_ || !apply_gamma_pwl_fxaa_luma_color_pipeline_) {
++    REXGPU_WARN("Failed to create the colour adjustment gamma pipelines; colours unadjusted");
++  }
+ 
+   // Initialize compute pipelines for post-processing anti-aliasing.
+   D3D12_ROOT_PARAMETER fxaa_root_parameters[UINT(FxaaRootParameter::kCount)];
+@@ -1712,6 +1997,10 @@ void D3D12CommandProcessor::ShutdownContext() {
+   resolve_downscale_pipeline_.Reset();
+   resolve_downscale_root_signature_.Reset();
+ 
++  apply_gamma_pwl_fxaa_luma_color_pipeline_.Reset();
++  apply_gamma_pwl_color_pipeline_.Reset();
++  apply_gamma_table_fxaa_luma_color_pipeline_.Reset();
++  apply_gamma_table_color_pipeline_.Reset();
+   apply_gamma_pwl_fxaa_luma_pipeline_.Reset();
+   apply_gamma_pwl_pipeline_.Reset();
+   apply_gamma_table_fxaa_luma_pipeline_.Reset();
+@@ -1917,6 +2206,41 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
  
  void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
 +  FlushOcclusionFrameQueries();
++  // The swap's own time, after its occlusion wait (counted with the GPU waits).
++  struct SwapTimer {
++    double& total;
++    bool on = rex::diag::TimingLogOn();
++    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++    ~SwapTimer() {
++      if (on) {
++        total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
++                                                           start)
++                     .count();
++      }
++    }
++  } swap_timer{timing_swap_ms_};
 +  if (REXCVAR_GET(gpu_perf_stats)) {
 +    auto& st = g_gpu_perf;
 +    const auto now = std::chrono::steady_clock::now();
@@ -2229,7 +2790,36 @@ index efed1b7..0f84811 100644
    SCOPE_profile_cpu_f("gpu");
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
-@@ -2292,6 +2531,125 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
+@@ -2166,9 +2490,13 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         gamma_ramp_buffer_state_ = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+ 
+         deferred_command_list_.D3DSetComputeRootSignature(apply_gamma_root_signature_.Get());
++        const ColorAdjust color = GetColorAdjust();
+         ApplyGammaConstants apply_gamma_constants;
+         apply_gamma_constants.size[0] = guest_output_width;
+         apply_gamma_constants.size[1] = guest_output_height;
++        apply_gamma_constants.saturation = color.saturation;
++        apply_gamma_constants.contrast = color.contrast;
++        apply_gamma_constants.black = color.black;
+         deferred_command_list_.D3DSetComputeRoot32BitConstants(
+             UINT(ApplyGammaRootParameter::kConstants),
+             sizeof(apply_gamma_constants) / sizeof(uint32_t), &apply_gamma_constants, 0);
+@@ -2186,6 +2514,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+           apply_gamma_pipeline = use_fxaa ? apply_gamma_table_fxaa_luma_pipeline_.Get()
+                                           : apply_gamma_table_pipeline_.Get();
+         }
++        if (color.active()) {
++          ID3D12PipelineState* color_pipeline =
++              use_pwl_gamma_ramp ? (use_fxaa ? apply_gamma_pwl_fxaa_luma_color_pipeline_.Get()
++                                             : apply_gamma_pwl_color_pipeline_.Get())
++                                 : (use_fxaa ? apply_gamma_table_fxaa_luma_color_pipeline_.Get()
++                                             : apply_gamma_table_color_pipeline_.Get());
++          if (color_pipeline) apply_gamma_pipeline = color_pipeline;
++        }
+         SetExternalPipeline(apply_gamma_pipeline);
+         SubmitBarriers();
+         uint32_t group_count_x = (guest_output_width + 15) / 16;
+@@ -2292,6 +2628,125 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
    return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
  }
  
@@ -2355,15 +2945,17 @@ index efed1b7..0f84811 100644
  bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
-@@ -2299,6 +2657,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2299,6 +2754,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
  
 +  ++g_gpu_perf.draws;
++  ++timing_draws_;
++  MaybeFlushForOcclusionOverlap();
    ID3D12Device* device = GetD3D12Provider().GetDevice();
    const RegisterFile& regs = *register_file_;
  
-@@ -2351,6 +2710,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2351,6 +2809,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
    bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
    bool memexport_used = memexport_used_vertex || memexport_used_pixel;
  
@@ -2374,7 +2966,7 @@ index efed1b7..0f84811 100644
    if (!BeginSubmission(true)) {
      return false;
    }
-@@ -3158,9 +3521,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+@@ -3158,9 +3620,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
      if (queue_operations_done_since_submission_signal_) {
        UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
        ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
@@ -2389,7 +2981,27 @@ index efed1b7..0f84811 100644
          PROFILE_CMD_BUFFER_STALL();
          WaitForSingleObject(fence_completion_event_, INFINITE);
          queue_operations_done_since_submission_signal_ = false;
-@@ -3418,11 +3783,118 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -3181,7 +3645,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+     if (SUCCEEDED(
+             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
+       PROFILE_CMD_BUFFER_STALL();
++      const auto wait_start = std::chrono::steady_clock::now();
+       WaitForSingleObject(fence_completion_event_, INFINITE);
++      fence_wait_ms_ += std::chrono::duration<double, std::milli>(
++                            std::chrono::steady_clock::now() - wait_start)
++                            .count();
+       submission_completed_ = submission_fence_->GetCompletedValue();
+     }
+   }
+@@ -3341,6 +3809,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+ 
+   if (!submission_open_) {
+     submission_open_ = true;
++    submission_open_time_ = std::chrono::steady_clock::now();
+ 
+     // Start a new deferred command list - will submit it to the real one in the
+     // end of the submission (when async pipeline creation requests are
+@@ -3418,11 +3887,176 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
      primitive_processor_->BeginFrame();
  
      texture_cache_->BeginFrame();
@@ -2404,6 +3016,50 @@ index efed1b7..0f84811 100644
    return true;
  }
  
++// Where this thread's frames went over the last window (issue #1: is it busy,
++// waiting for the game, waiting for the GPU, or not getting a CPU?). Working =
++// the rest of the frame; its CPU time is the thread's cycles outside the waits.
++void D3D12CommandProcessor::LogThreadFrameSplit(double frames) {
++  const auto now = std::chrono::steady_clock::now();
++  const uint64_t tsc = rex::diag::TscNow();
++  const uint64_t cycles = rex::diag::ThreadCycles();
++  if (timing_window_tsc_ && frames > 0.0 && tsc > timing_window_tsc_) {
++    const double wall_ms =
++        std::chrono::duration<double, std::milli>(now - timing_window_start_).count();
++    const double tsc_per_ms = double(tsc - timing_window_tsc_) / wall_ms;
++    const double cpu_ms = double(cycles - timing_window_cycles_) / tsc_per_ms;
++    const double idle_cpu_ms = double(timing_idle_cycles_) / tsc_per_ms;
++    const double reg_cpu_ms = double(timing_reg_wait_cycles_) / tsc_per_ms;
++    const double working_ms =
++        wall_ms - timing_idle_ms_ - timing_reg_wait_ms_ - fence_wait_window_ms_;
++    REXGPU_INFO("[timing] gpu commands thread per frame: {:.2f} ms = working {:.2f} ms (on a CPU "
++                "{:.2f} ms), waiting for game commands {:.2f} ms, register waits {:.2f} ms ({:.1f} "
++                "a frame), GPU waits {:.2f} ms; on a CPU {:.0f}% of the frame in all; swap {:.2f} "
++                "ms; {:.0f} draws",
++                wall_ms / frames, working_ms / frames,
++                (cpu_ms - idle_cpu_ms - reg_cpu_ms) / frames, timing_idle_ms_ / frames,
++                timing_reg_wait_ms_ / frames, double(timing_reg_waits_) / frames,
++                fence_wait_window_ms_ / frames, 100.0 * cpu_ms / wall_ms,
++                timing_swap_ms_ / frames, double(timing_draws_) / frames);
++    if (timing_reg_sleeps_) {
++      REXGPU_INFO("[timing] gpu commands register-wait sleeps: {:.1f} a frame, each asked for {} "
++                  "ms and took {:.2f} ms on average, longest {:.2f} ms (gpu_precise_waits {})",
++                  double(timing_reg_sleeps_) / frames, timing_reg_sleep_asked_ms_,
++                  timing_reg_sleep_ms_ / double(timing_reg_sleeps_), timing_reg_sleep_max_ms_,
++                  REXCVAR_GET(gpu_precise_waits) ? "on" : "off");
++    }
++  }
++  timing_reg_sleeps_ = 0;
++  timing_reg_sleep_ms_ = timing_reg_sleep_max_ms_ = 0.0;
++  timing_window_start_ = now;
++  timing_window_tsc_ = tsc;
++  timing_window_cycles_ = cycles;
++  timing_idle_ms_ = timing_reg_wait_ms_ = timing_swap_ms_ = 0.0;
++  timing_idle_cycles_ = timing_reg_wait_cycles_ = 0;
++  timing_reg_waits_ = 0;
++  timing_draws_ = 0;
++}
++
 +void D3D12CommandProcessor::GpuTimeFrameOpen() {
 +  const uint32_t slot = uint32_t(frame_current_ % kQueueFrames);
 +  // The frame that last used this slot has completed: BeginSubmission awaited
@@ -2422,6 +3078,12 @@ index efed1b7..0f84811 100644
 +      const D3D12_RANGE written_range = {};
 +      gpu_time_readback_->Unmap(0, &written_range);
 +      ++gpu_time_frames_;
++      {
++        const double frame_wait_ms = fence_wait_ms_ - fence_wait_frame_start_ms_;
++        fence_wait_frame_start_ms_ = fence_wait_ms_;
++        fence_wait_window_ms_ += frame_wait_ms;
++        fence_wait_frames_over_2_ += frame_wait_ms > 2.0;
++      }
 +      gpu_time_submissions_ += gpu_time_count_[slot] / 2;
 +      gpu_time_sum_ms_ += frame_ms;
 +      gpu_time_sq_ms_ += frame_ms * frame_ms;
@@ -2437,6 +3099,14 @@ index efed1b7..0f84811 100644
 +                    mean, std::sqrt(std::max(0.0, gpu_time_sq_ms_ / n - mean * mean)),
 +                    gpu_time_max_ms_, double(gpu_time_submissions_) / n, gpu_time_over_8_,
 +                    gpu_time_over_12_, gpu_time_over_16_);
++        REXGPU_INFO("[timing] gpu commands thread waiting on the GPU: {:.2f} ms a frame, "
++                    "over 2 ms in {} frames; {} early submissions for occlusion (flush {} us)",
++                    fence_wait_window_ms_ / n, fence_wait_frames_over_2_,
++                    occlusion_overlap_flushes_, REXCVAR_GET(occlusion_flush_us));
++        LogThreadFrameSplit(n);
++        fence_wait_window_ms_ = 0.0;
++        fence_wait_frames_over_2_ = 0;
++        occlusion_overlap_flushes_ = 0;
 +        gpu_time_frames_ = gpu_time_submissions_ = 0;
 +        gpu_time_sum_ms_ = gpu_time_sq_ms_ = gpu_time_max_ms_ = 0.0;
 +        gpu_time_over_8_ = gpu_time_over_12_ = gpu_time_over_16_ = 0;
@@ -2508,7 +3178,7 @@ index efed1b7..0f84811 100644
  bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
  
-@@ -3444,6 +3916,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3444,6 +4078,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
    }
  
    bool is_closing_frame = is_swap && frame_open_;
@@ -2516,7 +3186,7 @@ index efed1b7..0f84811 100644
  
    if (is_closing_frame) {
      texture_cache_->EndFrame();
-@@ -3455,13 +3928,21 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3455,13 +4090,21 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
      assert_false(scratch_buffer_used_);
  
      if (active_occlusion_query_.valid && occlusion_query_heap_) {
@@ -2538,7 +3208,7 @@ index efed1b7..0f84811 100644
      // Submit barriers now because resources with the queued barriers may be
      // destroyed between frames.
      SubmitBarriers();
-@@ -3504,6 +3985,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+@@ -3504,6 +4147,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
    }
  
    if (is_closing_frame) {
@@ -2548,7 +3218,7 @@ index efed1b7..0f84811 100644
      if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
        shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
      }
-@@ -4865,6 +5349,13 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
+@@ -4865,6 +5511,13 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
  bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
    active_occlusion_query_ = {};
    occlusion_query_cursor_ = 0;
@@ -2562,7 +3232,7 @@ index efed1b7..0f84811 100644
    occlusion_query_resources_available_ = false;
    occlusion_query_heap_.Reset();
    occlusion_query_readback_.Reset();
-@@ -4916,7 +5407,7 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
+@@ -4916,7 +5569,7 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
  }
  
  void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
@@ -2571,7 +3241,7 @@ index efed1b7..0f84811 100644
  
    if (occlusion_query_readback_ && occlusion_query_readback_mapping_) {
      occlusion_query_readback_->Unmap(0, nullptr);
-@@ -4934,7 +5425,66 @@ bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out)
+@@ -4934,7 +5587,66 @@ bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out)
    return true;
  }
  
@@ -2639,7 +3309,7 @@ index efed1b7..0f84811 100644
    if (active_occlusion_query_.valid && occlusion_query_heap_) {
      uint32_t host_index = active_occlusion_query_.host_index;
      // Clear before EndSubmission to prevent the EndSubmission safety net from issuing a second
-@@ -4949,6 +5499,13 @@ void D3D12CommandProcessor::DisableHostOcclusionQueries() {
+@@ -4949,6 +5661,13 @@ void D3D12CommandProcessor::DisableHostOcclusionQueries() {
      active_occlusion_query_ = {};
    }
    occlusion_query_cursor_ = 0;
@@ -2653,7 +3323,7 @@ index efed1b7..0f84811 100644
    occlusion_query_resources_available_ = false;
  }
  
-@@ -4959,7 +5516,7 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
+@@ -4959,7 +5678,7 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
    if (active_occlusion_query_.valid) {
      REXGPU_WARN(
          "D3D12CommandProcessor: Occlusion query begin issued while another query is active");
@@ -2662,7 +3332,7 @@ index efed1b7..0f84811 100644
      return false;
    }
  
-@@ -5036,7 +5593,11 @@ void D3D12CommandProcessor::WriteGuestOcclusionResult(
+@@ -5036,7 +5755,11 @@ void D3D12CommandProcessor::WriteGuestOcclusionResult(
    if (!sample_counts) {
      return;
    }
@@ -2692,7 +3362,7 @@ index 8637a62..dee6898 100644
        command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                         upload_buffer, UINT64(upload_buffer_offset),
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 3877b1a..85b244b 100644
+index 3877b1a..69f4fdc 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -13,6 +13,7 @@
@@ -2728,7 +3398,7 @@ index 3877b1a..85b244b 100644
  REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
  
  REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
-@@ -42,6 +54,27 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
+@@ -42,6 +54,30 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
  REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                      "Store shaders persistently and load them when loading games to avoid "
                      "runtime spikes and freezes when playing the game not for the first time.");
@@ -2743,6 +3413,9 @@ index 3877b1a..85b244b 100644
 +                     "Guest vblank: microseconds to yield-spin before each tick (after a "
 +                     "timer sleep); less uses less CPU, too little makes ticks late")
 +    .range(100, 4000);
++REXCVAR_DEFINE_BOOL(vblank_thread_high_priority, true, "GPU",
++                    "Run the guest vblank thread at time-critical priority so busy threads "
++                    "cannot delay its ticks");
 +
 +REXCVAR_DEFINE_DOUBLE(guest_vblank_scale, 1.0, "GPU",
 +                      "Run the guest's vblank - and so the game's own clock - this much faster "
@@ -2756,7 +3429,7 @@ index 3877b1a..85b244b 100644
  
  namespace {
  
-@@ -80,6 +113,10 @@ GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
+@@ -80,6 +116,10 @@ GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
  
  GraphicsSystem::~GraphicsSystem() = default;
  
@@ -2767,7 +3440,7 @@ index 3877b1a..85b244b 100644
  X_STATUS GraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) {
    if (presenter_) {
      return X_STATUS_SUCCESS;
-@@ -156,22 +193,129 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+@@ -156,22 +196,135 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
        new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
          system::X_VIDEO_MODE video_mode;
          kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
@@ -2806,6 +3479,12 @@ index 3877b1a..85b244b 100644
 +        // deadline (vblank_spin_us), then yield until it. The rate itself is
 +        // unchanged.
 +#if REX_PLATFORM_WIN32
++        // It sleeps nearly all the time, but at normal priority its wake-ups and
++        // the final yield-spin queued behind busy threads on a crowded PC: ticks
++        // up to 5 ms late and early (HANDOVER 4be, an i9-12900K's log).
++        if (REXCVAR_GET(vblank_thread_high_priority)) {
++          SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++        }
 +        HANDLE wait_timer = CreateWaitableTimerExW(
 +            nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
 +            TIMER_ALL_ACCESS);
@@ -2903,7 +3582,7 @@ index 3877b1a..85b244b 100644
          return 0;
        }));
    // TODO: set_can_debugger_suspend not yet ported
-@@ -348,6 +492,22 @@ void GraphicsSystem::InvalidateGpuMemory() {
+@@ -348,6 +501,22 @@ void GraphicsSystem::InvalidateGpuMemory() {
    command_processor_->CallInThread([&]() { command_processor_->InvalidateGpuMemory(); });
  }
  
@@ -2926,6 +3605,1891 @@ index 3877b1a..85b244b 100644
  void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                               uint32_t title_id, bool blocking) {
    if (!REXCVAR_GET(store_shaders)) {
+diff --git a/src/graphics/shaders/apply_gamma_color.cs.hlsl b/src/graphics/shaders/apply_gamma_color.cs.hlsl
+new file mode 100644
+index 0000000..7b4094e
+--- /dev/null
++++ b/src/graphics/shaders/apply_gamma_color.cs.hlsl
+@@ -0,0 +1,69 @@
++// Gamma ramp application with colour adjustment (Vivid Colours / Black Level),
++// the same as apply_gamma_{table,pwl}[_fxaa_luma]_cs plus the adjustment. Used
++// only while an adjustment is on, so the stock shaders stay as they were.
++//
++// Variants (fxc /D): XE_APPLY_GAMMA_PWL (piecewise linear ramp instead of the
++// 256-entry table), XE_APPLY_GAMMA_FXAA_LUMA (luma in alpha for FXAA, float
++// destination). Compile, from this folder:
++//   fxc /nologo /T cs_5_1 /E main /O3 [/D XE_APPLY_GAMMA_PWL=1] [/D XE_APPLY_GAMMA_FXAA_LUMA=1]
++//       /Vn apply_gamma_<variant>_color_cs /Fh bytecode\d3d12_5_1\apply_gamma_<variant>_color_cs.h
++//       apply_gamma_color.cs.hlsl
++
++cbuffer push_consts_xe : register(b0) {
++  uint2 xe_apply_gamma_size;
++  float xe_color_saturation;  // 1 = unchanged
++  float xe_color_contrast;    // 1 = unchanged, around a dark grey (0.25)
++  float xe_color_black;       // taken off the blacks, 0 = unchanged
++};
++
++#if XE_APPLY_GAMMA_PWL
++Buffer<uint4> xe_apply_gamma_ramp : register(t0);
++#else
++Buffer<float4> xe_apply_gamma_ramp : register(t0);
++#endif
++Texture2D<float4> xe_apply_gamma_source : register(t1);
++#if XE_APPLY_GAMMA_FXAA_LUMA
++RWTexture2D<float4> xe_apply_gamma_dest : register(u0);
++#else
++RWTexture2D<unorm float4> xe_apply_gamma_dest : register(u0);
++#endif
++
++static const float3 kLumaWeights = float3(0.299, 0.587, 0.114);
++
++#if XE_APPLY_GAMMA_PWL
++float ApplyPwl(uint source_value_10b, uint channel) {
++  uint4 pwl = xe_apply_gamma_ramp[(source_value_10b >> 3u) * 3u + channel];
++  float value = float(pwl.x) + float((source_value_10b & 7u) * pwl.y) * 0.125;
++  return min(value * 1.52737048e-05, 1.0);
++}
++#endif
++
++float3 AdjustColor(float3 rgb) {
++  rgb = saturate((rgb - xe_color_black) / (1.0 - xe_color_black));
++  float luma = dot(rgb, kLumaWeights);
++  rgb = luma + (rgb - luma) * xe_color_saturation;
++  rgb = (rgb - 0.25) * xe_color_contrast + 0.25;  // pivot on a dark grey: the game is dark
++  return saturate(rgb);
++}
++
++[numthreads(16, 8, 1)]
++void main(uint3 xe_thread_id : SV_DispatchThreadID) {
++  uint2 pixel = xe_thread_id.xy;
++  if (any(pixel >= xe_apply_gamma_size)) {
++    return;
++  }
++#if XE_APPLY_GAMMA_PWL
++  uint3 source = uint3(xe_apply_gamma_source.Load(int3(pixel, 0)).rgb * 1023.0 + 0.5);
++  float3 rgb = float3(ApplyPwl(source.r, 0u), ApplyPwl(source.g, 1u), ApplyPwl(source.b, 2u));
++#else
++  uint3 source = uint3(xe_apply_gamma_source.Load(int3(pixel, 0)).rgb * 255.0 + 0.5);
++  float3 rgb = float3(xe_apply_gamma_ramp[source.r].b, xe_apply_gamma_ramp[source.g].g,
++                      xe_apply_gamma_ramp[source.b].r);
++#endif
++  rgb = AdjustColor(rgb);
++#if XE_APPLY_GAMMA_FXAA_LUMA
++  xe_apply_gamma_dest[pixel] = float4(rgb, dot(rgb, kLumaWeights));
++#else
++  xe_apply_gamma_dest[pixel] = float4(rgb, 1.0);
++#endif
++}
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_pwl_color_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_pwl_color_cs.h
+new file mode 100644
+index 0000000..285beca
+--- /dev/null
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_pwl_color_cs.h
+@@ -0,0 +1,509 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions: 
++//
++// cbuffer push_consts_xe
++// {
++//
++//   uint2 xe_apply_gamma_size;         // Offset:    0 Size:     8
++//   float xe_color_saturation;         // Offset:    8 Size:     4
++//   float xe_color_contrast;           // Offset:   12 Size:     4
++//   float xe_color_black;              // Offset:   16 Size:     4
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// xe_apply_gamma_ramp               texture   uint4         buf      T0             t0      1 
++// xe_apply_gamma_source             texture  float4          2d      T1             t1      1 
++// xe_apply_gamma_dest                   UAV  unorm4          2d      U0             u0      1 
++// push_consts_xe                    cbuffer      NA          NA     CB0            cb0      1 
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][2], immediateIndexed, space=0
++dcl_resource_buffer (uint,uint,uint,uint) T0[0:0], space=0
++dcl_resource_texture2d (float,float,float,float) T1[1:1], space=0
++dcl_uav_typed_texture2d (unorm,unorm,unorm,unorm) U0[0:0], space=0
++dcl_input vThreadID.xy
++dcl_temps 3
++dcl_thread_group 16, 8, 1
++uge r0.xy, vThreadID.xyxx, CB0[0][0].xyxx
++or r0.x, r0.y, r0.x
++if_nz r0.x
++  ret 
++endif 
++mov r0.xy, vThreadID.xyxx
++mov r0.zw, l(0,0,0,0)
++ld r0.xyz, r0.xyzw, T1[1].xyzw
++mad r0.xyz, r0.xyzx, l(1023.000000, 1023.000000, 1023.000000, 0.000000), l(0.500000, 0.500000, 0.500000, 0.000000)
++ftou r0.xyz, r0.xyzx
++ushr r1.xyz, r0.xyzx, l(3, 3, 3, 0)
++imul null, r0.w, r1.x, l(3)
++ld r1.xw, r0.wwww, T0[0].xzwy
++utof r0.w, r1.x
++and r0.xyz, r0.xyzx, l(7, 7, 7, 0)
++imul null, r0.x, r1.w, r0.x
++utof r0.x, r0.x
++mad r0.x, r0.x, l(0.125000), r0.w
++mul r0.x, r0.x, l(0.000015)
++min r2.x, r0.x, l(1.000000)
++imad r0.xw, r1.yyyz, l(3, 0, 0, 3), l(1, 0, 0, 2)
++ld r1.xy, r0.xxxx, T0[0].xyzw
++utof r0.x, r1.x
++imul null, r0.y, r0.y, r1.y
++utof r0.y, r0.y
++mad r0.x, r0.y, l(0.125000), r0.x
++mul r0.x, r0.x, l(0.000015)
++min r2.y, r0.x, l(1.000000)
++ld r0.xy, r0.wwww, T0[0].xyzw
++imul null, r0.y, r0.y, r0.z
++utof r0.xy, r0.xyxx
++mad r0.x, r0.y, l(0.125000), r0.x
++mul r0.x, r0.x, l(0.000015)
++min r2.z, r0.x, l(1.000000)
++add r0.xyz, r2.xyzx, -CB0[0][1].xxxx
++add r0.w, -CB0[0][1].x, l(1.000000)
++div_sat r0.xyz, r0.xyzx, r0.wwww
++dp3 r0.w, r0.xyzx, l(0.299000, 0.587000, 0.114000, 0.000000)
++add r0.xyz, -r0.wwww, r0.xyzx
++mad r0.xyz, r0.xyzx, CB0[0][0].zzzz, r0.wwww
++add r0.xyz, r0.xyzx, l(-0.250000, -0.250000, -0.250000, 0.000000)
++mad_sat r0.xyz, r0.xyzx, CB0[0][0].wwww, l(0.250000, 0.250000, 0.250000, 0.000000)
++mov r0.w, l(1.000000)
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
++ret 
++// Approximately 45 instruction slots used
++#endif
++
++const BYTE apply_gamma_pwl_color_cs[] =
++{
++     68,  88,  66,  67, 178, 149, 
++    143,  85,  36, 223, 129,  88, 
++    170,   9, 241, 155, 186, 124, 
++    203,  76,   1,   0,   0,   0, 
++    148,   9,   0,   0,   5,   0, 
++      0,   0,  52,   0,   0,   0, 
++    236,   2,   0,   0, 252,   2, 
++      0,   0,  12,   3,   0,   0, 
++    248,   8,   0,   0,  82,  68, 
++     69,  70, 176,   2,   0,   0, 
++      1,   0,   0,   0,  44,   1, 
++      0,   0,   4,   0,   0,   0, 
++     60,   0,   0,   0,   1,   5, 
++     83,  67,   0, 133,   0,   0, 
++    133,   2,   0,   0,  19,  19, 
++     68,  37,  60,   0,   0,   0, 
++     24,   0,   0,   0,  40,   0, 
++      0,   0,  40,   0,   0,   0, 
++     36,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++    220,   0,   0,   0,   2,   0, 
++      0,   0,   4,   0,   0,   0, 
++      1,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++      1,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 240,   0, 
++      0,   0,   2,   0,   0,   0, 
++      5,   0,   0,   0,   4,   0, 
++      0,   0, 255, 255, 255, 255, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,  12,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   6,   1,   0,   0, 
++      4,   0,   0,   0,   1,   0, 
++      0,   0,   4,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     12,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     26,   1,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 114,  97, 109, 112,   0, 
++    120, 101,  95,  97, 112, 112, 
++    108, 121,  95, 103,  97, 109, 
++    109,  97,  95, 115, 111, 117, 
++    114,  99, 101,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 100, 101, 115, 116,   0, 
++    112, 117, 115, 104,  95,  99, 
++    111, 110, 115, 116, 115,  95, 
++    120, 101,   0, 171, 171, 171, 
++     26,   1,   0,   0,   4,   0, 
++      0,   0,  68,   1,   0,   0, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    228,   1,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++      2,   0,   0,   0,   0,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0,  36,   2, 
++      0,   0,   8,   0,   0,   0, 
++      4,   0,   0,   0,   2,   0, 
++      0,   0,  64,   2,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 100,   2,   0,   0, 
++     12,   0,   0,   0,   4,   0, 
++      0,   0,   2,   0,   0,   0, 
++     64,   2,   0,   0,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    118,   2,   0,   0,  16,   0, 
++      0,   0,   4,   0,   0,   0, 
++      2,   0,   0,   0,  64,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 115, 105, 122, 101,   0, 
++    117, 105, 110, 116,  50,   0, 
++    171, 171,   1,   0,  19,   0, 
++      1,   0,   2,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 248,   1, 
++      0,   0, 120, 101,  95,  99, 
++    111, 108, 111, 114,  95, 115, 
++     97, 116, 117, 114,  97, 116, 
++    105, 111, 110,   0, 102, 108, 
++    111,  97, 116,   0, 171, 171, 
++      0,   0,   3,   0,   1,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  56,   2,   0,   0, 
++    120, 101,  95,  99, 111, 108, 
++    111, 114,  95,  99, 111, 110, 
++    116, 114,  97, 115, 116,   0, 
++    120, 101,  95,  99, 111, 108, 
++    111, 114,  95,  98, 108,  97, 
++     99, 107,   0,  77, 105,  99, 
++    114, 111, 115, 111, 102, 116, 
++     32,  40,  82,  41,  32,  72, 
++     76,  83,  76,  32,  83, 104, 
++     97, 100, 101, 114,  32,  67, 
++    111, 109, 112, 105, 108, 101, 
++    114,  32,  49,  48,  46,  49, 
++      0, 171, 171, 171,  73,  83, 
++     71,  78,   8,   0,   0,   0, 
++      0,   0,   0,   0,   8,   0, 
++      0,   0,  79,  83,  71,  78, 
++      8,   0,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++     83,  72,  69,  88, 228,   5, 
++      0,   0,  81,   0,   5,   0, 
++    121,   1,   0,   0, 106,   8, 
++      0,   1,  89,   0,   0,   7, 
++     70, 142,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++     88,   8,   0,   7,  70, 126, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  68,  68,   0,   0, 
++      0,   0,   0,   0,  88,  24, 
++      0,   7,  70, 126,  48,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     85,  85,   0,   0,   0,   0, 
++      0,   0, 156,  24,   0,   7, 
++     70, 238,  49,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  17,  17, 
++      0,   0,   0,   0,   0,   0, 
++     95,   0,   0,   2,  50,   0, 
++      2,   0, 104,   0,   0,   2, 
++      3,   0,   0,   0, 155,   0, 
++      0,   4,  16,   0,   0,   0, 
++      8,   0,   0,   0,   1,   0, 
++      0,   0,  80,   0,   0,   8, 
++     50,   0,  16,   0,   0,   0, 
++      0,   0,  70,   0,   2,   0, 
++     70, 128,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  60,   0, 
++      0,   7,  18,   0,  16,   0, 
++      0,   0,   0,   0,  26,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  31,   0,   4,   3, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  62,   0,   0,   1, 
++     21,   0,   0,   1,  54,   0, 
++      0,   4,  50,   0,  16,   0, 
++      0,   0,   0,   0,  70,   0, 
++      2,   0,  54,   0,   0,   8, 
++    194,   0,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  45,   0, 
++      0,   8, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,  14, 
++     16,   0,   0,   0,   0,   0, 
++     70, 126,  32,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     50,   0,   0,  15, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0, 192, 127,  68,   0, 192, 
++    127,  68,   0, 192, 127,  68, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,  63, 
++      0,   0,   0,  63,   0,   0, 
++      0,  63,   0,   0,   0,   0, 
++     28,   0,   0,   5, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,  85,   0,   0,  10, 
++    114,   0,  16,   0,   1,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   3,   0,   0,   0, 
++      3,   0,   0,   0,   3,   0, 
++      0,   0,   0,   0,   0,   0, 
++     38,   0,   0,   8,   0, 208, 
++      0,   0, 130,   0,  16,   0, 
++      0,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,  64,   0,   0,   3,   0, 
++      0,   0,  45,   0,   0,   8, 
++    146,   0,  16,   0,   1,   0, 
++      0,   0, 246,  15,  16,   0, 
++      0,   0,   0,   0, 134, 119, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  86,   0, 
++      0,   5, 130,   0,  16,   0, 
++      0,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,   0,   0,  10, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      7,   0,   0,   0,   7,   0, 
++      0,   0,   7,   0,   0,   0, 
++      0,   0,   0,   0,  38,   0, 
++      0,   8,   0, 208,   0,   0, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  58,   0,  16,   0, 
++      1,   0,   0,   0,  10,   0, 
++     16,   0,   0,   0,   0,   0, 
++     86,   0,   0,   5,  18,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  50,   0,   0,   9, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  10,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0,   0,  62, 
++     58,   0,  16,   0,   0,   0, 
++      0,   0,  56,   0,   0,   7, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  10,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   8,  32, 128,  55, 
++     51,   0,   0,   7,  18,   0, 
++     16,   0,   2,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0, 128,  63,  35,   0, 
++      0,  15, 146,   0,  16,   0, 
++      0,   0,   0,   0,  86,   9, 
++     16,   0,   1,   0,   0,   0, 
++      2,  64,   0,   0,   3,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   3,   0, 
++      0,   0,   2,  64,   0,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,   0,   0,   0,  45,   0, 
++      0,   8,  50,   0,  16,   0, 
++      1,   0,   0,   0,   6,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70, 126,  32,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     86,   0,   0,   5,  18,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   1,   0, 
++      0,   0,  38,   0,   0,   8, 
++      0, 208,   0,   0,  34,   0, 
++     16,   0,   0,   0,   0,   0, 
++     26,   0,  16,   0,   0,   0, 
++      0,   0,  26,   0,  16,   0, 
++      1,   0,   0,   0,  86,   0, 
++      0,   5,  34,   0,  16,   0, 
++      0,   0,   0,   0,  26,   0, 
++     16,   0,   0,   0,   0,   0, 
++     50,   0,   0,   9,  18,   0, 
++     16,   0,   0,   0,   0,   0, 
++     26,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0,   0,  62,  10,   0, 
++     16,   0,   0,   0,   0,   0, 
++     56,   0,   0,   7,  18,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      8,  32, 128,  55,  51,   0, 
++      0,   7,  34,   0,  16,   0, 
++      2,   0,   0,   0,  10,   0, 
++     16,   0,   0,   0,   0,   0, 
++      1,  64,   0,   0,   0,   0, 
++    128,  63,  45,   0,   0,   8, 
++     50,   0,  16,   0,   0,   0, 
++      0,   0, 246,  15,  16,   0, 
++      0,   0,   0,   0,  70, 126, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  38,   0, 
++      0,   8,   0, 208,   0,   0, 
++     34,   0,  16,   0,   0,   0, 
++      0,   0,  26,   0,  16,   0, 
++      0,   0,   0,   0,  42,   0, 
++     16,   0,   0,   0,   0,   0, 
++     86,   0,   0,   5,  50,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   0,  16,   0,   0,   0, 
++      0,   0,  50,   0,   0,   9, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  26,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0,   0,  62, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  56,   0,   0,   7, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  10,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   8,  32, 128,  55, 
++     51,   0,   0,   7,  66,   0, 
++     16,   0,   2,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0, 128,  63,   0,   0, 
++      0,  10, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   2,   0,   0,   0, 
++      6, 128,  48, 128,  65,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   0,   0,   0,  10, 
++    130,   0,  16,   0,   0,   0, 
++      0,   0,  10, 128,  48, 128, 
++     65,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0, 128,  63, 
++     14,  32,   0,   7, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0, 246,  15,  16,   0, 
++      0,   0,   0,   0,  16,   0, 
++      0,  10, 130,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++      2,  64,   0,   0, 135,  22, 
++    153,  62, 162,  69,  22,  63, 
++    213, 120, 233,  61,   0,   0, 
++      0,   0,   0,   0,   0,   8, 
++    114,   0,  16,   0,   0,   0, 
++      0,   0, 246,  15,  16, 128, 
++     65,   0,   0,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0,  50,   0, 
++      0,  11, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++    166, 138,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 246,  15, 
++     16,   0,   0,   0,   0,   0, 
++      0,   0,   0,  10, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0, 128, 190,   0,   0, 
++    128, 190,   0,   0, 128, 190, 
++      0,   0,   0,   0,  50,  32, 
++      0,  14, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++    246, 143,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0, 128,  62, 
++      0,   0, 128,  62,   0,   0, 
++    128,  62,   0,   0,   0,   0, 
++     54,   0,   0,   5, 130,   0, 
++     16,   0,   0,   0,   0,   0, 
++      1,  64,   0,   0,   0,   0, 
++    128,  63, 164,   0,   0,   7, 
++    242, 224,  33,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     70,   5,   2,   0,  70,  14, 
++     16,   0,   0,   0,   0,   0, 
++     62,   0,   0,   1,  83,  84, 
++     65,  84, 148,   0,   0,   0, 
++     45,   0,   0,   0,   3,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,  18,   0, 
++      0,   0,   5,   0,   0,   0, 
++      4,   0,   0,   0,   2,   0, 
++      0,   0,   1,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      4,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   3,   0, 
++      0,   0,   0,   0,   0,   0, 
++      6,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0
++};
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_pwl_fxaa_luma_color_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_pwl_fxaa_luma_color_cs.h
+new file mode 100644
+index 0000000..a44d088
+--- /dev/null
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_pwl_fxaa_luma_color_cs.h
+@@ -0,0 +1,512 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions: 
++//
++// cbuffer push_consts_xe
++// {
++//
++//   uint2 xe_apply_gamma_size;         // Offset:    0 Size:     8
++//   float xe_color_saturation;         // Offset:    8 Size:     4
++//   float xe_color_contrast;           // Offset:   12 Size:     4
++//   float xe_color_black;              // Offset:   16 Size:     4
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// xe_apply_gamma_ramp               texture   uint4         buf      T0             t0      1 
++// xe_apply_gamma_source             texture  float4          2d      T1             t1      1 
++// xe_apply_gamma_dest                   UAV  float4          2d      U0             u0      1 
++// push_consts_xe                    cbuffer      NA          NA     CB0            cb0      1 
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][2], immediateIndexed, space=0
++dcl_resource_buffer (uint,uint,uint,uint) T0[0:0], space=0
++dcl_resource_texture2d (float,float,float,float) T1[1:1], space=0
++dcl_uav_typed_texture2d (float,float,float,float) U0[0:0], space=0
++dcl_input vThreadID.xy
++dcl_temps 3
++dcl_thread_group 16, 8, 1
++uge r0.xy, vThreadID.xyxx, CB0[0][0].xyxx
++or r0.x, r0.y, r0.x
++if_nz r0.x
++  ret 
++endif 
++mov r0.xy, vThreadID.xyxx
++mov r0.zw, l(0,0,0,0)
++ld r0.xyz, r0.xyzw, T1[1].xyzw
++mad r0.xyz, r0.xyzx, l(1023.000000, 1023.000000, 1023.000000, 0.000000), l(0.500000, 0.500000, 0.500000, 0.000000)
++ftou r0.xyz, r0.xyzx
++ushr r1.xyz, r0.xyzx, l(3, 3, 3, 0)
++imul null, r0.w, r1.x, l(3)
++ld r1.xw, r0.wwww, T0[0].xzwy
++utof r0.w, r1.x
++and r0.xyz, r0.xyzx, l(7, 7, 7, 0)
++imul null, r0.x, r1.w, r0.x
++utof r0.x, r0.x
++mad r0.x, r0.x, l(0.125000), r0.w
++mul r0.x, r0.x, l(0.000015)
++min r2.x, r0.x, l(1.000000)
++imad r0.xw, r1.yyyz, l(3, 0, 0, 3), l(1, 0, 0, 2)
++ld r1.xy, r0.xxxx, T0[0].xyzw
++utof r0.x, r1.x
++imul null, r0.y, r0.y, r1.y
++utof r0.y, r0.y
++mad r0.x, r0.y, l(0.125000), r0.x
++mul r0.x, r0.x, l(0.000015)
++min r2.y, r0.x, l(1.000000)
++ld r0.xy, r0.wwww, T0[0].xyzw
++imul null, r0.y, r0.y, r0.z
++utof r0.xy, r0.xyxx
++mad r0.x, r0.y, l(0.125000), r0.x
++mul r0.x, r0.x, l(0.000015)
++min r2.z, r0.x, l(1.000000)
++add r0.xyz, r2.xyzx, -CB0[0][1].xxxx
++add r0.w, -CB0[0][1].x, l(1.000000)
++div_sat r0.xyz, r0.xyzx, r0.wwww
++dp3 r0.w, r0.xyzx, l(0.299000, 0.587000, 0.114000, 0.000000)
++add r0.xyz, -r0.wwww, r0.xyzx
++mad r0.xyz, r0.xyzx, CB0[0][0].zzzz, r0.wwww
++add r0.xyz, r0.xyzx, l(-0.250000, -0.250000, -0.250000, 0.000000)
++mad_sat r0.xyz, r0.xyzx, CB0[0][0].wwww, l(0.250000, 0.250000, 0.250000, 0.000000)
++dp3 r0.w, r0.xyzx, l(0.299000, 0.587000, 0.114000, 0.000000)
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
++ret 
++// Approximately 45 instruction slots used
++#endif
++
++const BYTE apply_gamma_pwl_fxaa_luma_color_cs[] =
++{
++     68,  88,  66,  67, 121, 111, 
++    202,  75, 184, 203, 188,  94, 
++    244, 205, 210,   6,  91, 201, 
++     93, 254,   1,   0,   0,   0, 
++    168,   9,   0,   0,   5,   0, 
++      0,   0,  52,   0,   0,   0, 
++    236,   2,   0,   0, 252,   2, 
++      0,   0,  12,   3,   0,   0, 
++     12,   9,   0,   0,  82,  68, 
++     69,  70, 176,   2,   0,   0, 
++      1,   0,   0,   0,  44,   1, 
++      0,   0,   4,   0,   0,   0, 
++     60,   0,   0,   0,   1,   5, 
++     83,  67,   0, 133,   0,   0, 
++    133,   2,   0,   0,  19,  19, 
++     68,  37,  60,   0,   0,   0, 
++     24,   0,   0,   0,  40,   0, 
++      0,   0,  40,   0,   0,   0, 
++     36,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++    220,   0,   0,   0,   2,   0, 
++      0,   0,   4,   0,   0,   0, 
++      1,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++      1,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 240,   0, 
++      0,   0,   2,   0,   0,   0, 
++      5,   0,   0,   0,   4,   0, 
++      0,   0, 255, 255, 255, 255, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,  12,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   6,   1,   0,   0, 
++      4,   0,   0,   0,   5,   0, 
++      0,   0,   4,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     12,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     26,   1,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 114,  97, 109, 112,   0, 
++    120, 101,  95,  97, 112, 112, 
++    108, 121,  95, 103,  97, 109, 
++    109,  97,  95, 115, 111, 117, 
++    114,  99, 101,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 100, 101, 115, 116,   0, 
++    112, 117, 115, 104,  95,  99, 
++    111, 110, 115, 116, 115,  95, 
++    120, 101,   0, 171, 171, 171, 
++     26,   1,   0,   0,   4,   0, 
++      0,   0,  68,   1,   0,   0, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    228,   1,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++      2,   0,   0,   0,   0,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0,  36,   2, 
++      0,   0,   8,   0,   0,   0, 
++      4,   0,   0,   0,   2,   0, 
++      0,   0,  64,   2,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 100,   2,   0,   0, 
++     12,   0,   0,   0,   4,   0, 
++      0,   0,   2,   0,   0,   0, 
++     64,   2,   0,   0,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    118,   2,   0,   0,  16,   0, 
++      0,   0,   4,   0,   0,   0, 
++      2,   0,   0,   0,  64,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 115, 105, 122, 101,   0, 
++    117, 105, 110, 116,  50,   0, 
++    171, 171,   1,   0,  19,   0, 
++      1,   0,   2,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 248,   1, 
++      0,   0, 120, 101,  95,  99, 
++    111, 108, 111, 114,  95, 115, 
++     97, 116, 117, 114,  97, 116, 
++    105, 111, 110,   0, 102, 108, 
++    111,  97, 116,   0, 171, 171, 
++      0,   0,   3,   0,   1,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  56,   2,   0,   0, 
++    120, 101,  95,  99, 111, 108, 
++    111, 114,  95,  99, 111, 110, 
++    116, 114,  97, 115, 116,   0, 
++    120, 101,  95,  99, 111, 108, 
++    111, 114,  95,  98, 108,  97, 
++     99, 107,   0,  77, 105,  99, 
++    114, 111, 115, 111, 102, 116, 
++     32,  40,  82,  41,  32,  72, 
++     76,  83,  76,  32,  83, 104, 
++     97, 100, 101, 114,  32,  67, 
++    111, 109, 112, 105, 108, 101, 
++    114,  32,  49,  48,  46,  49, 
++      0, 171, 171, 171,  73,  83, 
++     71,  78,   8,   0,   0,   0, 
++      0,   0,   0,   0,   8,   0, 
++      0,   0,  79,  83,  71,  78, 
++      8,   0,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++     83,  72,  69,  88, 248,   5, 
++      0,   0,  81,   0,   5,   0, 
++    126,   1,   0,   0, 106,   8, 
++      0,   1,  89,   0,   0,   7, 
++     70, 142,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++     88,   8,   0,   7,  70, 126, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  68,  68,   0,   0, 
++      0,   0,   0,   0,  88,  24, 
++      0,   7,  70, 126,  48,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     85,  85,   0,   0,   0,   0, 
++      0,   0, 156,  24,   0,   7, 
++     70, 238,  49,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  85,  85, 
++      0,   0,   0,   0,   0,   0, 
++     95,   0,   0,   2,  50,   0, 
++      2,   0, 104,   0,   0,   2, 
++      3,   0,   0,   0, 155,   0, 
++      0,   4,  16,   0,   0,   0, 
++      8,   0,   0,   0,   1,   0, 
++      0,   0,  80,   0,   0,   8, 
++     50,   0,  16,   0,   0,   0, 
++      0,   0,  70,   0,   2,   0, 
++     70, 128,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  60,   0, 
++      0,   7,  18,   0,  16,   0, 
++      0,   0,   0,   0,  26,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  31,   0,   4,   3, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  62,   0,   0,   1, 
++     21,   0,   0,   1,  54,   0, 
++      0,   4,  50,   0,  16,   0, 
++      0,   0,   0,   0,  70,   0, 
++      2,   0,  54,   0,   0,   8, 
++    194,   0,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  45,   0, 
++      0,   8, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,  14, 
++     16,   0,   0,   0,   0,   0, 
++     70, 126,  32,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     50,   0,   0,  15, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0, 192, 127,  68,   0, 192, 
++    127,  68,   0, 192, 127,  68, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,  63, 
++      0,   0,   0,  63,   0,   0, 
++      0,  63,   0,   0,   0,   0, 
++     28,   0,   0,   5, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,  85,   0,   0,  10, 
++    114,   0,  16,   0,   1,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   3,   0,   0,   0, 
++      3,   0,   0,   0,   3,   0, 
++      0,   0,   0,   0,   0,   0, 
++     38,   0,   0,   8,   0, 208, 
++      0,   0, 130,   0,  16,   0, 
++      0,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,  64,   0,   0,   3,   0, 
++      0,   0,  45,   0,   0,   8, 
++    146,   0,  16,   0,   1,   0, 
++      0,   0, 246,  15,  16,   0, 
++      0,   0,   0,   0, 134, 119, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  86,   0, 
++      0,   5, 130,   0,  16,   0, 
++      0,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,   0,   0,  10, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      7,   0,   0,   0,   7,   0, 
++      0,   0,   7,   0,   0,   0, 
++      0,   0,   0,   0,  38,   0, 
++      0,   8,   0, 208,   0,   0, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  58,   0,  16,   0, 
++      1,   0,   0,   0,  10,   0, 
++     16,   0,   0,   0,   0,   0, 
++     86,   0,   0,   5,  18,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  50,   0,   0,   9, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  10,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0,   0,  62, 
++     58,   0,  16,   0,   0,   0, 
++      0,   0,  56,   0,   0,   7, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  10,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   8,  32, 128,  55, 
++     51,   0,   0,   7,  18,   0, 
++     16,   0,   2,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0, 128,  63,  35,   0, 
++      0,  15, 146,   0,  16,   0, 
++      0,   0,   0,   0,  86,   9, 
++     16,   0,   1,   0,   0,   0, 
++      2,  64,   0,   0,   3,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   3,   0, 
++      0,   0,   2,  64,   0,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,   0,   0,   0,  45,   0, 
++      0,   8,  50,   0,  16,   0, 
++      1,   0,   0,   0,   6,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70, 126,  32,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     86,   0,   0,   5,  18,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   1,   0, 
++      0,   0,  38,   0,   0,   8, 
++      0, 208,   0,   0,  34,   0, 
++     16,   0,   0,   0,   0,   0, 
++     26,   0,  16,   0,   0,   0, 
++      0,   0,  26,   0,  16,   0, 
++      1,   0,   0,   0,  86,   0, 
++      0,   5,  34,   0,  16,   0, 
++      0,   0,   0,   0,  26,   0, 
++     16,   0,   0,   0,   0,   0, 
++     50,   0,   0,   9,  18,   0, 
++     16,   0,   0,   0,   0,   0, 
++     26,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0,   0,  62,  10,   0, 
++     16,   0,   0,   0,   0,   0, 
++     56,   0,   0,   7,  18,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      8,  32, 128,  55,  51,   0, 
++      0,   7,  34,   0,  16,   0, 
++      2,   0,   0,   0,  10,   0, 
++     16,   0,   0,   0,   0,   0, 
++      1,  64,   0,   0,   0,   0, 
++    128,  63,  45,   0,   0,   8, 
++     50,   0,  16,   0,   0,   0, 
++      0,   0, 246,  15,  16,   0, 
++      0,   0,   0,   0,  70, 126, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  38,   0, 
++      0,   8,   0, 208,   0,   0, 
++     34,   0,  16,   0,   0,   0, 
++      0,   0,  26,   0,  16,   0, 
++      0,   0,   0,   0,  42,   0, 
++     16,   0,   0,   0,   0,   0, 
++     86,   0,   0,   5,  50,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   0,  16,   0,   0,   0, 
++      0,   0,  50,   0,   0,   9, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  26,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0,   0,  62, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  56,   0,   0,   7, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  10,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   8,  32, 128,  55, 
++     51,   0,   0,   7,  66,   0, 
++     16,   0,   2,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0, 128,  63,   0,   0, 
++      0,  10, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   2,   0,   0,   0, 
++      6, 128,  48, 128,  65,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   0,   0,   0,  10, 
++    130,   0,  16,   0,   0,   0, 
++      0,   0,  10, 128,  48, 128, 
++     65,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0, 128,  63, 
++     14,  32,   0,   7, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0, 246,  15,  16,   0, 
++      0,   0,   0,   0,  16,   0, 
++      0,  10, 130,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++      2,  64,   0,   0, 135,  22, 
++    153,  62, 162,  69,  22,  63, 
++    213, 120, 233,  61,   0,   0, 
++      0,   0,   0,   0,   0,   8, 
++    114,   0,  16,   0,   0,   0, 
++      0,   0, 246,  15,  16, 128, 
++     65,   0,   0,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0,  50,   0, 
++      0,  11, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++    166, 138,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 246,  15, 
++     16,   0,   0,   0,   0,   0, 
++      0,   0,   0,  10, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0, 128, 190,   0,   0, 
++    128, 190,   0,   0, 128, 190, 
++      0,   0,   0,   0,  50,  32, 
++      0,  14, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++    246, 143,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0, 128,  62, 
++      0,   0, 128,  62,   0,   0, 
++    128,  62,   0,   0,   0,   0, 
++     16,   0,   0,  10, 130,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++    135,  22, 153,  62, 162,  69, 
++     22,  63, 213, 120, 233,  61, 
++      0,   0,   0,   0, 164,   0, 
++      0,   7, 242, 224,  33,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  70,   5,   2,   0, 
++     70,  14,  16,   0,   0,   0, 
++      0,   0,  62,   0,   0,   1, 
++     83,  84,  65,  84, 148,   0, 
++      0,   0,  45,   0,   0,   0, 
++      3,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     19,   0,   0,   0,   5,   0, 
++      0,   0,   4,   0,   0,   0, 
++      2,   0,   0,   0,   1,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   4,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,   0,   0,   0,   0,   0, 
++      0,   0,   6,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0
++};
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_table_color_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_table_color_cs.h
+new file mode 100644
+index 0000000..05625ab
+--- /dev/null
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_table_color_cs.h
+@@ -0,0 +1,381 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions: 
++//
++// cbuffer push_consts_xe
++// {
++//
++//   uint2 xe_apply_gamma_size;         // Offset:    0 Size:     8
++//   float xe_color_saturation;         // Offset:    8 Size:     4
++//   float xe_color_contrast;           // Offset:   12 Size:     4
++//   float xe_color_black;              // Offset:   16 Size:     4
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// xe_apply_gamma_ramp               texture  float4         buf      T0             t0      1 
++// xe_apply_gamma_source             texture  float4          2d      T1             t1      1 
++// xe_apply_gamma_dest                   UAV  unorm4          2d      U0             u0      1 
++// push_consts_xe                    cbuffer      NA          NA     CB0            cb0      1 
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][2], immediateIndexed, space=0
++dcl_resource_buffer (float,float,float,float) T0[0:0], space=0
++dcl_resource_texture2d (float,float,float,float) T1[1:1], space=0
++dcl_uav_typed_texture2d (unorm,unorm,unorm,unorm) U0[0:0], space=0
++dcl_input vThreadID.xy
++dcl_temps 2
++dcl_thread_group 16, 8, 1
++uge r0.xy, vThreadID.xyxx, CB0[0][0].xyxx
++or r0.x, r0.y, r0.x
++if_nz r0.x
++  ret 
++endif 
++mov r0.xy, vThreadID.xyxx
++mov r0.zw, l(0,0,0,0)
++ld r0.xyz, r0.xyzw, T1[1].xyzw
++mad r0.xyz, r0.xyzx, l(255.000000, 255.000000, 255.000000, 0.000000), l(0.500000, 0.500000, 0.500000, 0.000000)
++ftou r0.xyz, r0.xyzx
++ld r1.x, r0.xxxx, T0[0].zxyw
++ld r1.y, r0.yyyy, T0[0].xyzw
++ld r1.z, r0.zzzz, T0[0].yzxw
++add r0.xyz, r1.xyzx, -CB0[0][1].xxxx
++add r0.w, -CB0[0][1].x, l(1.000000)
++div_sat r0.xyz, r0.xyzx, r0.wwww
++dp3 r0.w, r0.xyzx, l(0.299000, 0.587000, 0.114000, 0.000000)
++add r0.xyz, -r0.wwww, r0.xyzx
++mad r0.xyz, r0.xyzx, CB0[0][0].zzzz, r0.wwww
++add r0.xyz, r0.xyzx, l(-0.250000, -0.250000, -0.250000, 0.000000)
++mad_sat r0.xyz, r0.xyzx, CB0[0][0].wwww, l(0.250000, 0.250000, 0.250000, 0.000000)
++mov r0.w, l(1.000000)
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
++ret 
++// Approximately 24 instruction slots used
++#endif
++
++const BYTE apply_gamma_table_color_cs[] =
++{
++     68,  88,  66,  67, 233, 105, 
++    162, 104, 139, 204,  96,  14, 
++    196, 207,  43,  43,  31,  79, 
++    181,  47,   1,   0,   0,   0, 
++     16,   7,   0,   0,   5,   0, 
++      0,   0,  52,   0,   0,   0, 
++    236,   2,   0,   0, 252,   2, 
++      0,   0,  12,   3,   0,   0, 
++    116,   6,   0,   0,  82,  68, 
++     69,  70, 176,   2,   0,   0, 
++      1,   0,   0,   0,  44,   1, 
++      0,   0,   4,   0,   0,   0, 
++     60,   0,   0,   0,   1,   5, 
++     83,  67,   0, 133,   0,   0, 
++    133,   2,   0,   0,  19,  19, 
++     68,  37,  60,   0,   0,   0, 
++     24,   0,   0,   0,  40,   0, 
++      0,   0,  40,   0,   0,   0, 
++     36,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++    220,   0,   0,   0,   2,   0, 
++      0,   0,   5,   0,   0,   0, 
++      1,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++      1,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 240,   0, 
++      0,   0,   2,   0,   0,   0, 
++      5,   0,   0,   0,   4,   0, 
++      0,   0, 255, 255, 255, 255, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,  12,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   6,   1,   0,   0, 
++      4,   0,   0,   0,   1,   0, 
++      0,   0,   4,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     12,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     26,   1,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 114,  97, 109, 112,   0, 
++    120, 101,  95,  97, 112, 112, 
++    108, 121,  95, 103,  97, 109, 
++    109,  97,  95, 115, 111, 117, 
++    114,  99, 101,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 100, 101, 115, 116,   0, 
++    112, 117, 115, 104,  95,  99, 
++    111, 110, 115, 116, 115,  95, 
++    120, 101,   0, 171, 171, 171, 
++     26,   1,   0,   0,   4,   0, 
++      0,   0,  68,   1,   0,   0, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    228,   1,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++      2,   0,   0,   0,   0,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0,  36,   2, 
++      0,   0,   8,   0,   0,   0, 
++      4,   0,   0,   0,   2,   0, 
++      0,   0,  64,   2,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 100,   2,   0,   0, 
++     12,   0,   0,   0,   4,   0, 
++      0,   0,   2,   0,   0,   0, 
++     64,   2,   0,   0,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    118,   2,   0,   0,  16,   0, 
++      0,   0,   4,   0,   0,   0, 
++      2,   0,   0,   0,  64,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 115, 105, 122, 101,   0, 
++    117, 105, 110, 116,  50,   0, 
++    171, 171,   1,   0,  19,   0, 
++      1,   0,   2,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 248,   1, 
++      0,   0, 120, 101,  95,  99, 
++    111, 108, 111, 114,  95, 115, 
++     97, 116, 117, 114,  97, 116, 
++    105, 111, 110,   0, 102, 108, 
++    111,  97, 116,   0, 171, 171, 
++      0,   0,   3,   0,   1,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  56,   2,   0,   0, 
++    120, 101,  95,  99, 111, 108, 
++    111, 114,  95,  99, 111, 110, 
++    116, 114,  97, 115, 116,   0, 
++    120, 101,  95,  99, 111, 108, 
++    111, 114,  95,  98, 108,  97, 
++     99, 107,   0,  77, 105,  99, 
++    114, 111, 115, 111, 102, 116, 
++     32,  40,  82,  41,  32,  72, 
++     76,  83,  76,  32,  83, 104, 
++     97, 100, 101, 114,  32,  67, 
++    111, 109, 112, 105, 108, 101, 
++    114,  32,  49,  48,  46,  49, 
++      0, 171, 171, 171,  73,  83, 
++     71,  78,   8,   0,   0,   0, 
++      0,   0,   0,   0,   8,   0, 
++      0,   0,  79,  83,  71,  78, 
++      8,   0,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++     83,  72,  69,  88,  96,   3, 
++      0,   0,  81,   0,   5,   0, 
++    216,   0,   0,   0, 106,   8, 
++      0,   1,  89,   0,   0,   7, 
++     70, 142,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++     88,   8,   0,   7,  70, 126, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  85,  85,   0,   0, 
++      0,   0,   0,   0,  88,  24, 
++      0,   7,  70, 126,  48,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     85,  85,   0,   0,   0,   0, 
++      0,   0, 156,  24,   0,   7, 
++     70, 238,  49,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  17,  17, 
++      0,   0,   0,   0,   0,   0, 
++     95,   0,   0,   2,  50,   0, 
++      2,   0, 104,   0,   0,   2, 
++      2,   0,   0,   0, 155,   0, 
++      0,   4,  16,   0,   0,   0, 
++      8,   0,   0,   0,   1,   0, 
++      0,   0,  80,   0,   0,   8, 
++     50,   0,  16,   0,   0,   0, 
++      0,   0,  70,   0,   2,   0, 
++     70, 128,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  60,   0, 
++      0,   7,  18,   0,  16,   0, 
++      0,   0,   0,   0,  26,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  31,   0,   4,   3, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  62,   0,   0,   1, 
++     21,   0,   0,   1,  54,   0, 
++      0,   4,  50,   0,  16,   0, 
++      0,   0,   0,   0,  70,   0, 
++      2,   0,  54,   0,   0,   8, 
++    194,   0,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  45,   0, 
++      0,   8, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,  14, 
++     16,   0,   0,   0,   0,   0, 
++     70, 126,  32,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     50,   0,   0,  15, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0, 127,  67,   0,   0, 
++    127,  67,   0,   0, 127,  67, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,  63, 
++      0,   0,   0,  63,   0,   0, 
++      0,  63,   0,   0,   0,   0, 
++     28,   0,   0,   5, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,  45,   0,   0,   8, 
++     18,   0,  16,   0,   1,   0, 
++      0,   0,   6,   0,  16,   0, 
++      0,   0,   0,   0,  38, 125, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  45,   0, 
++      0,   8,  34,   0,  16,   0, 
++      1,   0,   0,   0,  86,   5, 
++     16,   0,   0,   0,   0,   0, 
++     70, 126,  32,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     45,   0,   0,   8,  66,   0, 
++     16,   0,   1,   0,   0,   0, 
++    166,  10,  16,   0,   0,   0, 
++      0,   0, 150, 124,  32,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,  10, 
++    114,   0,  16,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      1,   0,   0,   0,   6, 128, 
++     48, 128,  65,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++      0,   0,   0,  10, 130,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10, 128,  48, 128,  65,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0, 128,  63,  14,  32, 
++      0,   7, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++    246,  15,  16,   0,   0,   0, 
++      0,   0,  16,   0,   0,  10, 
++    130,   0,  16,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0, 135,  22, 153,  62, 
++    162,  69,  22,  63, 213, 120, 
++    233,  61,   0,   0,   0,   0, 
++      0,   0,   0,   8, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++    246,  15,  16, 128,  65,   0, 
++      0,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,  50,   0,   0,  11, 
++    114,   0,  16,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0, 166, 138, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0, 246,  15,  16,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,  10, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++    128, 190,   0,   0, 128, 190, 
++      0,   0, 128, 190,   0,   0, 
++      0,   0,  50,  32,   0,  14, 
++    114,   0,  16,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0, 246, 143, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0, 128,  62,   0,   0, 
++    128,  62,   0,   0, 128,  62, 
++      0,   0,   0,   0,  54,   0, 
++      0,   5, 130,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0, 128,  63, 
++    164,   0,   0,   7, 242, 224, 
++     33,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  70,   5, 
++      2,   0,  70,  14,  16,   0, 
++      0,   0,   0,   0,  62,   0, 
++      0,   1,  83,  84,  65,  84, 
++    148,   0,   0,   0,  24,   0, 
++      0,   0,   2,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   9,   0,   0,   0, 
++      0,   0,   0,   0,   2,   0, 
++      0,   0,   2,   0,   0,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   4,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   3,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0
++};
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_color_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_color_cs.h
+new file mode 100644
+index 0000000..8e64187
+--- /dev/null
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_color_cs.h
+@@ -0,0 +1,384 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions: 
++//
++// cbuffer push_consts_xe
++// {
++//
++//   uint2 xe_apply_gamma_size;         // Offset:    0 Size:     8
++//   float xe_color_saturation;         // Offset:    8 Size:     4
++//   float xe_color_contrast;           // Offset:   12 Size:     4
++//   float xe_color_black;              // Offset:   16 Size:     4
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// xe_apply_gamma_ramp               texture  float4         buf      T0             t0      1 
++// xe_apply_gamma_source             texture  float4          2d      T1             t1      1 
++// xe_apply_gamma_dest                   UAV  float4          2d      U0             u0      1 
++// push_consts_xe                    cbuffer      NA          NA     CB0            cb0      1 
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][2], immediateIndexed, space=0
++dcl_resource_buffer (float,float,float,float) T0[0:0], space=0
++dcl_resource_texture2d (float,float,float,float) T1[1:1], space=0
++dcl_uav_typed_texture2d (float,float,float,float) U0[0:0], space=0
++dcl_input vThreadID.xy
++dcl_temps 2
++dcl_thread_group 16, 8, 1
++uge r0.xy, vThreadID.xyxx, CB0[0][0].xyxx
++or r0.x, r0.y, r0.x
++if_nz r0.x
++  ret 
++endif 
++mov r0.xy, vThreadID.xyxx
++mov r0.zw, l(0,0,0,0)
++ld r0.xyz, r0.xyzw, T1[1].xyzw
++mad r0.xyz, r0.xyzx, l(255.000000, 255.000000, 255.000000, 0.000000), l(0.500000, 0.500000, 0.500000, 0.000000)
++ftou r0.xyz, r0.xyzx
++ld r1.x, r0.xxxx, T0[0].zxyw
++ld r1.y, r0.yyyy, T0[0].xyzw
++ld r1.z, r0.zzzz, T0[0].yzxw
++add r0.xyz, r1.xyzx, -CB0[0][1].xxxx
++add r0.w, -CB0[0][1].x, l(1.000000)
++div_sat r0.xyz, r0.xyzx, r0.wwww
++dp3 r0.w, r0.xyzx, l(0.299000, 0.587000, 0.114000, 0.000000)
++add r0.xyz, -r0.wwww, r0.xyzx
++mad r0.xyz, r0.xyzx, CB0[0][0].zzzz, r0.wwww
++add r0.xyz, r0.xyzx, l(-0.250000, -0.250000, -0.250000, 0.000000)
++mad_sat r0.xyz, r0.xyzx, CB0[0][0].wwww, l(0.250000, 0.250000, 0.250000, 0.000000)
++dp3 r0.w, r0.xyzx, l(0.299000, 0.587000, 0.114000, 0.000000)
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
++ret 
++// Approximately 24 instruction slots used
++#endif
++
++const BYTE apply_gamma_table_fxaa_luma_color_cs[] =
++{
++     68,  88,  66,  67,  11, 137, 
++    128,  19,  28, 155, 107, 234, 
++    131,  67,  34, 138, 148, 126, 
++     20, 170,   1,   0,   0,   0, 
++     36,   7,   0,   0,   5,   0, 
++      0,   0,  52,   0,   0,   0, 
++    236,   2,   0,   0, 252,   2, 
++      0,   0,  12,   3,   0,   0, 
++    136,   6,   0,   0,  82,  68, 
++     69,  70, 176,   2,   0,   0, 
++      1,   0,   0,   0,  44,   1, 
++      0,   0,   4,   0,   0,   0, 
++     60,   0,   0,   0,   1,   5, 
++     83,  67,   0, 133,   0,   0, 
++    133,   2,   0,   0,  19,  19, 
++     68,  37,  60,   0,   0,   0, 
++     24,   0,   0,   0,  40,   0, 
++      0,   0,  40,   0,   0,   0, 
++     36,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++    220,   0,   0,   0,   2,   0, 
++      0,   0,   5,   0,   0,   0, 
++      1,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++      1,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 240,   0, 
++      0,   0,   2,   0,   0,   0, 
++      5,   0,   0,   0,   4,   0, 
++      0,   0, 255, 255, 255, 255, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,  12,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   6,   1,   0,   0, 
++      4,   0,   0,   0,   5,   0, 
++      0,   0,   4,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     12,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     26,   1,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 114,  97, 109, 112,   0, 
++    120, 101,  95,  97, 112, 112, 
++    108, 121,  95, 103,  97, 109, 
++    109,  97,  95, 115, 111, 117, 
++    114,  99, 101,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 100, 101, 115, 116,   0, 
++    112, 117, 115, 104,  95,  99, 
++    111, 110, 115, 116, 115,  95, 
++    120, 101,   0, 171, 171, 171, 
++     26,   1,   0,   0,   4,   0, 
++      0,   0,  68,   1,   0,   0, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    228,   1,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++      2,   0,   0,   0,   0,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0,  36,   2, 
++      0,   0,   8,   0,   0,   0, 
++      4,   0,   0,   0,   2,   0, 
++      0,   0,  64,   2,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 100,   2,   0,   0, 
++     12,   0,   0,   0,   4,   0, 
++      0,   0,   2,   0,   0,   0, 
++     64,   2,   0,   0,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    118,   2,   0,   0,  16,   0, 
++      0,   0,   4,   0,   0,   0, 
++      2,   0,   0,   0,  64,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 120, 101, 
++     95,  97, 112, 112, 108, 121, 
++     95, 103,  97, 109, 109,  97, 
++     95, 115, 105, 122, 101,   0, 
++    117, 105, 110, 116,  50,   0, 
++    171, 171,   1,   0,  19,   0, 
++      1,   0,   2,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 248,   1, 
++      0,   0, 120, 101,  95,  99, 
++    111, 108, 111, 114,  95, 115, 
++     97, 116, 117, 114,  97, 116, 
++    105, 111, 110,   0, 102, 108, 
++    111,  97, 116,   0, 171, 171, 
++      0,   0,   3,   0,   1,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  56,   2,   0,   0, 
++    120, 101,  95,  99, 111, 108, 
++    111, 114,  95,  99, 111, 110, 
++    116, 114,  97, 115, 116,   0, 
++    120, 101,  95,  99, 111, 108, 
++    111, 114,  95,  98, 108,  97, 
++     99, 107,   0,  77, 105,  99, 
++    114, 111, 115, 111, 102, 116, 
++     32,  40,  82,  41,  32,  72, 
++     76,  83,  76,  32,  83, 104, 
++     97, 100, 101, 114,  32,  67, 
++    111, 109, 112, 105, 108, 101, 
++    114,  32,  49,  48,  46,  49, 
++      0, 171, 171, 171,  73,  83, 
++     71,  78,   8,   0,   0,   0, 
++      0,   0,   0,   0,   8,   0, 
++      0,   0,  79,  83,  71,  78, 
++      8,   0,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++     83,  72,  69,  88, 116,   3, 
++      0,   0,  81,   0,   5,   0, 
++    221,   0,   0,   0, 106,   8, 
++      0,   1,  89,   0,   0,   7, 
++     70, 142,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++     88,   8,   0,   7,  70, 126, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  85,  85,   0,   0, 
++      0,   0,   0,   0,  88,  24, 
++      0,   7,  70, 126,  48,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     85,  85,   0,   0,   0,   0, 
++      0,   0, 156,  24,   0,   7, 
++     70, 238,  49,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  85,  85, 
++      0,   0,   0,   0,   0,   0, 
++     95,   0,   0,   2,  50,   0, 
++      2,   0, 104,   0,   0,   2, 
++      2,   0,   0,   0, 155,   0, 
++      0,   4,  16,   0,   0,   0, 
++      8,   0,   0,   0,   1,   0, 
++      0,   0,  80,   0,   0,   8, 
++     50,   0,  16,   0,   0,   0, 
++      0,   0,  70,   0,   2,   0, 
++     70, 128,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  60,   0, 
++      0,   7,  18,   0,  16,   0, 
++      0,   0,   0,   0,  26,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  31,   0,   4,   3, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  62,   0,   0,   1, 
++     21,   0,   0,   1,  54,   0, 
++      0,   4,  50,   0,  16,   0, 
++      0,   0,   0,   0,  70,   0, 
++      2,   0,  54,   0,   0,   8, 
++    194,   0,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  45,   0, 
++      0,   8, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,  14, 
++     16,   0,   0,   0,   0,   0, 
++     70, 126,  32,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     50,   0,   0,  15, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0, 127,  67,   0,   0, 
++    127,  67,   0,   0, 127,  67, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,  63, 
++      0,   0,   0,  63,   0,   0, 
++      0,  63,   0,   0,   0,   0, 
++     28,   0,   0,   5, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,  45,   0,   0,   8, 
++     18,   0,  16,   0,   1,   0, 
++      0,   0,   6,   0,  16,   0, 
++      0,   0,   0,   0,  38, 125, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  45,   0, 
++      0,   8,  34,   0,  16,   0, 
++      1,   0,   0,   0,  86,   5, 
++     16,   0,   0,   0,   0,   0, 
++     70, 126,  32,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     45,   0,   0,   8,  66,   0, 
++     16,   0,   1,   0,   0,   0, 
++    166,  10,  16,   0,   0,   0, 
++      0,   0, 150, 124,  32,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,  10, 
++    114,   0,  16,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      1,   0,   0,   0,   6, 128, 
++     48, 128,  65,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++      0,   0,   0,  10, 130,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10, 128,  48, 128,  65,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0, 128,  63,  14,  32, 
++      0,   7, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++    246,  15,  16,   0,   0,   0, 
++      0,   0,  16,   0,   0,  10, 
++    130,   0,  16,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0, 135,  22, 153,  62, 
++    162,  69,  22,  63, 213, 120, 
++    233,  61,   0,   0,   0,   0, 
++      0,   0,   0,   8, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++    246,  15,  16, 128,  65,   0, 
++      0,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,  50,   0,   0,  11, 
++    114,   0,  16,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0, 166, 138, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0, 246,  15,  16,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,  10, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++    128, 190,   0,   0, 128, 190, 
++      0,   0, 128, 190,   0,   0, 
++      0,   0,  50,  32,   0,  14, 
++    114,   0,  16,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0, 246, 143, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0, 128,  62,   0,   0, 
++    128,  62,   0,   0, 128,  62, 
++      0,   0,   0,   0,  16,   0, 
++      0,  10, 130,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++      2,  64,   0,   0, 135,  22, 
++    153,  62, 162,  69,  22,  63, 
++    213, 120, 233,  61,   0,   0, 
++      0,   0, 164,   0,   0,   7, 
++    242, 224,  33,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     70,   5,   2,   0,  70,  14, 
++     16,   0,   0,   0,   0,   0, 
++     62,   0,   0,   1,  83,  84, 
++     65,  84, 148,   0,   0,   0, 
++     24,   0,   0,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,  10,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,   0,   0,   0,   2,   0, 
++      0,   0,   1,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      4,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0
++};
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
 index 333becb..68c12b1 100644
 --- a/src/graphics/shared_memory.cpp
@@ -3159,7 +5723,7 @@ index 333becb..68c12b1 100644
    std::pair<uint32_t, uint32_t> range(start, length);
    return RequestRanges(&range, 1);
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index a40436e..51b7322 100644
+index a40436e..478deb7 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -9,6 +9,8 @@
@@ -3179,7 +5743,81 @@ index a40436e..51b7322 100644
  #include <rex/graphics/flags.h>
  #include <rex/graphics/pipeline/shader/shader.h>
  #include <rex/graphics/pipeline/shader/spirv_translator.h>
-@@ -700,6 +703,31 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
+@@ -495,6 +498,73 @@ void main() {
+ )";
+ }
+ 
++// The compute gamma pass with colour adjustment (Vivid Colours / Black Level),
++// as apply_gamma_color.cs.hlsl on D3D12: the stock pass, then black level,
++// saturation and contrast. rb_swap reads the source red/blue swapped, for
++// devices without image view swizzles.
++std::string GetSwapApplyGammaColorComputeSource(bool pwl, bool fxaa_luma, bool rb_swap) {
++  std::string s = R"(#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
++
++layout(push_constant) uniform XeApplyGammaRampConstants {
++  uvec2 xe_apply_gamma_size;
++  float xe_color_saturation;
++  float xe_color_contrast;
++  float xe_color_black;
++};
++)";
++  s += pwl ? "layout(set = 0, binding = 0) uniform utextureBuffer xe_apply_gamma_ramp;\n"
++           : "layout(set = 0, binding = 0) uniform textureBuffer xe_apply_gamma_ramp;\n";
++  s += "layout(set = 1, binding = 0) uniform texture2D xe_apply_gamma_source;\n";
++  s += fxaa_luma
++           ? "layout(set = 2, binding = 0, rgba16f) writeonly uniform image2D xe_apply_gamma_dest;\n"
++           : "layout(set = 2, binding = 0, rgb10_a2) writeonly uniform image2D xe_apply_gamma_dest;\n";
++  s += "\nconst vec3 kLumaWeights = vec3(0.299, 0.587, 0.114);\n";
++  if (pwl) {
++    s += R"(
++float ApplyPwl(uint source_value_10b, uint channel) {
++  uint source_value_base = source_value_10b >> 3u;
++  uvec4 pwl = texelFetch(xe_apply_gamma_ramp, int(source_value_base * 3u + channel));
++  float value = float(pwl.x) + float((source_value_10b & 7u) * pwl.y) * 0.125;
++  return clamp(value * 1.52737048e-05, 0.0, 1.0);
++}
++)";
++  }
++  s += R"(
++vec3 AdjustColor(vec3 rgb) {
++  rgb = clamp((rgb - xe_color_black) / (1.0 - xe_color_black), 0.0, 1.0);
++  float luma = dot(rgb, kLumaWeights);
++  rgb = luma + (rgb - luma) * xe_color_saturation;
++  rgb = (rgb - 0.25) * xe_color_contrast + 0.25;  // pivot on a dark grey: the game is dark
++  return clamp(rgb, 0.0, 1.0);
++}
++
++void main() {
++  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
++  if (any(greaterThanEqual(uvec2(pixel), xe_apply_gamma_size))) {
++    return;
++  }
++)";
++  const char* swap = rb_swap ? ".bgr" : "";
++  if (pwl) {
++    s += std::string("  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, pixel, 0).rgb * 1023.0 + vec3(0.5))") +
++         swap + ";\n";
++    s += "  vec3 rgb = vec3(ApplyPwl(source.r, 0u), ApplyPwl(source.g, 1u), ApplyPwl(source.b, 2u));\n";
++  } else {
++    s += std::string("  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, pixel, 0).rgb * 255.0 + vec3(0.5))") +
++         swap + ";\n";
++    s += "  vec3 rgb = vec3(texelFetch(xe_apply_gamma_ramp, int(source.r)).b,\n"
++         "                  texelFetch(xe_apply_gamma_ramp, int(source.g)).g,\n"
++         "                  texelFetch(xe_apply_gamma_ramp, int(source.b)).r);\n";
++  }
++  s += "  rgb = AdjustColor(rgb);\n";
++  s += fxaa_luma ? "  imageStore(xe_apply_gamma_dest, pixel, vec4(rgb, dot(rgb, kLumaWeights)));\n"
++                 : "  imageStore(xe_apply_gamma_dest, pixel, vec4(rgb, 1.0));\n";
++  s += "}\n";
++  return s;
++}
++
+ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
+                                 std::vector<uint32_t>& spirv_out, std::string& error_out) {
+   static std::once_flag glslang_initialize_once;
+@@ -700,6 +770,31 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
    bool is_end = is_end_via_z_pass || is_end_via_z_fail;
  
@@ -3211,7 +5849,60 @@ index a40436e..51b7322 100644
    if (!is_end) {
      if (active_occlusion_query_.valid &&
          active_occlusion_query_.sample_count_address != sample_count_addr) {
-@@ -2285,6 +2313,9 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+@@ -1844,6 +1939,38 @@ bool VulkanCommandProcessor::SetupContext() {
+                                     "swap gamma PWL FXAA-luma compute red/blue fallback");
+   }
+ 
++  // Colour adjustment gamma pipelines (Vivid Colours / Black Level). Optional:
++  // without them the frame is shown unadjusted. The red/blue swapped ones only
++  // where image views cannot swizzle.
++  {
++    const int rb_swap_count = vulkan_device->properties().imageViewFormatSwizzle ? 1 : 2;
++    int color_pipelines_failed = 0;
++    for (int pwl = 0; pwl < 2; ++pwl) {
++      for (int fxaa_luma = 0; fxaa_luma < 2; ++fxaa_luma) {
++        for (int rb_swap = 0; rb_swap < rb_swap_count; ++rb_swap) {
++          std::vector<uint32_t> color_spirv;
++          std::string color_error;
++          VkPipeline& pipeline = swap_apply_gamma_compute_color_pipelines_[pwl][fxaa_luma][rb_swap];
++          if (CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT,
++                                 GetSwapApplyGammaColorComputeSource(pwl != 0, fxaa_luma != 0,
++                                                                     rb_swap != 0),
++                                 color_spirv, color_error)) {
++            pipeline = ui::vulkan::util::CreateComputePipeline(
++                vulkan_device, swap_apply_gamma_compute_pipeline_layout_, color_spirv.data(),
++                sizeof(uint32_t) * color_spirv.size());
++          } else {
++            REXGPU_WARN("Failed to compile a colour adjustment gamma shader: {}", color_error);
++          }
++          if (pipeline == VK_NULL_HANDLE) ++color_pipelines_failed;
++        }
++      }
++    }
++    if (color_pipelines_failed) {
++      REXGPU_WARN("{} colour adjustment gamma pipeline(s) unavailable; colours unadjusted there",
++                  color_pipelines_failed);
++    }
++  }
++
+   // FXAA compute pipelines, compiled to SPIR-V at runtime.
+   std::vector<uint32_t> swap_fxaa_spirv;
+   std::string swap_fxaa_compile_error;
+@@ -1969,6 +2096,13 @@ void VulkanCommandProcessor::ShutdownContext() {
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                          swap_fxaa_extreme_pipeline_);
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_fxaa_pipeline_);
++  for (auto& by_fxaa : swap_apply_gamma_compute_color_pipelines_) {
++    for (auto& by_swap : by_fxaa) {
++      for (VkPipeline& pipeline : by_swap) {
++        ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, pipeline);
++      }
++    }
++  }
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                          swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_);
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+@@ -2285,6 +2419,9 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
  void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                         uint32_t frontbuffer_height) {
    SCOPE_profile_cpu_f("gpu");
@@ -3221,7 +5912,33 @@ index a40436e..51b7322 100644
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
  
-@@ -4866,7 +4897,14 @@ bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addr
+@@ -2524,6 +2661,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+                 "presentation path");
+           }
+         }
++        const ColorAdjust color = GetColorAdjust();
++        if (color.active() && swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE) {
++          VkPipeline color_pipeline =
++              swap_apply_gamma_compute_color_pipelines_[use_pwl_gamma_ramp][use_fxaa]
++                                                       [swap_source_requires_compute_rb_swap];
++          if (color_pipeline != VK_NULL_HANDLE) swap_apply_gamma_compute_pipeline = color_pipeline;
++        }
+         bool use_compute_gamma = swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE;
+ 
+         // TODO(Triang3l): FXAA can result in more than 8 bits of precision.
+@@ -2684,7 +2828,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+               uint32_t(swap_apply_gamma_compute_descriptor_sets.size()),
+               swap_apply_gamma_compute_descriptor_sets.data(), 0, nullptr);
+           SwapApplyGammaConstants swap_apply_gamma_constants = {
+-              {guest_output_width, guest_output_height}};
++              {guest_output_width, guest_output_height},
++              color.saturation,
++              color.contrast,
++              color.black};
+           deferred_command_buffer_.CmdVkPushConstants(
+               swap_apply_gamma_compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+               sizeof(swap_apply_gamma_constants), &swap_apply_gamma_constants);
+@@ -4866,7 +5013,14 @@ bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addr
  
    DeferredCommandBuffer& command_buffer = deferred_command_buffer();
    command_buffer.CmdVkResetQueryPool(occlusion_query_pool_, host_index, 1);
@@ -3237,7 +5954,7 @@ index a40436e..51b7322 100644
    active_occlusion_query_.sample_count_address = sample_count_address;
    active_occlusion_query_.host_index = host_index;
    active_occlusion_query_.valid = true;
-@@ -4945,7 +4983,11 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
+@@ -4945,7 +5099,11 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
    if (!sample_counts) {
      return;
    }
@@ -3250,7 +5967,7 @@ index a40436e..51b7322 100644
    sample_counts->Total_A = clamped;
    sample_counts->Total_B = 0;
    sample_counts->ZPass_A = clamped;
-@@ -4956,6 +4998,116 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
+@@ -4956,6 +5114,116 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
    sample_counts->StencilFail_B = 0;
  }
  
@@ -3367,7 +6084,7 @@ index a40436e..51b7322 100644
  void VulkanCommandProcessor::InitializeTrace() {
    CommandProcessor::InitializeTrace();
  
-@@ -5478,6 +5630,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5478,6 +5746,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
    }
  
    if (is_closing_frame) {
@@ -10275,12 +12992,15 @@ index 8a97c2d..a25b510 100644
 +
  }  // namespace rex::ui
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..2b5c09d 100644
+index 7360ed9..8a71831 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
-@@ -13,11 +13,14 @@
+@@ -12,12 +12,17 @@
+ #include <algorithm>
  #include <atomic>
  #include <cctype>
++#include <chrono>
++#include <string>
  #include <utility>
 +#include <vector>
  
@@ -10293,7 +13013,7 @@ index 7360ed9..2b5c09d 100644
  #include <rex/ui/presenter.h>
  #include <rex/ui/window.h>
  
-@@ -29,6 +32,26 @@
+@@ -29,9 +34,36 @@
  REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                      "Allow presentation from non-UI thread");
  
@@ -10320,7 +13040,17 @@ index 7360ed9..2b5c09d 100644
  REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                      "Enable letterboxing for non-native aspect ratios");
  
-@@ -41,17 +64,18 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
++// The shape the guest's picture is shown at, instead of the one its video mode
++// reports: "4:3" fits a 16:9 frame into a 4:3 box (bars at the sides), for a
++// title that draws its view for 4:3 into that frame. Read every frame.
++REXCVAR_DEFINE_STRING(present_aspect_ratio, "auto", "UI/Presenter",
++                      "Shape the picture is shown at: auto (the guest's own), 4:3 or 16:9")
++    .allowed({"auto", "4:3", "16:9"});
++
+ REXCVAR_DEFINE_INT32(present_safe_area_x, 90, "UI/Presenter",
+                      "Horizontal safe area percentage (0-100)")
+     .range(0, 100);
+@@ -41,17 +73,18 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
      .range(0, 100);
  
  #if defined(REX_HAS_FIDELITYFX_SDK)
@@ -10341,7 +13071,7 @@ index 7360ed9..2b5c09d 100644
  
  REXCVAR_DEFINE_INT32(present_fsr_max_upsampling_passes,
                       rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax,
-@@ -64,7 +88,7 @@ REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
+@@ -64,7 +97,7 @@ REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
                        "UI/Presenter", "FSR RCAS sharpness reduction in stops")
      .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
             rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
@@ -10350,7 +13080,7 @@ index 7360ed9..2b5c09d 100644
  
  REXCVAR_DEFINE_STRING(
      present_fsr_quality_mode, "auto", "UI/Presenter",
-@@ -286,6 +310,7 @@ Presenter::~Presenter() {
+@@ -286,6 +319,7 @@ Presenter::~Presenter() {
    // No intrusive lifetime management must be performed from UI drawers - defer
    // it if needed.
    assert_false(is_executing_ui_drawers_);
@@ -10358,7 +13088,56 @@ index 7360ed9..2b5c09d 100644
  
  #if REX_PLATFORM_WIN32
    if (dxgi_ui_tick_thread_.joinable()) {
-@@ -613,6 +638,211 @@ bool Presenter::RefreshGuestOutput(
+@@ -415,6 +449,22 @@ void Presenter::OnSurfaceResizeFromUIThread() {
+   }
+ }
+ 
++void Presenter::OnSurfaceRestoredFromUIThread() {
++  // Minimising gives the surface no area: Vulkan's swapchain goes out of date
++  // and painting is disconnected until the surface "changes state" (a resize).
++  // SDL sends no resize when the window is restored at its old size, so the
++  // picture stayed frozen until the window was resized. Reconnect here instead,
++  // as a resize would (a still-paintable connection, as Direct3D 12's stays
++  // while minimised, is left alone).
++  if (!surface_ ||
++      surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable ||
++      surface_paint_connection_state_ ==
++          SurfacePaintConnectionState::kUnconnectedSurfaceReportedUnusable) {
++    return;
++  }
++  OnSurfaceResizeFromUIThread();
++}
++
+ void Presenter::PaintFromUIThread(bool force_paint) {
+   // If there is no surface, this will be a no-op, nothing outdated, nothing to
+   // paint. However, an explicit monitor check is needed because UI framerate
+@@ -554,6 +604,25 @@ bool Presenter::RefreshGuestOutput(
+       guest_output_properties_[guest_output_mailbox_writable_];
+   writable_properties.frontbuffer_width = frontbuffer_width;
+   writable_properties.frontbuffer_height = frontbuffer_height;
++  {
++    // present_aspect_ratio: cached, re-read twice a second (it is a string).
++    static std::atomic<int64_t> next_check_ms{0};
++    static std::atomic<uint32_t> forced{0};  // 0 auto, else (x << 16) | y
++    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                               std::chrono::steady_clock::now().time_since_epoch())
++                               .count();
++    if (now_ms >= next_check_ms.load(std::memory_order_relaxed)) {
++      next_check_ms.store(now_ms + 500, std::memory_order_relaxed);
++      const std::string ratio = REXCVAR_GET(present_aspect_ratio);
++      forced.store(ratio == "4:3" ? (4u << 16) | 3u : ratio == "16:9" ? (16u << 16) | 9u : 0u,
++                   std::memory_order_relaxed);
++    }
++    const uint32_t f = forced.load(std::memory_order_relaxed);
++    if (f) {
++      display_aspect_ratio_x = f >> 16;
++      display_aspect_ratio_y = f & 0xFFFF;
++    }
++  }
+   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
+   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
+   writable_properties.is_8bpc = false;
+@@ -613,6 +682,211 @@ bool Presenter::RefreshGuestOutput(
      guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
    }
  
@@ -10570,7 +13349,7 @@ index 7360ed9..2b5c09d 100644
    // Trigger the presentation on the host.
    PaintResult paint_result = PaintResult::kNotPresented;
    {
-@@ -645,8 +875,10 @@ bool Presenter::RefreshGuestOutput(
+@@ -645,8 +919,10 @@ bool Presenter::RefreshGuestOutput(
        host_gpu_loss_callback_(false, false);
      }
    }
@@ -10582,7 +13361,7 @@ index 7360ed9..2b5c09d 100644
  }
  
  void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {
-@@ -1313,9 +1545,10 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
+@@ -1313,9 +1589,10 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
    if (!REXCVAR_GET(host_present_from_non_ui_thread)) {
      return PaintMode::kUIThreadOnRequest;
    }
@@ -10852,6 +13631,23 @@ index 25976b4..caba3e6 100644
  }
  
  }  // namespace rex
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index fc31478..632457d 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -200,6 +200,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     // #2.
+     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
+   }
++#if REX_PLATFORM_WIN32
++  // #73 / #74: images shared with another Vulkan device on the same GPU (a
++  // title's own renderer drawing for the presenter-only graphics system).
++  XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_external_memory, 1, 1)
++  XE_UI_VULKAN_STRUCT_EXTENSION(KHR_external_memory_win32)
++#endif
+ 
+   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
+   bool ext_1_1_KHR_maintenance1 = false;
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
 index 30bafba..dc24ac6 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
@@ -10880,11 +13676,42 @@ index 30bafba..dc24ac6 100644
      // Allowing tearing to reduce latency, and possibly variable refresh rate
      // (though on Windows with borderless fullscreen, GDI copying is used
      // instead of independent flip, so it's not supported there).
+diff --git a/src/ui/window.cpp b/src/ui/window.cpp
+index 6b75fae..a3ce667 100644
+--- a/src/ui/window.cpp
++++ b/src/ui/window.cpp
+@@ -581,6 +581,11 @@ void Window::OnMinimized(WindowDestructionReceiver& destruction_receiver) {
+ }
+ 
+ void Window::OnRestored(WindowDestructionReceiver& destruction_receiver) {
++  // Painting may have been disconnected while minimised (Vulkan), and no resize
++  // event comes with a restore at the old size.
++  if (presenter_surface_) {
++    presenter_->OnSurfaceRestoredFromUIThread();
++  }
+   if (!CanSendEventsToListeners()) {
+     return;
+   }
 diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
-index c37e550..ab57949 100644
+index c37e550..9b80bf3 100644
 --- a/src/ui/window_sdl.cpp
 +++ b/src/ui/window_sdl.cpp
-@@ -221,6 +221,81 @@ void* WindowSDL::GetNativeWindowHandle() const {
+@@ -165,6 +165,14 @@ bool WindowSDL::OpenImpl() {
+   SDL_StartTextInput(sdl_window_);
+   ApplyCursorVisibilityNow();
+   SDL_ShowWindow(sdl_window_);
++  // A windowed size larger than the desktop (3840 x 2160 on a 3440 x 1440
++  // screen) was only fitted when changed from the menu: at start Windows
++  // clamped the width alone, so the window ran off the screen at another shape
++  // and the picture looked stretched or cut (HANDOVER 4bf). Fit it here too,
++  // keeping its shape, now that the border sizes are known.
++  if (!IsFullscreen()) {
++    SetLogicalSize(GetDesiredLogicalWidth(), GetDesiredLogicalHeight());
++  }
+ 
+   // Actualize state for the common Window code. Listener dispatch is handled
+   // by Window::Open after OpenImpl returns; these only record initial state.
+@@ -221,6 +229,81 @@ void* WindowSDL::GetNativeWindowHandle() const {
  #endif
  }
  
@@ -10966,7 +13793,7 @@ index c37e550..ab57949 100644
  uint32_t WindowSDL::GetLatestDpiImpl() const {
    float scale = sdl_window_ ? SDL_GetWindowDisplayScale(sdl_window_)
                              : SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
-@@ -234,7 +309,17 @@ void WindowSDL::ApplyNewFullscreen() {
+@@ -234,7 +317,17 @@ void WindowSDL::ApplyNewFullscreen() {
    if (!sdl_window_) {
      return;
    }
@@ -10984,7 +13811,7 @@ index c37e550..ab57949 100644
  }
  
  void WindowSDL::ApplyNewTitle() {
-@@ -458,7 +543,8 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
+@@ -458,7 +551,8 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
          RearmCursorAutoHideTimer();
        }
        MouseEvent e(this, MouseEvent::Button::kNone, int32_t(event.motion.x * density),
