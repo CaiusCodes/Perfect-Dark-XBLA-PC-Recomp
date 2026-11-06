@@ -8,6 +8,11 @@ Play at **up to 4K and 60 FPS**, with keyboard and mouse support, enhanced graph
 
 > **You must provide your own copy of Perfect Dark XBLA.** No copyrighted game files are distributed with this project. The launcher imports the required files from your Xbox 360 game package during first-time setup.
 
+Like the recomp and want to support future projects? You can
+tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
+
+[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
+
 ## Download & Installation
 
 **[Download the latest release](https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp/releases)**
@@ -219,10 +224,6 @@ This project's own code is released under The Unlicense (see
 
 ReXGlue, Plume, XenosRecomp and their third-party libraries keep their own
 licences; see [packaging/licenses](packaging/licenses).
-
-## Support Development
-
-If you enjoy the project and would like to support future PC recompilation projects, you can [support me on Ko-fi](https://ko-fi.com/caiuscodes).
 
 ---
 
