@@ -1,183 +1,139 @@
 # Perfect Dark XBLA PC Recomp
 
-A native Windows PC version of **Perfect Dark** from the 2010 Xbox 360 Xbox Live
-Arcade remaster by Rare and 4J Studios. Created through static recompilation with
-[ReXGlue](https://github.com/rexglue/rexglue-sdk). It runs 60 FPS at up to 4K
-with keyboard and mouse or Xbox controller support and features a built in
-LAN / Virtual LANmultiplayer for up to 8 players and 2 player co-op.
+A native Windows PC port of **Perfect Dark (2010)**, the Xbox 360 remaster by Rare and 4J Studios, built using [ReXGlue](https://github.com/rexglue/rexglue-sdk) static recompilation.
 
-> **You need your own copy of Perfect Dark XBLA.** This project contains no
-> original game program, graphics, sound, music or other game data. The first
-> time you start it reads the Xbox 360 Perfect Dark package you provide
-> (Title ID `584109C2`), checks that it is the supported version and imports the
-> game data from it into the game's folder on your PC.
+Play at **up to 4K and 60 FPS**, with keyboard and mouse support, enhanced graphics, and LAN / Virtual LAN multiplayer. No emulator required.
 
-Like the recomp and want to support future projects? You can
-tip me on [Ko-fi](https://ko-fi.com/caiuscodes).
+![Perfect Dark gameplay](docs/screenshots/gameplay-rooftop.webp)
 
-[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/caiuscodes)
+> **You must provide your own copy of Perfect Dark XBLA.** No copyrighted game files are distributed with this project. The launcher imports the required files from your Xbox 360 game package during first-time setup.
 
-![A rooftop above the city at night](docs/screenshots/gameplay-rooftop.webp)
+## Download & Installation
 
-## Requirements
+**[Download the latest release](https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp/releases)**
 
-- Windows 10 or 11, 64-bit
-- A processor with AVX2 (Intel Haswell / 4th generation Core or AMD Ryzen and
-  newer; most PCs from 2015 onwards)
-- A graphics card with DirectX 12 or Vulkan support
-- Your own Perfect Dark Xbox Live Arcade package (the Xbox 360 game file for
-  Title ID `584109C2`, named `4287CC74…` or `8292DB97…`)
-
-## Install and play
-
-1. Download the latest release ZIP from the
-   [Releases](https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp/releases)
-   page and extract the **Perfect Dark** folder somewhere you can write to (not
-   Program Files).
-2. Open **Perfect Dark.exe**. The first time, the setup window opens.
-3. Drag your package file onto the window or click **Browse Package**.
-4. Tick any optional extras: start in fullscreen, desktop shortcut, all cheats
-   unlocked, 100% story completion, unlock all multiplayer content, Auto-Aim on,
-   and the game language.
-5. Click **Play** once it says READY TO PLAY.
+1. Download the latest ZIP and extract it to a folder of your choice.
+2. Run `Perfect Dark.exe`.
+3. Drag your Xbox 360 Perfect Dark package into the setup window, or select **Browse Package**.
+4. Choose your preferred options, including fullscreen, language, optional unlocks and Auto-Aim.
+5. Click **Play** once setup is complete.
 
 ![Setup window](docs/screenshots/setup.png)
 
-After setup opening `Perfect Dark.exe` starts the game straight away; the
-package is not needed again. Everything stays inside the extracted folder
-(`resources\assets` for the imported game data, `resources\userdata` for saves
-and settings), so it can be moved or backed up as a whole.
+After setup, simply run `Perfect Dark.exe` to play. Your original game package is no longer needed.
 
-**To update**, open Help & Options → Settings → **Check for Updates**. If a newer
-release is out, choose **Update now**: the game closes, the launcher downloads the
-release from this page, checks it against the checksum GitHub publishes, replaces
-the program files and offers Play. Your imported game data, saves and settings are
-never touched. You can also extract a new release over the folder by hand.
+**To reopen setup:** Hold **Shift** while launching the game.
 
-**To open the setup window again** (to change extras or import again), hold
-**Shift** while opening `Perfect Dark.exe`.
+### System Requirements
 
-The launcher only reads your package and never changes it. It needs no
-administrator rights, and neither it nor the game contacts Xbox Live. The only
-time either asks the internet for anything is when you choose Check for Updates.
+- Windows 10 or 11 (64-bit)
+- AVX2-compatible processor
+- DirectX 12 or Vulkan-compatible graphics card
+- Your own Perfect Dark XBLA package (Title ID `584109C2`)
 
-## What's new in 0.9.1
-
-- **New renderer, Plume**: the game is now drawn natively with **DirectX 12** or
-  **Vulkan** instead of through an emulated Xbox 360 graphics chip. Smoother frame
-  pacing, much lower CPU load, and the stutter on Intel 12th–14th gen (hybrid core)
-  CPUs is gone. Pick the API in Settings → Graphics → **Graphics API**.
-- **Check for Updates** in Settings: update from inside the game (see above).
-- **Camera Bob** on/off (Settings → Display Interface).
-- **Skip cutscenes** with left click or the controller's A button, not only Start.
-- **Sharpness** setting (Off, Low, Medium, High) alongside Upscaling (Off or FSR).
-- A tidier **Graphics** page; **Screen Split** moved to Display Interface.
-- **Multiplayer music**: every player in a network match now hears the host's track.
-- The **re-release package** (`8292DB97…`) is accepted as well as the original.
-- Fixes: light flares flashing or showing through walls, the FPS counter showing
-  nothing, and on Vulkan the picture freezing after minimising and restoring the window.
+Supported packages begin with `4287CC74` (original release) or `8292DB97` (re-release).
 
 ## Features
 
-- **Native Windows PC build**: no emulator, runs as a normal Windows program
-- **Up to 4K**: windowed or fullscreen at your screen's resolution, with
-  **Render Scale** 1x, 2x or 3x the Xbox's 1280 × 720 (Settings → Graphics),
-  **Upscaling** Off or FSR (AMD FSR 1) and **Sharpness** (AMD CAS)
-- **Steady 60 FPS** (the game's own rate) with V-Sync, drawn natively by the
-  Plume renderer with DirectX 12 (default) or Vulkan
-- **Keyboard and mouse**: raw mouse look with rebindable keys and the mouse support in every menu
-- **Xbox controller** support working alongside keyboard and mouse; button
-  prompts hide themselves when no controller is connected
-- **Settings menus** in Help & Options: Audio, Graphics, Display Interface,
-  Keyboard & Mouse, Gamepad Controls, Online, Cheats and Check for Updates
-- **Camera Bob** on/off, and cutscenes skip with left click or A
-- **Leaderboards and achievements** kept on your PC
-- **Vivid Colours and Black Level** picture settings, and **F12 screenshots**
-- **Five languages**: English, French, German, Italian and Spanish, picked in
-  setup or in Settings > Display Interface (the PC port's own labels stay in English)
-- Optional extras in setup: **all cheats unlocked**, **100% story completion**
-  (every mission on every difficulty), **all multiplayer content unlocked**
-  and **Auto-Aim on** for new players (handy on Steam Deck)
-- **Portable**: one program to open, no installer; saves and settings stay in
-  the game folder
-- **LAN and Virtual LAN multiplayer** for up to 8 players (12 with Simulants) 2 player Co-Operative
-  and Counter-Operative over services such as Radmin VPN, ZeroTier, Tailscale and Hamachi
-  ![Combat Simulator lobby](docs/screenshots/combat-simulator-lobby-host.webp)
-  ![Four players in a Combat Simulator match](docs/screenshots/combat-simulator-match.webp)
+### Graphics & Performance
 
-### Controls
+- **Native PC rendering** using Plume, with DirectX 12 or Vulkan
+- **60 FPS** gameplay with improved frame pacing
+- **Up to 4K resolution** with fullscreen and windowed modes
+- **Render Scale:** 1x, 2x or 3x
+- **AMD FSR 1** upscaling and adjustable sharpness
+- **V-Sync**, Vivid Colours, Black Level and Camera Bob settings
+- **F12 screenshots** and an optional FPS counter
 
-| Key / button | Action |
+Most graphics settings apply instantly; Render Scale and Graphics API restart the game.
+
+### Controls & Quality of Life
+
+- Full **keyboard and mouse** support, including raw mouse input and rebindable keys
+- **Xbox controller** support
+- Native PC settings menus
+- Optional Auto-Aim
+- Skip cutscenes using mouse or controller
+- Unlock all cheats, missions and multiplayer content during setup
+- Five languages: English, French, German, Italian and Spanish
+- Local achievements and leaderboards
+- Portable installation with local saves and settings
+- Built-in update checker
+
+### Multiplayer
+
+- **Up to 8 players** in Combat Simulator (up to 12 with Simulants)
+- **2-player Co-Operative** and Counter-Operative modes
+- LAN and Virtual LAN connections
+- Compatible with Radmin VPN, ZeroTier, Tailscale and Hamachi
+- Multiplayer music synchronised across connected players
+
+No Xbox Live connection is required.
+
+![Combat Simulator lobby](docs/screenshots/combat-simulator-lobby-host.webp)
+
+![Combat Simulator gameplay](docs/screenshots/combat-simulator-match.webp)
+
+## Keyboard & Mouse Controls
+
+| Key | Action |
 |---|---|
 | W, A, S, D | Move |
-| Mouse | Look and aim; points in menus |
-| Left click | Fire; select in menus |
-| Right click | Aim; back in menus |
-| Middle click | Zoom |
-| E | Use / activate; select in menus |
+| Mouse | Look / Aim |
+| Left Click | Fire / Select |
+| Right Click | Aim / Back |
+| Middle Click | Zoom |
+| E | Interact |
 | R | Reload |
-| Mouse wheel | Next / previous weapon; one row in menus |
-| Q (hold) | Weapon menu: move the mouse towards an item, release |
+| Q (Hold) | Weapon menu |
 | F | Secondary fire |
+| Mouse Wheel | Switch weapons |
 | Ctrl | Crouch |
 | Tab | Objectives |
-| Escape | Pause; back in menus |
+| Esc | Pause / Back |
 
-Keys can be changed in Help & Options → Settings → Keyboard & Mouse. An Xbox
-controller works as on the console.
+All key bindings can be customised under **Help & Options → Settings → Keyboard & Mouse**.
 
-### Fixes
+Xbox controllers use the original console controls.
 
-- The game clock no longer runs 2% fast and network matches no longer run
-  0.25% fast with a double step every few seconds.
-- Light and sun flares no longer show through walls, flash, or cause slowdowns.
-- No more uneven frame rate on Intel hybrid-core CPUs (12th–14th gen).
-- Rooms with their lights switched off are dark but visible again (they went
-  completely black), with objects kept darker than the room.
-- Hosting a match no longer crashes after about three minutes in the lobby.
-- In game multiplayer Virtual LAN games now sync smoothly with other players.
-- Game no longer keeps three CPU cores fully busy: about a third of one core
-  standing still reducing load.
-- Xbox LIVE leftovers removed: dead buttons, gamer cards, storage device prompts
-  and messages that don't apply on PC.
-- Auto-Aim starts off, since the mouse aims; switch it on in Control settings,
-  or tick **Auto-Aim on** in setup so new players start with it (Steam Deck).
-- No Xbox LIVE Arcade logo at start-up; the Carrington Institute walk-in no
-  longer turns Joanna with the mouse before the menu appears.
-- Other miscellaneous fixes.
+## Updates
 
-## Known limitations
+Check for new versions through **Help & Options → Settings → Check for Updates**.
 
-- Windows only for now.
-- The game is not digitally signed, so Windows SmartScreen may warn the first
-  time: choose *More info*, then *Run anyway*. Windows also asks for network
-  access the first time you host or join a LAN or Direct Connect game; allow it
-  on private and public networks (virtual LANs often count as public).
-- Two Perfect Dark Xbox Live Arcade packages work: `4287CC74…` (the 2010
-  release) and `8292DB97…` (the re-release). Both carry the game program this
-  port was recompiled from; setup refuses other builds.
-- Not yet tested: matches with eight players, local split-screen, Counter-Operative
-  over the network, and the Vulkan option on AMD and Intel graphics cards.
-- If something looks wrong with the new renderer, the Classic renderer of earlier
-  versions is still there: add `gpu_native = false` to
-  `resources\userdata\perfect_dark.toml` (see README.txt in the game folder).
-- At 144 or 165 Hz without G-Sync / FreeSync, 60 frames a second cannot be
-  shown evenly; turn on G-Sync / FreeSync or set the screen to 120 Hz.
+If a newer version is available, choose **Update now**: the update is downloaded, verified against the checksum GitHub publishes and installed, without touching your imported game files, saves or settings. The game only goes online when you check.
 
-## Reporting a problem
+Alternatively, download the latest ZIP from GitHub Releases and extract it over your existing installation.
 
-**To report a problem, [open an Issue](https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp/issues/new/choose) and attach your newest log from `resources\runtime\logs`.**
-If the game crashed, the log ends with a `[crash]` line and 
-a `crash-<date>-<time>.dmp` is written beside it: attach that too.
+For detailed changes and bug fixes, see the [release notes](https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp/releases).
 
-For anything more detailed, stutter, slowdowns, multiplayer lag or anything that
-comes and goes, a more detailed log helps most:
+## Known Limitations
 
-1. Close the game and open `resources\userdata\perfect_dark.toml` in Notepad.
-2. Set `diagnostics = true` (add the line if it is not there) and save.
-3. Play until the problem has happened a few times then close the game.
-4. [Open an Issue](https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp/issues/new/choose) and attach the newest log from `resources\runtime\logs`.
-5. Set it back to `false` afterwards.
+- Windows only.
+- Some multiplayer configurations, including 8-player matches, local split-screen and network Counter-Operative, remain untested.
+- Vulkan has not been fully tested on AMD and Intel GPUs.
+- Windows SmartScreen may warn about the unsigned executable. Download only from the official release page.
+- Windows Firewall may request permission for network multiplayer.
+- Displays running at 144 or 165 Hz without variable refresh may exhibit uneven 60 FPS pacing. Use G-Sync / FreeSync or a 120 Hz refresh rate if available.
+
+**Renderer compatibility:** If you encounter problems with Plume, the previous renderer can be enabled by adding `gpu_native = false` to `resources\userdata\perfect_dark.toml`.
+
+## Reporting Issues
+
+Found a bug? [Open a GitHub Issue](https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp/issues/new/choose).
+
+Please include a description of the problem and your latest log from:
+
+`resources\runtime\logs\`
+
+For crashes, attach the corresponding `crash-*.dmp` file if available.
+
+**For performance, stuttering or multiplayer issues:**
+
+1. Open `resources\userdata\perfect_dark.toml`.
+2. Set `diagnostics = true`.
+3. Reproduce the issue and close the game.
+4. Attach the latest log to your GitHub Issue.
+5. Set diagnostics back to `false` afterwards.
 
 ## For Developers
 
@@ -188,8 +144,11 @@ releases ship) and Windows PowerShell, plus your own Perfect Dark package.
 
 ReXGlue is the `rexglue-sdk` submodule, pinned to upstream v0.9.0. This
 project's changes to it are kept in `patches/rexglue.patch`, which CMake applies
-automatically when it configures. ReXGlue's dependencies are nested deeply, so
-enable long paths when cloning, and keep the clone in a short folder path:
+automatically when it configures; the Plume renderer and XenosRecomp (the
+`thirdparty` submodules) get theirs from `patches/plume.patch` and
+`patches/xenosrecomp.patch` the same way. ReXGlue's dependencies are nested
+deeply, so enable long paths when cloning, and keep the clone in a short folder
+path:
 
 ```powershell
 git -c core.longpaths=true clone --recurse-submodules --shallow-submodules https://github.com/CaiusCodes/Perfect-Dark-XBLA-PC-Recomp.git
@@ -235,15 +194,20 @@ when run from the build folder):
 `resources\runtime` (the game and its DLLs), and never any game data. Before
 zipping it audits the folder: forbidden file types, a byte comparison against
 your extracted game, and a scan for personal paths. The version comes from the
-`VERSION` file.
+`VERSION` file. Keep the ZIP's name when publishing a release: Check for
+Updates looks for exactly that asset.
 
-## Licence and credits
+## Licence and Credits
 
 This project's own code is released under The Unlicense (see
 [LICENSE](LICENSE), which also lists what it does not cover). It is built on:
 
 - [ReXGlue](https://github.com/rexglue/rexglue-sdk) by Tom Clay and contributors
   (BSD 3-Clause), which includes code derived from [Xenia](https://xenia.jp).
+- [Plume](https://github.com/zolaware/plume) by renderbag and contributors (MIT), the rendering library the
+  native renderer is built on, and
+  [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) (MIT), which translates
+  the game's shaders on your PC with Microsoft's DirectX Shader Compiler.
 - The STFS package reader (`packaging/launcher/stfs.cpp` and
   `tools/Extract-STFS.ps1`), derived from
   [Velocity](https://github.com/hetelek/Velocity) and licensed under the GPL-3.0.
@@ -253,9 +217,13 @@ This project's own code is released under The Unlicense (see
   project, whose names and documentation of the N64 game helped find the way
   around this version's code (used as a reference; no code was copied).
 
-ReXGlue and its third-party libraries keep their own licences; see
-[packaging/licenses](packaging/licenses).
+ReXGlue, Plume, XenosRecomp and their third-party libraries keep their own
+licences; see [packaging/licenses](packaging/licenses).
 
-Perfect Dark, Rare, Xbox and Xbox 360 are trademarks or property of their
-respective owners. This is an unofficial fan project, not affiliated with or
-endorsed by them.
+## Support Development
+
+If you enjoy the project and would like to support future PC recompilation projects, you can [support me on Ko-fi](https://ko-fi.com/caiuscodes).
+
+---
+
+*Perfect Dark is the property of its respective rights holders. This is an independent fan project and is not affiliated with or endorsed by Microsoft, Rare or 4J Studios.*
