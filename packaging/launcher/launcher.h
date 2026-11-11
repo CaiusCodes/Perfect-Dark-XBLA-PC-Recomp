@@ -7,6 +7,7 @@
 //     runtime\            the game (Perfect Dark.exe, DLLs), logs\
 //     assets\             imported once from the player's own Xbox 360 package
 //     userdata\           saves, caches and perfect_dark.toml (settings)
+//     userdata-location.txt  only when the player chose another folder for those
 //
 // Everything is found relative to this exe, so the folder can be moved.
 #pragma once
@@ -31,13 +32,26 @@ struct Paths {
   fs::path runtime;    // resources\runtime
   fs::path game_exe;   // runtime\Perfect Dark.exe
   fs::path assets;     // resources\assets
-  fs::path userdata;   // resources\userdata
+  fs::path userdata;   // resources\userdata, or the folder the player chose for saves
+  fs::path userdata_pointer;  // resources\userdata-location.txt (names the chosen folder)
+  bool custom_userdata = false;  // saves are in a folder the player chose
   fs::path config;     // userdata\perfect_dark.toml
   fs::path logs;       // runtime\logs (the game's own logs go there too)
   fs::path staging;    // resources\.import        (an import in progress)
   fs::path previous;   // resources\.assets-previous (the old copy during the swap)
 };
 Paths MakePaths();
+// The saves folder of the install whose resources folder (or older Game
+// folder) this is: the folder named in its userdata-location.txt, or its
+// userdata folder.
+fs::path UserDataIn(const fs::path& resources);
+// Keeps saves and settings in `folder` from now on (empty: back in
+// resources\userdata). Copies what is in the current folder where the new one
+// has nothing yet or an older file (caches are left behind; the old copy
+// stays), then records
+// the choice in resources\userdata-location.txt, which updates never touch.
+// *message gets a sentence for the player either way.
+bool SetUserDataLocation(Paths& p, const fs::path& folder, std::wstring* message);
 
 extern const wchar_t* const kVersion;  // PD_VERSION, set by the build
 extern const char* const kMarkerName;  // assets\<marker> is written last by a good import

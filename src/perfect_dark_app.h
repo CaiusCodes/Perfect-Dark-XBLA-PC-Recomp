@@ -50,6 +50,7 @@
 #include "pd_test_input.h"  // native-renderer branch: test pipe input
 #include "pd_native_vk_out.h"  // Graphics API: pd::native_vk::VulkanUsable
 #include "pd_update.h"         // Check for Updates
+#include "pd_paths.h"          // the saves folder (userdata-location.txt)
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/cvar.h>
 #include <rex/diag_timing.h>
@@ -603,7 +604,8 @@ class PerfectDarkApp : public rex::ReXApp {
   // Release layout: the game program sits in <release>\resources\runtime and
   // its data beside that folder - resources\assets (imported by "Perfect
   // Dark.exe" in the release root from the player's own XBLA package) and
-  // resources\userdata, which also holds perfect_dark.toml. Any other place
+  // resources\userdata (or the folder chosen in setup, pd_paths.h), which also
+  // holds perfect_dark.toml. Any other place
   // (a dev build, or an older release's Game folder) keeps assets, userdata
   // and perfect_dark.toml beside the exe, as before.
   void OnConfigurePaths(rex::PathConfig& paths) override {
@@ -637,7 +639,18 @@ class PerfectDarkApp : public rex::ReXApp {
 
     paths.game_data_root = assets_path;
 
-    const auto user_data_path = data_root / "userdata";
+    const auto custom = release_layout ? pd_paths::CustomUserDataRoot() : std::filesystem::path();
+    std::error_code ec;
+    if (!custom.empty() && !std::filesystem::is_directory(custom, ec)) {
+      // A saves folder chosen in setup that is gone (a drive not connected,
+      // say): never start with empty saves in its place.
+      const std::wstring text = L"Perfect Dark can't find your saves and settings folder:\n\n" + custom.wstring() +
+                                L"\n\nConnect the drive it is on, or hold Shift while opening \"Perfect Dark.exe\" "
+                                L"to open setup and choose another folder.";
+      MessageBoxW(nullptr, text.c_str(), L"Perfect Dark", MB_OK | MB_ICONERROR);
+      ExitProcess(1);
+    }
+    const auto user_data_path = custom.empty() ? data_root / "userdata" : custom;
     paths.user_data_root = user_data_path;
     paths.cache_root = user_data_path / "cache";
     if (release_layout) paths.config_path = user_data_path / "perfect_dark.toml";
@@ -822,6 +835,7 @@ class PerfectDarkApp : public rex::ReXApp {
   // F9 (see PerfectDarkInputTracker/PerfectDarkSettingsDialog).
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     rex::input::mnk::MnkInputDriver::SetLookDeltaSink(&PerfectDarkApp::OnMouseLookDelta);
+    rex::input::mnk::MnkInputDriver::SetStickLookQuery(&PerfectDarkApp::StickLookActive);
     // Highest z-order, so key rebinding sees every wheel notch first; it never
     // marks an event handled, so the rest of the chain still gets them.
     if (window()) window()->AddInputListener(&rebind_wheel_listener_, 0x7FFF);
@@ -1866,12 +1880,32 @@ class PerfectDarkApp : public rex::ReXApp {
   static constexpr uint32_t kInCutscene = 0x82648BF8 + 1788;
   static constexpr uint32_t kTickMode = 0x82648BF8 + 1228;
   static constexpr uint32_t kTickModeCutscene = 6;
+  // g_Vars.tickmode values (the decompilation's TICKMODE_*): 1 is ordinary
+  // play; 7 (AUTOWALK) is the game walking the player itself, as in the Duel's
+  // paces, where it replaces the stick's turn and pitch with its own.
+  static constexpr uint32_t kTickModeNormal = 1;
+  static constexpr uint32_t kTickModeAutowalk = 7;
+  // True while the game takes the player's turn and pitch from the stick
+  // (tick mode NORMAL). Logs each change of tick mode (a handful per mission).
+  static bool PlayerSteersView(rex::memory::Memory* mem) {
+    static std::atomic<uint32_t> last{0xFFFFFFFF};
+    const uint32_t mode = ReadGuestU32(mem, kTickMode);
+    if (last.exchange(mode) != mode) {
+      REXLOG_INFO("[input] tick mode {}{}", mode,
+                  mode == kTickModeNormal     ? " (play: mouse aims)"
+                  : mode == kTickModeAutowalk ? " (the game walks the player: no mouse look)"
+                  : mode == kTickModeCutscene ? " (cutscene)"
+                                              : "");
+    }
+    return mode == kTickModeNormal;
+  }
   static void TickCutsceneSkip() {
     PerfectDarkApp* app = current_instance_;
     if (!app || !app->runtime() || !app->runtime()->memory()) return;
     auto* mem = app->runtime()->memory();
     static bool lmb_was_down = true, pad_a_was_down = true;
     const uint32_t stage = ReadGuestU32(mem, kStageNum);
+    if (stage != kStageTitle) PlayerSteersView(mem);  // logs tick mode changes, whatever the input
     const bool cutscene = app->HasWindowFocus() && stage != kStageTitle && !menu_attract_ &&
                           ReadGuestU32(mem, kInCutscene) != 0 &&
                           ReadGuestU32(mem, kTickMode) == kTickModeCutscene;
@@ -2724,7 +2758,6 @@ class PerfectDarkApp : public rex::ReXApp {
   static constexpr uint32_t kLblPcControls = 0x826750E0;
   static constexpr uint32_t kLblMouseSens = 0x82675100;
   static constexpr uint32_t kLblInvertLook = 0x82675120;
-  static constexpr uint32_t kSensOptionStrings = 0x82675140;  // 5 x 16
   // Render Scale row: its label, the three values (1x 2x 3x) as shown for the
   // scale this run renders at, and the same marked "(requires restart)" for
   // the others (32-byte slots, after "Press ANY KEY To Play" at 0x826752D0).
@@ -2797,29 +2830,8 @@ class PerfectDarkApp : public rex::ReXApp {
     ctx.r3.u64 = ret;
   }
 
-  // TEMP_MENU_SCAN: PC Controls rows. mnk_sensitivity is a double cvar in the
-  // SDK's MnK driver; we expose five presets rather than a free slider because
-  // the native menu only does discrete option lists.
-  static const double* SensValues() {
-    static const double kV[5] = {0.5, 1.0, 1.5, 2.0, 3.0};
-    return kV;
-  }
-
-  static int32_t GetMouseSensIndex() {
-    std::string v = rex::cvar::GetFlagByName("mnk_sensitivity");
-    double d = v.empty() ? 1.0 : atof(v.c_str());
-    const double* vals = SensValues();
-    int32_t best = 1;
-    double best_err = 1e9;
-    for (int32_t i = 0; i < 5; ++i) {
-      double err = d > vals[i] ? d - vals[i] : vals[i] - d;
-      if (err < best_err) {
-        best_err = err;
-        best = i;
-      }
-    }
-    return best;
-  }
+  // PC Controls rows. mnk_sensitivity is a double cvar in the SDK's MnK
+  // driver; Mouse Sensitivity is a slider (PdMouseSensHandler, issue #20).
 
   // Combat Simulator > Match Type lists Local Multiplayer, Xbox LIVE Private
   // Match and Xbox LIVE Quick Match (text ids 0x8CC2, 0x8CC1, 0x8CC0; indices
@@ -3553,6 +3565,22 @@ class PerfectDarkApp : public rex::ReXApp {
     }
   }
 
+  // Mouse Sensitivity is a slider (issue #20; it was a list of 0.5 / 1.0 /
+  // 1.5 / 2.0 / 3.0): 0.10 to 3.00 in steps of 0.05, the value shown beside it.
+  // The game's own slider item (type 0x08, as Audio's volume rows): op 9
+  // asks for the position (written at data), op 6 sets it (read from data),
+  // op 10 asks for the text shown with it (written into the buffer data + 4 points at).
+  // mnk_sensitivity keeps any value typed into perfect_dark.toml; the slider
+  // shows the nearest step.
+  static constexpr float kSensMin = 0.10f, kSensStep = 0.01f;
+  static constexpr uint32_t kSensSteps = 290;  // (3.00 - 0.10) / 0.01
+
+  static float CurrentMouseSens() {
+    const std::string s = rex::cvar::GetFlagByName("mnk_sensitivity");
+    const float v = s.empty() ? 1.0f : float(atof(s.c_str()));
+    return v > 0.0f ? v : 1.0f;
+  }
+
   static void PdMouseSensHandler(PPCContext& ctx, uint8_t*) {
     PerfectDarkApp* app = current_instance_;
     auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
@@ -3560,28 +3588,34 @@ class PerfectDarkApp : public rex::ReXApp {
     const uint32_t data = ctx.r5.u32;
     uint32_t ret = 0;
     switch (op) {
-      case 1:
-        if (mem) WriteGuestU32(mem, data, 5);
+      case 9:  // slider position
+        if (mem && data) {
+          const float steps = (CurrentMouseSens() - kSensMin) / kSensStep;
+          WriteGuestU32(mem, data, uint32_t(std::clamp(std::lround(steps), 0L, long(kSensSteps))));
+        }
         break;
-      case 3: {
-        uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
-        if (i > 4) i = 0;
-        ret = kSensOptionStrings + i * 16;
-        break;
-      }
-      case 6: {
-        uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
-        if (i > 4) i = 0;
+      case 6: {  // moved
+        if (!mem || !data) break;
+        const uint32_t step = std::min(ReadGuestU32(mem, data), kSensSteps);
         char buf[32];
-        snprintf(buf, sizeof(buf), "%.2f", SensValues()[i]);
-        if (rex::cvar::SetFlagByName("mnk_sensitivity", buf)) {
+        snprintf(buf, sizeof(buf), "%.2f", kSensMin + float(step) * kSensStep);
+        if (rex::cvar::GetFlagByName("mnk_sensitivity") != buf && rex::cvar::SetFlagByName("mnk_sensitivity", buf)) {
           SavePcSettings();
         }
         break;
       }
-      case 7:
-        if (mem) WriteGuestU32(mem, data, static_cast<uint32_t>(GetMouseSensIndex()));
+      case 10: {  // the text shown with the slider: written into the game's
+                  // buffer (data + 4 points at it, 24 bytes on its stack), for
+                  // the position at data (it follows the slider while held)
+        const uint32_t buffer = mem && data ? ReadGuestU32(mem, data + 4) : 0;
+        if (buffer >= 0x40000000) {
+          const uint32_t step = std::min(ReadGuestU32(mem, data), kSensSteps);
+          char buf[16];
+          snprintf(buf, sizeof(buf), "%.2f", kSensMin + float(step) * kSensStep);
+          WriteGuestBytes(mem, buffer, buf, strlen(buf) + 1);
+        }
         break;
+      }
       default:
         break;
     }
@@ -4443,6 +4477,9 @@ class PerfectDarkApp : public rex::ReXApp {
     // The game also takes control away for its own menus, briefings and
     // cutscenes; there is nothing to aim then either.
     if (ReadGuestU8(mem, kPlayerHasControl) == 0) return;
+    // Nor while the game steers the view itself with control still on (the
+    // Duel's walk, issue #19): a pad's stick does nothing then either.
+    if (!PlayerSteersView(mem)) return;
     uint32_t a = GetLivePlayerThetaAddr(mem);
     if (!a) return;
 
@@ -4537,6 +4574,74 @@ class PerfectDarkApp : public rex::ReXApp {
   }
 
   static inline float* look_last_written_theta_ = nullptr;
+
+  // ---- Mouse on the right stick for remote control (issue #19) ---------------
+  // Direct look writes the player's view angles, but some things are steered
+  // with the right stick instead of the view: the CamSpy (and DrugSpy /
+  // BombSpy), the hoverbike and the Slayer's fly-by-wire rocket. The mouse
+  // turned Joanna's head behind them and steered nothing. While one is in use
+  // the MnK driver moves the right stick with the mouse instead (its non-direct
+  // path), as a controller does. Fields (the N64 decomp's, +8 like vv_theta,
+  // checked in the recompiled code): player +1160 eyespy*, eyespy +55 active;
+  // player +440 bondmovemode (3 = MOVEMODE_BIKE); player +16 u16 visionmode
+  // (2 = VISIONMODE_SLAYERROCKET).
+  static constexpr uint32_t kPlayerEyespy = 1160;
+  static constexpr uint32_t kEyespyActive = 55;
+  static constexpr uint32_t kPlayerMoveMode = 440;
+  static constexpr uint32_t kMoveModeBike = 3;
+  static constexpr uint32_t kPlayerVisionMode = 16;
+  static constexpr uint16_t kVisionSlayerRocket = 2;
+
+  // What is being steered right now: nullptr for the view (direct look).
+  static const char* StickLookTarget() {
+    PerfectDarkApp* app = current_instance_;
+    if (!app || !app->runtime() || !app->runtime()->memory() || menu_mouse_active_) return nullptr;
+    auto* mem = app->runtime()->memory();
+    if (ReadGuestU32(mem, kStageNum) == kStageTitle || ReadGuestU8(mem, kPlayerHasControl) == 0) return nullptr;
+    if (!PlayerSteersView(mem)) return nullptr;
+    if (!GetLivePlayerThetaAddr(mem)) return nullptr;  // no plausible player now
+    const uint32_t player = ReadGuestU32(mem, kPlayerPtrGlobal);
+    const uint32_t eyespy = ReadGuestU32(mem, player + kPlayerEyespy);
+    if (eyespy >= 0x40000000 && eyespy < 0x50000000 && ReadGuestU8(mem, eyespy + kEyespyActive) != 0)
+      return "the CamSpy";
+    if (ReadGuestU32(mem, player + kPlayerMoveMode) == kMoveModeBike) return "the hoverbike";
+    const auto* vision = mem->TranslateVirtual<const uint8_t*>(player + kPlayerVisionMode);
+    if (vision && uint16_t(vision[0] << 8 | vision[1]) == kVisionSlayerRocket) return "the Slayer rocket";
+    return nullptr;
+  }
+
+  // Where each target starts to respond, in raw stick units. sub_8225D9F8 gives
+  // each axis a 10000 dead zone and scales the rest by 80/22767 (the constant
+  // at 0x82014328 is 0.0035139), so one N64 stick unit is about 285. The CamSpy
+  // then ignores 10 units sideways and 20 up and down (bondeyespy.c); the
+  // hoverbike and the Slayer rocket have no zone of their own beyond the 10000.
+  static constexpr int32_t kPadDeadZone = 10000;
+  static constexpr float kRawPerStickUnit = 22767.0f / 80.0f;
+  // The mouse on these turns 25% more than mnk_sensitivity alone (the user
+  // found it a little slow).
+  static constexpr float kStickLookGain = 1.25f;
+  static void SetStickLookResponseFor(const char* target) {
+    using rex::input::mnk::MnkInputDriver;
+    if (target && std::string_view(target) == "the CamSpy") {
+      MnkInputDriver::SetStickLookResponse(kPadDeadZone + int32_t(10 * kRawPerStickUnit),
+                                           kPadDeadZone + int32_t(20 * kRawPerStickUnit), kStickLookGain);
+    } else {
+      MnkInputDriver::SetStickLookResponse(kPadDeadZone + int32_t(kRawPerStickUnit),
+                                           kPadDeadZone + int32_t(kRawPerStickUnit), kStickLookGain);
+    }
+  }
+
+  // Guest thread, once per input poll (MnkInputDriver::SetStickLookQuery).
+  static bool StickLookActive() {
+    static const char* last = nullptr;
+    const char* target = StickLookTarget();
+    if (target != last) {
+      SetStickLookResponseFor(target);
+      REXLOG_INFO("[input] mouse {}", target ? std::string("steers ") + target + " (right stick)" : std::string("aims the view again"));
+      last = target;
+    }
+    return target != nullptr;
+  }
 
   // ---------------------------------------------------------------------------
   // Mouse look in networked matches (Co-Operative, Counter-Operative).
@@ -5361,6 +5466,32 @@ class PerfectDarkApp : public rex::ReXApp {
                   mode, arena, scenario, stage);
     }
     netplay::SetMatchDetails(arena, mode);
+  }
+
+  // For reports of a picture of the wrong size or place (issue #18): the
+  // window's DPI scale, its client size in pixels and fullscreen or not, at
+  // start and whenever one changes (checked twice a second). The SDK presenter
+  // logs where it draws the picture ("[display] picture ...").
+  static void TickDisplayInfo() {
+    PerfectDarkApp* app = current_instance_;
+    if (!app || !app->window()) return;
+    static auto next = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) return;
+    next = now + std::chrono::milliseconds(500);
+    HWND hwnd = static_cast<HWND>(app->window()->GetNativeWindowHandle());
+    if (!hwnd) return;
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const UINT dpi = GetDpiForWindow(hwnd);
+    const bool full = app->window()->IsFullscreen();
+    static std::string logged;
+    const std::string line = fmt::format("window {}x{} pixels, DPI {} ({}% scaling), {}", client.right - client.left,
+                                         client.bottom - client.top, dpi, dpi ? dpi * 100 / 96 : 0,
+                                         full ? "fullscreen" : "windowed");
+    if (line == logged) return;
+    logged = line;
+    REXLOG_INFO("[display] {}", line);
   }
 
   // Developer aid (pd_frame_stats, or the bug-report switch diagnostics): every five seconds, logs how many frames
@@ -6232,11 +6363,6 @@ class PerfectDarkApp : public rex::ReXApp {
           {kLblPcControls, "PC Controls\n"},
           {kLblMouseSens, "Mouse Sensitivity\n"},
           {kLblInvertLook, "Invert Look\n"},
-          {kSensOptionStrings + 0 * 16, "0.5\n"},
-          {kSensOptionStrings + 1 * 16, "1.0\n"},
-          {kSensOptionStrings + 2 * 16, "1.5\n"},
-          {kSensOptionStrings + 3 * 16, "2.0\n"},
-          {kSensOptionStrings + 4 * 16, "3.0\n"},
       };
       for (const StrDef& d : kStrings) {
         WriteGuestBytes(mem, d.addr, d.text, strlen(d.text) + 1);
@@ -6704,6 +6830,11 @@ class PerfectDarkApp : public rex::ReXApp {
         WriteGuestU32(mem, ia + 16, r.handler);
         ++n;
       }
+      // Mouse Sensitivity (row 0) is a slider, like Audio's volume rows
+      // (PdMouseSensHandler).
+      WriteGuestU32(mem, pc_items + 0, 0x08000000);
+      WriteGuestU32(mem, pc_items + 4, 0x00100000);  // MENUITEMFLAG_SLIDER_ALTSIZE (value shown)
+      WriteGuestU32(mem, pc_items + 12, kSensSteps);
       uint32_t pc_term = pc_items + n * 20;
       WriteGuestU32(mem, pc_term + 0, kTypeEnd << 24);
       for (int w = 1; w < 5; ++w) WriteGuestU32(mem, pc_term + w * 4, 0);
@@ -7183,11 +7314,12 @@ class PerfectDarkApp : public rex::ReXApp {
     if (built_in) rex::cvar::SetFlagByName("net_relay_server", "");
     // The same for resolution_scale: this run set it from Render Scale, and
     // only what the file itself held (a hand-edited value, or nothing) goes back.
-    const std::string running_scale = rex::cvar::GetFlagByName("resolution_scale");
+    const std::string running_scale = std::to_string(running_render_scale_);
     if (render_scale_set_) {
-      rex::cvar::SetFlagByName("resolution_scale", config_resolution_scale_.empty()
-                                                       ? std::string("1")
-                                                       : config_resolution_scale_);
+      for (int i = 0; i < 3; ++i) {
+        rex::cvar::SetFlagByName(kSdkScaleKeys[i], config_scale_values_[i].empty() ? std::string("1")
+                                                                                   : config_scale_values_[i]);
+      }
     }
     // A Language chosen during a mission is written for the next start but not
     // set under the running game (see "Language").
@@ -7201,7 +7333,9 @@ class PerfectDarkApp : public rex::ReXApp {
     if (pending_language_) {
       rex::cvar::SetFlagByName("user_language", std::to_string(running_language_));
     }
-    if (render_scale_set_) rex::cvar::SetFlagByName("resolution_scale", running_scale);
+    if (render_scale_set_) {
+      for (const char* key : kSdkScaleKeys) rex::cvar::SetFlagByName(key, running_scale);
+    }
     if (built_in) rex::cvar::SetFlagByName("net_relay_server", relay);
   }
 
@@ -7216,7 +7350,14 @@ class PerfectDarkApp : public rex::ReXApp {
   // There was an Auto choice (by display height and GPU, 4ai); a tester found
   // it confusing next to Resolution, so the user had it removed (2026-10-25,
   // HANDOVER 4aq). An old "auto" in perfect_dark.toml now means 1x.
-  static inline std::string config_resolution_scale_;  // the line in the file, if any
+  // The SDK's own scale settings. Render Scale (pd_render_scale) alone sets the
+  // scale: all three follow it every run (issue #18: Plume reads only
+  // resolution_scale, Classic the per-axis ones whenever resolution_scale is 1,
+  // so a stray line in the file could make the two disagree). The file keeps
+  // whatever lines it had (SavePcSettings).
+  static constexpr const char* kSdkScaleKeys[3] = {"resolution_scale", "draw_resolution_scale_x",
+                                                   "draw_resolution_scale_y"};
+  static inline std::string config_scale_values_[3];  // each key's line in the file, if any
   static inline bool render_scale_set_ = false;        // this run chose resolution_scale
   static inline int running_render_scale_ = 0;         // what this run renders at
   static inline int pending_render_scale_index_ = -1;  // chosen, applies next start
@@ -7328,9 +7469,9 @@ class PerfectDarkApp : public rex::ReXApp {
     return 1;
   }
 
-  // The resolution_scale line as written in perfect_dark.toml, if there is one
+  // A number setting's line as written in perfect_dark.toml, if there is one
   // (the cvar itself cannot tell a written value from its default).
-  static std::string ReadConfigResolutionScale(const std::filesystem::path& config) {
+  static std::string ReadConfigNumber(const std::filesystem::path& config, const std::string& key) {
     std::FILE* f = nullptr;
     if (_wfopen_s(&f, config.wstring().c_str(), L"rb") != 0 || !f) return {};
     std::string text;
@@ -7339,9 +7480,9 @@ class PerfectDarkApp : public rex::ReXApp {
     while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
     std::fclose(f);
     size_t pos = 0;
-    while ((pos = text.find("resolution_scale", pos)) != std::string::npos) {
+    while ((pos = text.find(key, pos)) != std::string::npos) {
       const bool line_start = pos == 0 || text[pos - 1] == '\n';
-      size_t i = pos + 16;
+      size_t i = pos + key.size();
       pos = i;
       if (!line_start) continue;
       while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
@@ -7543,11 +7684,16 @@ class PerfectDarkApp : public rex::ReXApp {
                 "upscaling {}, smooth game clock {}",
                 flag("gpu"), flag("fullscreen"), flag("vsync"), running_render_scale_,
                 flag("present_effect"), flag("pd_smooth_game_clock"));
+    const std::filesystem::path custom = pd_paths::CustomUserDataRoot();
+    if (!custom.empty()) {
+      REXLOG_INFO("[system] saves and settings: {} (chosen in setup)", Utf8(custom.wstring().c_str()));
+    }
     REXLOG_INFO("[system] diagnostics: {}", flag("diagnostics") == "true"
-                                                ? "on (detailed log)"
-                                                : "off (set diagnostics = true in "
-                                                  "resources\\userdata\\perfect_dark.toml "
-                                                  "for a detailed log)");
+                                                ? std::string("on (detailed log)")
+                                                : "off (set diagnostics = true in " +
+                                                      (custom.empty() ? std::string("resources\\userdata")
+                                                                      : std::string("the saves folder")) +
+                                                      "\\perfect_dark.toml for a detailed log)");
   }
 
   // ---- Settings from older releases (HANDOVER 4ak) ---------------------------
@@ -7576,9 +7722,31 @@ class PerfectDarkApp : public rex::ReXApp {
                 changed.empty() ? " nothing to change" : changed);
   }
 
+  // Settings the port needs whatever perfect_dark.toml says, which no player
+  // chooses: the shipped file sets them, but a file without those lines (one
+  // written by hand, or by an older tool) used to start with no GPU plugin, so
+  // neither renderer could show anything (a black window, issue #21). Set only
+  // where the file left the SDK's default.
+  static void EnsurePortSettings(rex::RuntimeConfig& config) {
+    std::string filled;
+    if (config.gpu_plugin.empty()) {
+      config.gpu_plugin = "xenos";
+      rex::cvar::SetFlagByName("gpu_plugin", "xenos");
+      filled += " gpu_plugin";
+    }
+    if (rex::cvar::GetFlagByName("license_mask") == "0") {  // 0 = the trial game
+      rex::cvar::SetFlagByName("license_mask", "1");
+      filled += " license_mask";
+    }
+    if (!filled.empty()) {
+      REXLOG_WARN("[settings] perfect_dark.toml was missing settings the game needs; using the shipped values for:{}",
+                  filled);
+    }
+  }
+
   void OnPreSetup(rex::RuntimeConfig& config) override {
-    (void)config;
     PdInstallCrashReport();
+    EnsurePortSettings(config);
     // A test build (its version contains "test") is for one bug report: the
     // detailed log is always on and the pacing experiment always off, whatever
     // perfect_dark.toml says, so the player only has to play and send the log.
@@ -7610,12 +7778,21 @@ class PerfectDarkApp : public rex::ReXApp {
       REXLOG_INFO("[native] renderer Classic: gpu = {}", config_gpu_);
     }
     SyncPresentAspect();
-    config_resolution_scale_ = ReadConfigResolutionScale(config_path());
+    for (int i = 0; i < 3; ++i) config_scale_values_[i] = ReadConfigNumber(config_path(), kSdkScaleKeys[i]);
     running_language_ = ConfiguredLanguage();
     REXLOG_INFO("[system] game text language {}{}", running_language_,
                 GameTextIsEnglish() ? " (English)" : "");
     running_render_scale_ = RenderScaleChoice();
-    rex::cvar::SetFlagByName("resolution_scale", std::to_string(running_render_scale_));
+    // The per-axis two are registered later by the GPU plugin; a value set now
+    // wins over the file's when they register (cvar.cpp, late registration).
+    for (int i = 0; i < 3; ++i) {
+      rex::cvar::SetFlagByName(kSdkScaleKeys[i], std::to_string(running_render_scale_));
+      if (!config_scale_values_[i].empty() && config_scale_values_[i] != std::to_string(running_render_scale_)) {
+        REXLOG_WARN("[render_scale] {} = {} in perfect_dark.toml is ignored: Render Scale "
+                    "(pd_render_scale) sets the scale, {}x",
+                    kSdkScaleKeys[i], config_scale_values_[i], running_render_scale_);
+      }
+    }
     render_scale_set_ = true;
     REXLOG_INFO("[render_scale] {}x", running_render_scale_);
   }
@@ -8086,7 +8263,9 @@ class PerfectDarkApp : public rex::ReXApp {
       if (WritePng(path, image)) {
         REXLOG_INFO("[screenshot] {} x {} saved to {}", image.width, image.height,
                     path.filename().string());
-        rex::kernel::xam::netplay::ShowNotice("Screenshot saved to resources\\userdata\\screenshots");
+        rex::kernel::xam::netplay::ShowNotice(pd_paths::CustomUserDataRoot().empty()
+                                                  ? "Screenshot saved to resources\\userdata\\screenshots"
+                                                  : "Screenshot saved to screenshots in your saves folder");
       } else {
         REXLOG_WARN("[screenshot] could not write {}", path.string());
       }
@@ -8346,6 +8525,9 @@ class PerfectDarkApp : public rex::ReXApp {
     if (!app) {
       return;
     }
+    // Render Scale alone sets the scale (issue #18): the old F-key dialog's
+    // Resolution row used to change it under a running Plume.
+    if (render_scale_set_) scale = running_render_scale_;
 
     // rex::cvar::SetFlagByName returns *success*, not *value changed* - it is
     // true even when the new value equals the old one. Comparing first matters
@@ -8482,6 +8664,7 @@ inline void PerfectDarkInputTracker::OnDraw(ImGuiIO& /*io*/) {
   PerfectDarkApp::TickNameEntry();
   PerfectDarkApp::TickStoryComplete();
   PerfectDarkApp::TickFrameStats();
+  PerfectDarkApp::TickDisplayInfo();
   PerfectDarkApp::TickMenuMouse();
   PerfectDarkApp::TickCutsceneSkip();
   PerfectDarkApp::DrawMenuCursor();

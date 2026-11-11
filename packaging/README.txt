@@ -68,7 +68,8 @@ not contact Xbox LIVE.
 WHERE THINGS LIVE
 -----------------
 
-Everything stays inside the extracted "Perfect Dark" folder:
+Everything stays inside the extracted "Perfect Dark" folder (saves and
+settings too, unless you choose another folder for them, see below):
 
   Perfect Dark.exe            Open this to play (and to set up the first time)
   README.txt, licenses\       This file and the third-party notices
@@ -81,6 +82,16 @@ Everything stays inside the extracted "Perfect Dark" folder:
 
 Paths are relative, so the folder can be moved or copied anywhere (a USB
 drive works too). To back up your progress, copy resources\userdata.
+
+To keep saves and settings somewhere else (another drive, or a folder you
+back up or sync), tick "Keep saves and settings in another folder" in the
+setup window and choose the folder. Press Play to apply it: what is in
+resources\userdata is copied there, the old copy is left as it was, and from
+then on the game uses only the chosen folder (it holds everything that
+resources\userdata would). resources\userdata-location.txt records the
+choice; updates keep it. Untick the box to go back to resources\userdata,
+which takes back any newer files. If the chosen folder is missing (a drive
+not connected), the game does not start with empty saves; it says so instead.
 
 SETUP AGAIN, UPDATING AND OLDER RELEASES
 ----------------------------------------
@@ -311,6 +322,14 @@ TROUBLESHOOTING
   - The launcher says a file in resources\runtime is missing: the download is
     incomplete or something removed a file. Extract the whole ZIP again
     (your resources\assets and resources\userdata are kept).
+  - Only part of the picture shows after changing Render Scale, or the game
+    cannot be used to change it back: close the game, open
+    resources\userdata\perfect_dark.toml in Notepad and set
+        pd_render_scale = "1"
+    (or delete that line), then start the game again. Render Scale is the
+    only scale setting the game uses: resolution_scale and
+    draw_resolution_scale lines in the file are ignored. Please report it
+    with your newest log (see below).
 
 REPORTING A PROBLEM
   Every time the game runs it writes a log to resources\runtime\logs

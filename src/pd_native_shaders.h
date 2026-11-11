@@ -14,7 +14,8 @@
 
 namespace pd::native_shaders {
 
-// <release>\resources\userdata\native_shaders\v<N> when the exe runs from a
+// <saves folder>\native_shaders\v<N> (resources\userdata unless the player
+// chose another folder in setup, pd_paths.h) when the exe runs from a
 // "runtime" folder, else <exe>\native_shaders\v<N> (dev builds and test
 // copies); N = the translation version.
 const std::wstring& CacheDir();

@@ -32,15 +32,21 @@ namespace {
 using namespace Gdiplus;
 
 // ------------------------------------------------------------- layout --
-constexpr float kW = 640, kH = 736;
+constexpr float kW = 640, kH = 770;
 constexpr float kUiScale = 1.1f;  // drawn 10% larger than the 96-DPI layout
 constexpr float kRowsY = 236, kRowPitch = 30;   // candidate rows when several packages are found
 constexpr int kMaxRows = 4;
 constexpr float kExtrasCapsY = 390, kExtrasCardY = 410, kExtraFirst = 422, kExtraPitch = 34;
 constexpr int kExtraCount = 6;
 constexpr float kLanguageY = kExtraFirst + kExtraCount * kExtraPitch;  // the row after the extras
+constexpr float kSavesY = kLanguageY + kExtraPitch;                    // the saves-folder row, last
+constexpr int kCardRows = kExtraCount + 2;                             // extras, language, saves folder
+constexpr float kFooterY = kExtraFirst + kCardRows * kExtraPitch + 10;  // top of the Play button
 
-enum Control { kNone = -1, kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kExtra3, kExtra4, kExtra5, kLanguage, kRow0 };
+enum Control {
+  kNone = -1, kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kExtra3, kExtra4, kExtra5, kLanguage,
+  kSaves, kSavesBrowse, kRow0
+};
 
 enum class Mode { Idle, Choosing, Importing, Ready };
 
@@ -125,11 +131,12 @@ class SetupWindow {
   void StartImport(Source source);  // by value: it may come from candidates_, which is cleared
   void OnProgress(ProgressMsg* msg);
   void OnDone(ImportResult* result);
+  void ChooseSavesFolder();
   void Play();
   void RequestClose();
   void Invalidate() { InvalidateRect(hwnd_, nullptr, FALSE); }
 
-  const Paths& p_;
+  Paths p_;  // a copy: the saves folder can change (SetUserDataLocation)
   SetupOptions options_;
   HWND hwnd_ = nullptr;
   HICON icon_ = nullptr;
@@ -145,6 +152,8 @@ class SetupWindow {
   int progress_ = 0;
   bool show_bar_ = false;
   Extras want_, was_;
+  // The saves folder (empty: resources\userdata), applied on Play like the extras.
+  fs::path want_saves_, was_saves_;
   Control hover_ = kNone, pressed_ = kNone;
   bool tracking_ = false;
   std::atomic<bool> cancel_{false};
@@ -215,9 +224,11 @@ void SetupWindow::ApplyScale(UINT dpi, const RECT* suggested) {
 RectL SetupWindow::ControlRect(Control id) const {
   switch (id) {
     case kBrowse: return {456, 236, 124, 34};
-    case kLeft: return {330, 678, 104, 38};
-    case kPlay: return {446, 670, 154, 52};
+    case kLeft: return {330, kFooterY + 8, 104, 38};
+    case kPlay: return {446, kFooterY, 154, 52};
     case kLanguage: return {52, kLanguageY - 3, 548, kExtraPitch};
+    case kSaves: return {52, kSavesY - 3, 548, kExtraPitch};
+    case kSavesBrowse: return {478, kSavesY + 2, 110, 24};
     case kExtra0:
     case kExtra1:
     case kExtra2:
@@ -243,12 +254,14 @@ bool SetupWindow::Enabled(Control id) const {
     case kExtra4:
     case kExtra5:
     case kLanguage: return true;
+    case kSaves:
+    case kSavesBrowse: return mode_ != Mode::Importing;
     default: return mode_ == Mode::Choosing && id - kRow0 < static_cast<int>(candidates_.size());
   }
 }
 
 Control SetupWindow::HitTest(float x, float y) const {
-  std::vector<Control> ids = {kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kExtra3, kExtra4, kExtra5, kLanguage};
+  std::vector<Control> ids = {kBrowse, kLeft, kPlay, kExtra0, kExtra1, kExtra2, kExtra3, kExtra4, kExtra5, kLanguage, kSavesBrowse, kSaves};
   if (mode_ == Mode::Choosing) {
     for (int i = 0; i < static_cast<int>(candidates_.size()) && i < kMaxRows; ++i)
       ids.push_back(static_cast<Control>(kRow0 + i));
@@ -461,7 +474,7 @@ void SetupWindow::Paint(HDC dc) {
     // Extras: a painted checkbox, a title and a one-line explanation each.
     PaintText(g, std::wstring(L"OPTIONAL EXTRAS  ") + kDot + L"  APPLIED WHEN YOU PRESS PLAY", caps_.get(),
               tone::Cyan, RectF(40, kExtrasCapsY, 560, 18));
-    PaintCard(g, 40, kExtrasCardY, 560, 12 + (kExtraCount + 1) * kExtraPitch);
+    PaintCard(g, 40, kExtrasCardY, 560, 12 + kCardRows * kExtraPitch);
     const bool on[kExtraCount] = {want_.fullscreen, want_.shortcut, want_.cheats, want_.story, want_.multiplayer, want_.autoaim};
     for (int i = 0; i < kExtraCount; ++i) {
       const float y = kExtraFirst + i * kExtraPitch;
@@ -522,9 +535,52 @@ void SetupWindow::Paint(HDC dc) {
                 RectF(478, y + 4, 110, 20), StringAlignmentCenter);
     }
 
+    // Saves and settings folder: unticked = this folder; ticked = the chosen one.
+    {
+      const float y = kSavesY;
+      const bool enabled = Enabled(kSaves);
+      if (enabled && (hover_ == kSaves || hover_ == kSavesBrowse)) {
+        const RectL r = ControlRect(kSaves);
+        GraphicsPath hoverShape;
+        RoundedPath(hoverShape, r.x, r.y, r.w, r.h, 6);
+        SolidBrush hover(Hex(tone::Cyan, 22));
+        g.FillPath(&hover, &hoverShape);
+      }
+      const bool custom = !want_saves_.empty();
+      GraphicsPath box;
+      RoundedPath(box, 62, y + 3, 18, 18, 3);
+      if (custom) {
+        SolidBrush fill(Hex(tone::Cyan));
+        g.FillPath(&fill, &box);
+        Pen tick(Hex(tone::Ink), 2.2f);
+        tick.SetStartCap(LineCapRound);
+        tick.SetEndCap(LineCapRound);
+        tick.SetLineJoin(LineJoinRound);
+        const PointF points[3] = {PointF(66, y + 12.5f), PointF(70, y + 16.5f), PointF(77, y + 7.5f)};
+        g.DrawLines(&tick, points, 3);
+      } else {
+        SolidBrush fill(Hex(tone::Field));
+        g.FillPath(&fill, &box);
+        Pen edge(Hex(tone::Cyan, 170), 1.2f);
+        g.DrawPath(&edge, &box);
+      }
+      PaintText(g, L"Keep saves and settings in another folder", row_title_.get(), tone::Text,
+                RectF(92, y - 1, 380, 20));
+      PaintText(g, custom ? want_saves_.wstring() : std::wstring(L"Off: they stay in this folder (resources\\userdata)."),
+                row_detail_.get(), custom ? tone::Cyan : tone::Muted, RectF(92, y + 17, 380, 16));
+      GraphicsPath pill;
+      RoundedPath(pill, 478, y + 2, 110, 24, 12);
+      SolidBrush pillFill(Hex(tone::Field));
+      g.FillPath(&pillFill, &pill);
+      Pen pillEdge(Hex(tone::Cyan, !enabled ? 60 : hover_ == kSavesBrowse ? 230 : 130), 1.2f);
+      g.DrawPath(&pillEdge, &pill);
+      PaintText(g, L"Choose folder", row_title_.get(), enabled ? tone::Cyan : tone::Muted, RectF(478, y + 4, 110, 20),
+                StringAlignmentCenter);
+    }
+
     // Footer and the two buttons.
     PaintText(g, std::wstring(L"Xbox LIVE Arcade  ") + kDot + L"  Title ID 584109C2", foot_.get(), tone::Muted,
-              RectF(40, 693, 270, 16));
+              RectF(40, kFooterY + 23, 270, 16));
     const wchar_t* left = mode_ == Mode::Importing ? (cancel_.load() ? L"Cancelling" : L"Cancel") : L"Close";
     PaintButton(g, kLeft, left, Enabled(kLeft), false, button_.get());
     PaintButton(g, kPlay, L"PLAY", Enabled(kPlay), true, play_.get());
@@ -550,6 +606,8 @@ void SetupWindow::Start() {
   // switches it off.
   was_ = installed_ ? CurrentExtras(p_, options_.shortcut_folder) : Extras{};
   want_ = was_;
+  was_saves_ = p_.custom_userdata ? p_.userdata : fs::path();
+  want_saves_ = was_saves_;
   if (!options_.package.empty()) {
     SelectPath(options_.package);
     return;
@@ -559,7 +617,8 @@ void SetupWindow::Start() {
     heading_ = L"Perfect Dark is set up in this folder";
     path_text_ = L"resources\\assets";
     path_set_ = true;
-    status_ = L"✓  Game data imported. Saves and settings are in resources\\userdata.";
+    status_ = p_.custom_userdata ? L"✓  Game data imported. Saves and settings are in the folder shown below."
+                                 : L"✓  Game data imported. Saves and settings are in resources\\userdata.";
     status_color_ = tone::Ok;
     phase_ = L"READY TO PLAY";
     phase_color_ = tone::Ok;
@@ -741,7 +800,48 @@ void SetupWindow::OnDone(ImportResult* result) {
   if (close_after_import_) DestroyWindow(hwnd_);
 }
 
+// The folder for saves and settings (applied on Play).
+void SetupWindow::ChooseSavesFolder() {
+  IFileOpenDialog* dialog = nullptr;
+  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return;
+  DWORD flags = 0;
+  dialog->GetOptions(&flags);
+  dialog->SetOptions(flags | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT);
+  dialog->SetTitle(L"Choose a folder for your Perfect Dark saves and settings");
+  dialog->SetOkButtonLabel(L"Use this folder");
+  IShellItem* start = nullptr;
+  const fs::path from = want_saves_.empty() ? p_.root : want_saves_;
+  if (SUCCEEDED(SHCreateItemFromParsingName(from.c_str(), nullptr, IID_PPV_ARGS(&start)))) {
+    dialog->SetFolder(start);
+    start->Release();
+  }
+  if (SUCCEEDED(dialog->Show(hwnd_))) {
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(dialog->GetResult(&item))) {
+      PWSTR path = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+        // Choosing this release's own userdata folder is the default.
+        want_saves_ = SameFile(path, p_.resources / L"userdata") ? fs::path() : fs::path(path);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dialog->Release();
+  Invalidate();
+}
+
 void SetupWindow::Play() {
+  // A new saves folder first, so the extras (fullscreen is a setting) go there.
+  if (_wcsicmp(want_saves_.wstring().c_str(), was_saves_.wstring().c_str()) != 0) {
+    std::wstring message;
+    if (!SetUserDataLocation(p_, want_saves_, &message)) {
+      MessageBoxW(hwnd_, message.c_str(), L"Perfect Dark", MB_OK | MB_ICONWARNING);
+      return;
+    }
+    was_saves_ = want_saves_;
+    MessageBoxW(hwnd_, message.c_str(), L"Perfect Dark", MB_OK | MB_ICONINFORMATION);
+  }
   const std::wstring note = ApplyExtras(p_, want_, was_, options_.shortcut_folder, [this](const fs::path& link) {
     const std::wstring text = L"There is already a Perfect Dark shortcut on your desktop that opens a different copy:\n\n" +
                               link.wstring() + L"\n\nReplace it with one for this folder?";
@@ -789,6 +889,12 @@ void SetupWindow::Click(Control id) {
     case kExtra4: want_.multiplayer = !want_.multiplayer; break;
     case kExtra5: want_.autoaim = !want_.autoaim; break;
     case kLanguage: want_.language = kLanguages[(LanguageIndex(want_.language) + 1) % 5].id; break;
+    case kSaves:
+      // Unticked: choose a folder; ticked: back to this folder (resources\userdata).
+      if (want_saves_.empty()) ChooseSavesFolder();
+      else want_saves_.clear();
+      break;
+    case kSavesBrowse: ChooseSavesFolder(); break;
     default:
       if (id >= kRow0 && id - kRow0 < static_cast<int>(candidates_.size())) StartImport(candidates_[id - kRow0]);
       break;

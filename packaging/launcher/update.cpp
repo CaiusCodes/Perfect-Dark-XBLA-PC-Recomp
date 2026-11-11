@@ -6,7 +6,8 @@
 // checks the SHA-256 GitHub gives for it, unpacks it and replaces the program
 // files: Perfect Dark.exe, README.txt, licenses\ and resources\runtime\ (not
 // runtime\logs). resources\assets and resources\userdata (game data, saves,
-// settings, shader caches) are never touched.
+// settings, shader caches) are never touched, nor is a saves folder chosen in
+// setup or resources\userdata-location.txt, which names it.
 //
 // The replacement is two steps per file, so a failure can be undone: every new
 // file is first written beside its target as <name>.update-new; then each

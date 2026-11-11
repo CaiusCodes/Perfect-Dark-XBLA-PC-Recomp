@@ -31,6 +31,8 @@
 #include <rex/logging/api.h>
 #include <rex/logging/macros.h>
 
+#include "pd_paths.h"  // the saves folder (userdata-location.txt)
+
 #include "pch.h"  // XenosRecomp's common header (its sources build with it precompiled)
 #include "shader_recompiler.h"
 
@@ -309,8 +311,10 @@ const std::wstring& CacheDir() {
     const size_t slash = exe.find_last_of(L"\\/");
     std::wstring leaf = slash == std::wstring::npos ? exe : exe.substr(slash + 1);
     for (wchar_t& ch : leaf) ch = wchar_t(towlower(ch));
-    std::wstring d = leaf == L"runtime" ? exe.substr(0, slash) + L"\\userdata\\native_shaders" : exe + L"\\native_shaders";
-    if (leaf == L"runtime") CreateDirectoryW((exe.substr(0, slash) + L"\\userdata").c_str(), nullptr);
+    // In a release: the saves folder (resources\userdata, or the one chosen in setup).
+    const std::wstring userdata = pd_paths::UserDataRoot().wstring();
+    std::wstring d = leaf == L"runtime" ? userdata + L"\\native_shaders" : exe + L"\\native_shaders";
+    if (leaf == L"runtime") CreateDirectoryW(userdata.c_str(), nullptr);
     CreateDirectoryW(d.c_str(), nullptr);
     // One folder per translation version: shaders from an older translator or
     // patch_hlsl are never picked up.

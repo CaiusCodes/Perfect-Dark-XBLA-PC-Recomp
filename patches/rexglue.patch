@@ -550,7 +550,7 @@ index 8f34d97..b8a445d 100644
  
  /// Create a default InputSystem with SDL + NOP drivers.
 diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
-index d4188df..d5c73af 100644
+index d4188df..a6cd2f8 100644
 --- a/include/rex/input/mnk/mnk_input_driver.h
 +++ b/include/rex/input/mnk/mnk_input_driver.h
 @@ -10,6 +10,8 @@
@@ -562,7 +562,7 @@ index d4188df..d5c73af 100644
  #include <rex/input/input_driver.h>
  #include <rex/ui/window.h>
  #include <rex/ui/window_listener.h>
-@@ -30,6 +32,54 @@ class MnkInputDriver final : public InputDriver,
+@@ -30,6 +32,67 @@ class MnkInputDriver final : public InputDriver,
  
    X_STATUS Setup() override;
  
@@ -581,6 +581,19 @@ index d4188df..d5c73af 100644
 +  // drift, so some frames get two updates and some none, which reads as jitter.
 +  using LookDeltaSink = void (*)(int32_t dx, int32_t dy);
 +  static void SetLookDeltaSink(LookDeltaSink sink);
++
++  // Asked once per guest input poll (guest thread) while mnk_direct_look is on:
++  // true while the title steers something with the right stick other than the
++  // view (a remote camera, a vehicle, a guided missile). The mouse then moves
++  // the right stick, as with mnk_direct_look off, instead of the look sink.
++  using StickLookQuery = bool (*)();
++  static void SetStickLookQuery(StickLookQuery query);
++
++  // How the mouse moves the right stick while the query says so: any movement
++  // starts at start_x / start_y (the title's dead zone for what it steers, in
++  // stick units, 0 = from the centre), and the mouse counts gain times
++  // mnk_sensitivity. Defaults 0, 0, 1.
++  static void SetStickLookResponse(int32_t start_x, int32_t start_y, float gain);
 +
 +  // Menus. While a title is showing a menu it can take the mouse over from the
 +  // driver: motion stops driving the look sink (the title steers the highlight
@@ -617,7 +630,7 @@ index d4188df..d5c73af 100644
    X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                             X_INPUT_CAPABILITIES* out_caps) override;
    X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override;
-@@ -45,6 +95,7 @@ class MnkInputDriver final : public InputDriver,
+@@ -45,6 +108,7 @@ class MnkInputDriver final : public InputDriver,
    void OnMouseDown(rex::ui::MouseEvent& e) override;
    void OnMouseUp(rex::ui::MouseEvent& e) override;
    void OnMouseMove(rex::ui::MouseEvent& e) override;
@@ -625,7 +638,7 @@ index d4188df..d5c73af 100644
  
    // WindowListener
    void OnClosing(rex::ui::UIEvent& e) override;
-@@ -58,18 +109,44 @@ class MnkInputDriver final : public InputDriver,
+@@ -58,18 +122,48 @@ class MnkInputDriver final : public InputDriver,
    void UpdateMouseCapture();
    void SetKeyState(uint16_t vk, bool down);
    void EnqueueKeystroke(uint16_t vk_pad, bool down);
@@ -633,6 +646,10 @@ index d4188df..d5c73af 100644
 +
 +  static MnkInputDriver* active_instance_;
 +  static LookDeltaSink look_delta_sink_;
++  static StickLookQuery stick_look_query_;
++  static std::atomic<int32_t> stick_look_start_x_;
++  static std::atomic<int32_t> stick_look_start_y_;
++  static std::atomic<float> stick_look_gain_;
 +  static std::atomic<bool> menu_mouse_mode_;
 +  static std::atomic<uint16_t> injected_buttons_;
 +  static std::atomic<int64_t> injected_buttons_until_;
@@ -1461,7 +1478,7 @@ index e15e410..b9f236b 100644
 +
  }  // namespace rex::ui
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
-index afb4a30..c25a848 100644
+index afb4a30..5316b1b 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
 @@ -10,9 +10,19 @@
@@ -1510,7 +1527,17 @@ index afb4a30..c25a848 100644
  
    void AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order);
    void RemoveUIDrawerFromUIThread(UIDrawer* drawer);
-@@ -977,6 +999,10 @@ class Presenter {
+@@ -675,6 +697,9 @@ class Presenter {
+   // possible to leave the consumer critical section earlier. Also, the guest
+   // output paint configuration is passed explicitly too so calling this
+   // function multiple times is safer.
++  void LogGuestOutputPlacement(const GuestOutputProperties& properties, uint32_t host_rt_width,
++                               uint32_t host_rt_height, int32_t x, int32_t y, uint32_t width,
++                               uint32_t height) const;
+   GuestOutputPaintFlow GetGuestOutputPaintFlow(const GuestOutputProperties& properties,
+                                                uint32_t host_rt_width, uint32_t host_rt_height,
+                                                uint32_t max_rt_width, uint32_t max_rt_height,
+@@ -977,6 +1002,10 @@ class Presenter {
    // rather than being blank.
    bool guest_output_active_last_refresh_ = false;
  
@@ -1521,7 +1548,7 @@ index afb4a30..c25a848 100644
    // Ordered by the Z order, and then by the time of addition.
    // Note: All the iteration logic involving this Z ordering must be the same as
    // in input handling (in the input listeners in the Window), but in reverse.
-@@ -1051,6 +1077,22 @@ class Presenter {
+@@ -1051,6 +1080,22 @@ class Presenter {
  
    std::thread dxgi_ui_tick_thread_;
  #endif  // XE_PLATFORM
@@ -6228,7 +6255,7 @@ index e132acb..3c94f5a 100644
  
  std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
-index cff5b1a..18fa32a 100644
+index cff5b1a..eba8c60 100644
 --- a/src/input/mnk/mnk_input_driver.cpp
 +++ b/src/input/mnk/mnk_input_driver.cpp
 @@ -11,6 +11,7 @@
@@ -6292,7 +6319,7 @@ index cff5b1a..18fa32a 100644
  REXCVAR_DEFINE_STRING(keybind_dpad_up, "Up", "Input/Keybinds/Controller", "D-pad up");
  REXCVAR_DEFINE_STRING(keybind_dpad_down, "Down", "Input/Keybinds/Controller", "D-pad down");
  REXCVAR_DEFINE_STRING(keybind_dpad_left, "Left", "Input/Keybinds/Controller", "D-pad left");
-@@ -55,12 +95,56 @@ REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide but
+@@ -55,12 +95,67 @@ REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide but
  
  namespace rex::input::mnk {
  
@@ -6300,6 +6327,17 @@ index cff5b1a..18fa32a 100644
 +MnkInputDriver::LookDeltaSink MnkInputDriver::look_delta_sink_ = nullptr;
 +
 +void MnkInputDriver::SetLookDeltaSink(LookDeltaSink sink) { look_delta_sink_ = sink; }
++
++MnkInputDriver::StickLookQuery MnkInputDriver::stick_look_query_ = nullptr;
++void MnkInputDriver::SetStickLookQuery(StickLookQuery query) { stick_look_query_ = query; }
++std::atomic<int32_t> MnkInputDriver::stick_look_start_x_{0};
++std::atomic<int32_t> MnkInputDriver::stick_look_start_y_{0};
++std::atomic<float> MnkInputDriver::stick_look_gain_{1.0f};
++void MnkInputDriver::SetStickLookResponse(int32_t start_x, int32_t start_y, float gain) {
++  stick_look_start_x_ = start_x;
++  stick_look_start_y_ = start_y;
++  stick_look_gain_ = gain > 0.0f ? gain : 1.0f;
++}
 +
 +std::atomic<bool> MnkInputDriver::menu_mouse_mode_{false};
 +std::atomic<uint16_t> MnkInputDriver::injected_buttons_{0};
@@ -6349,7 +6387,7 @@ index cff5b1a..18fa32a 100644
    // Detach handled by OnClosing; if window outlives the driver, clean up here.
    if (attached_window_) {
      attached_window_->RemoveInputListener(this);
-@@ -70,6 +154,7 @@ MnkInputDriver::~MnkInputDriver() {
+@@ -70,6 +165,7 @@ MnkInputDriver::~MnkInputDriver() {
  }
  
  X_STATUS MnkInputDriver::Setup() {
@@ -6357,7 +6395,7 @@ index cff5b1a..18fa32a 100644
    REXLOG_INFO("MnK input driver initialized");
    return X_STATUS_SUCCESS;
  }
-@@ -103,14 +188,78 @@ bool MnkInputDriver::IsEnabled() const {
+@@ -103,14 +199,78 @@ bool MnkInputDriver::IsEnabled() const {
    return REXCVAR_GET(mnk_mode);
  }
  
@@ -6438,7 +6476,7 @@ index cff5b1a..18fa32a 100644
  X_RESULT MnkInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
                                           X_INPUT_CAPABILITIES* out_caps) {
    if (!IsEnabled() || user_index != UserIndex()) {
-@@ -142,6 +291,9 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+@@ -142,6 +302,9 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
    UpdateMouseCapture();
  
    if (!is_active() || !has_focus_) {
@@ -6448,7 +6486,7 @@ index cff5b1a..18fa32a 100644
      if (out_state) {
        std::memset(out_state, 0, sizeof(*out_state));
        out_state->packet_number = packet_number_;
-@@ -151,27 +303,66 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+@@ -151,27 +314,66 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
  
    std::lock_guard lock(state_mutex_);
  
@@ -6525,7 +6563,7 @@ index cff5b1a..18fa32a 100644
    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
      buttons |= X_INPUT_GAMEPAD_GUIDE;
    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
-@@ -183,26 +374,154 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+@@ -183,26 +385,170 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
      buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
  
@@ -6630,15 +6668,31 @@ index cff5b1a..18fa32a 100644
 +    radial_x_ = radial_y_ = 0.0f;
 +  }
 +
++  // Direct look, unless the title is steering something else with the right
++  // stick right now (then the mouse moves the stick, as without direct look).
++  const bool stick_look =
++      REXCVAR_GET(mnk_direct_look) && stick_look_query_ && stick_look_query_();
++  const bool direct_look = REXCVAR_GET(mnk_direct_look) && !stick_look;
 +  if (!REXCVAR_GET(mnk_mouse)) {
 +    mouse_dx_ = 0;
 +    mouse_dy_ = 0;
-+  } else if (!REXCVAR_GET(mnk_direct_look)) {
++  } else if (!direct_look) {
 +    double sensitivity = REXCVAR_GET(mnk_sensitivity);
 +    constexpr double kBaseScale = 200.0;
 +    const double y_sign = REXCVAR_GET(mnk_invert_y) ? 1.0 : -1.0;
++    if (stick_look) sensitivity *= stick_look_gain_.load();
 +    ry = static_cast<int32_t>(y_sign * mouse_dy_ * sensitivity * kBaseScale);
 +    rx = static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale);
++    if (stick_look) {
++      // Any movement starts where the title first responds (its dead zone),
++      // so a slow mouse moves the thing it steers instead of nothing.
++      auto lift = [](int32_t v, int32_t start) {
++        if (v == 0 || start <= 0) return v;
++        return v > 0 ? v + start : v - start;
++      };
++      rx = lift(rx, stick_look_start_x_.load());
++      ry = lift(ry, stick_look_start_y_.load());
++    }
 +    mouse_dx_ = 0;
 +    mouse_dy_ = 0;
 +  }
@@ -6662,7 +6716,7 @@ index cff5b1a..18fa32a 100644
 +  // so aim is applied exactly once per guest input poll.
 +  int32_t look_dx = 0;
 +  int32_t look_dy = 0;
-+  if (REXCVAR_GET(mnk_direct_look)) {
++  if (direct_look) {
 +    look_dx = mouse_dx_;
 +    look_dy = mouse_dy_;
 +    mouse_dx_ = 0;
@@ -6692,7 +6746,7 @@ index cff5b1a..18fa32a 100644
  
    auto clamp16 = [](int32_t v) -> int16_t {
      return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
-@@ -215,11 +534,18 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+@@ -215,11 +561,18 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
      out_state->gamepad.buttons = buttons;
      out_state->gamepad.left_trigger = lt;
      out_state->gamepad.right_trigger = rt;
@@ -6713,7 +6767,7 @@ index cff5b1a..18fa32a 100644
    return X_ERROR_SUCCESS;
  }
  
-@@ -247,6 +573,12 @@ X_RESULT MnkInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
+@@ -247,6 +600,12 @@ X_RESULT MnkInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
  }
  
  void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
@@ -6726,7 +6780,7 @@ index cff5b1a..18fa32a 100644
    X_INPUT_KEYSTROKE ks = {};
    ks.virtual_key = vk_pad;
    ks.unicode = 0;
-@@ -277,24 +609,30 @@ void MnkInputDriver::UpdateMouseCapture() {
+@@ -277,24 +636,30 @@ void MnkInputDriver::UpdateMouseCapture() {
    if (!attached_window_)
      return;
  
@@ -6760,7 +6814,7 @@ index cff5b1a..18fa32a 100644
      CenterCursor();
    }
  }
-@@ -305,20 +643,68 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+@@ -305,20 +670,68 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
    }
  }
  
@@ -6831,7 +6885,7 @@ index cff5b1a..18fa32a 100644
  }
  
  void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
-@@ -335,14 +721,19 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+@@ -335,14 +748,19 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
      case rex::ui::MouseEvent::Button::kMiddle:
        SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), true);
        break;
@@ -6853,7 +6907,7 @@ index cff5b1a..18fa32a 100644
    std::lock_guard lock(state_mutex_);
    switch (e.button()) {
      case rex::ui::MouseEvent::Button::kLeft:
-@@ -354,15 +745,42 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+@@ -354,15 +772,42 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
      case rex::ui::MouseEvent::Button::kMiddle:
        SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), false);
        break;
@@ -6896,7 +6950,7 @@ index cff5b1a..18fa32a 100644
    int32_t x = e.x();
    int32_t y = e.y();
    mouse_dx_ += x - prev_mouse_x_;
-@@ -375,6 +793,10 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+@@ -375,6 +820,10 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
    std::lock_guard lock(state_mutex_);
    has_focus_ = false;
    std::memset(key_down_, 0, sizeof(key_down_));
@@ -6907,7 +6961,7 @@ index cff5b1a..18fa32a 100644
    mouse_dx_ = 0;
    mouse_dy_ = 0;
    if (mouse_captured_ && attached_window_) {
-@@ -389,4 +811,19 @@ void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
+@@ -389,4 +838,19 @@ void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
    has_focus_ = true;
  }
  
@@ -12992,7 +13046,7 @@ index 8a97c2d..a25b510 100644
 +
  }  // namespace rex::ui
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..8a71831 100644
+index 7360ed9..42ae7f5 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -12,12 +12,17 @@
@@ -13361,7 +13415,60 @@ index 7360ed9..8a71831 100644
  }
  
  void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {
-@@ -1313,9 +1589,10 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
+@@ -850,6 +1126,43 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+   return std::move(consumer_lock);
+ }
+ 
++// Where the picture goes in the window, logged when it changes (at most once a
++// second, so a window being dragged to a new size gives a line or two): the
++// frame's size, the window surface and the render target (these two differ when
++// window coordinates and pixels disagree, e.g. DPI scaling), and the rectangle
++// drawn. Bug reports about a picture of the wrong size or place need exactly
++// this.
++void Presenter::LogGuestOutputPlacement(const GuestOutputProperties& properties, uint32_t host_rt_width,
++                                        uint32_t host_rt_height, int32_t x, int32_t y, uint32_t width,
++                                        uint32_t height) const {
++  struct Placement {
++    uint32_t v[11];
++    bool operator==(const Placement& o) const { return std::equal(std::begin(v), std::end(v), std::begin(o.v)); }
++  };
++  const Placement now = {{properties.frontbuffer_width, properties.frontbuffer_height,
++                          surface_width_in_paint_connection_, surface_height_in_paint_connection_, host_rt_width,
++                          host_rt_height, uint32_t(x), uint32_t(y), width, height,
++                          properties.display_aspect_ratio_x * 65536u + properties.display_aspect_ratio_y}};
++  static std::mutex mutex;
++  static Placement logged = {};
++  static std::chrono::steady_clock::time_point last;
++  std::lock_guard<std::mutex> lock(mutex);
++  const auto t = std::chrono::steady_clock::now();
++  if (now == logged || t - last < std::chrono::seconds(1)) return;
++  logged = now;
++  last = t;
++  const bool fills = x <= 0 && y <= 0 && int64_t(x) + width >= host_rt_width && int64_t(y) + height >= host_rt_height;
++  REXLOG_INFO("[display] picture {}x{} at {},{} in the window's {}x{} (surface {}x{}){}; frame {}x{}, aspect {}:{}",
++              width, height, x, y, host_rt_width, host_rt_height, surface_width_in_paint_connection_,
++              surface_height_in_paint_connection_,
++              fills                                                                ? ", fills it"
++              : surface_width_in_paint_connection_ != host_rt_width ||
++                        surface_height_in_paint_connection_ != host_rt_height ? ", SURFACE AND RENDER TARGET DIFFER"
++                                                                               : ", letterboxed",
++              properties.frontbuffer_width, properties.frontbuffer_height, properties.display_aspect_ratio_x,
++              properties.display_aspect_ratio_y);
++}
++
+ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+     const GuestOutputProperties& properties, uint32_t host_rt_width, uint32_t host_rt_height,
+     uint32_t max_rt_width, uint32_t max_rt_height, const GuestOutputPaintConfig& config) const {
+@@ -1014,6 +1327,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+     output_right = int32_t(output_width);
+     output_bottom = int32_t(output_height);
+   }
++  LogGuestOutputPlacement(properties, host_rt_width, host_rt_height, flow.output_x, flow.output_y,
++                          output_width, output_height);
+   if (!output_width || !output_height || output_right <= 0 || output_bottom <= 0 ||
+       flow.output_x >= int32_t(host_rt_width) || flow.output_y >= int32_t(host_rt_height)) {
+     return flow;
+@@ -1313,9 +1628,10 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
    if (!REXCVAR_GET(host_present_from_non_ui_thread)) {
      return PaintMode::kUIThreadOnRequest;
    }
