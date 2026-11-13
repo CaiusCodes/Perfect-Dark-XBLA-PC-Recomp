@@ -23,6 +23,13 @@
 // never need these; set pd_dev_hotkeys = true in perfect_dark.toml to enable.
 REXCVAR_DEFINE_BOOL(pd_dev_hotkeys, false, "PerfectDark",
                     "Enable developer diagnostic hotkeys (F1, F2, F5, F6, F8, F10-F12)");
+REXCVAR_DEFINE_BOOL(pd_trace_stick_look, false, "PerfectDark",
+                    "Test: log the CamSpy's turn and height every drawn frame while it is steered");
+REXCVAR_DEFINE_BOOL(pd_test_camspy_mouse, false, "PerfectDark",
+                    "Test: treat the test pipe's right stick Y as mouse movement on the CamSpy (height kicks)");
+REXCVAR_DEFINE_BOOL(pd_keyboard_prompts, true, "PerfectDark",
+                    "With no gamepad connected, show the bound key (\"[E]\") where the game's text has a "
+                    "button icon");
 REXCVAR_DEFINE_BOOL(pd_frame_stats, false, "PerfectDark",
                     "Log presented frame rate and slow frames every five seconds (developer "
                     "aid for performance work)");
@@ -62,6 +69,13 @@ REXCVAR_DEFINE_STRING(pd_aspect_ratio, "16:9", "PerfectDark",
                       "Picture shape: 16:9 (the Xbox version) or 4:3 (the N64's field of view, "
                       "with bars at the sides)")
     .allowed({"16:9", "4:3"});
+
+// The game's text lookup (sub_8226C9F0), as it returns: button icons in the
+// string become the bound keys while no gamepad is connected (PerfectDarkApp::
+// KeyboardTextFor).
+uint32_t PdTextForDisplay(uint32_t text) {
+  return PerfectDarkApp::KeyboardTextFor(text);
+}
 
 bool PdAspect43() {
   return REXCVAR_GET(pd_aspect_ratio) == "4:3";
@@ -197,6 +211,20 @@ REXCVAR_DEFINE_INT32(pd_mp_facing_delay_ms, 50, "PerfectDark",
                      "shipped 200; lower shows their turning sooner, and below about 35 "
                      "it turns in steps. 100 can look smoother on a jittery internet link")
     .range(0, 200);
+
+// Controller stick dead zones (issue #23): the game ignores each stick axis
+// up to 10000 of 32767, about 30%, which makes precise aiming hard. These
+// replace that for controllers, in percent of the stick's travel; 30 is the
+// game's own and changes nothing. Keyboard and mouse are not affected.
+// Settings > Gamepad Controls (perfect_dark_app.h, "Stick dead zones").
+REXCVAR_DEFINE_INT32(pd_deadzone_right, 30, "PerfectDark",
+                     "Controller right stick dead zone, percent of its travel (0-30). "
+                     "30 is the game's own; lower reacts to smaller movements")
+    .range(0, 30);
+REXCVAR_DEFINE_INT32(pd_deadzone_left, 30, "PerfectDark",
+                     "Controller left stick dead zone, percent of its travel (0-30). "
+                     "30 is the game's own; lower reacts to smaller movements")
+    .range(0, 30);
 
 int64_t PdMpFacingDelayMs() {
   return REXCVAR_GET(pd_mp_facing_delay_ms);
@@ -692,7 +720,9 @@ void PdNoteGameFrame(uint8_t* base) {
   PdMpMusicFrame(base);
   PerfectDarkApp::NoteGameStage(
       _byteswap_ulong(*reinterpret_cast<const uint32_t*>(base + 0x826492E0)),   // stage
-      _byteswap_ulong(*reinterpret_cast<const uint32_t*>(base + 0x82648BF8 + 0x0C)));  // level frames
+      _byteswap_ulong(*reinterpret_cast<const uint32_t*>(base + 0x82648BF8 + 0x0C)),  // level frames
+      *(base + 0x82656740),  // the player has control
+      _byteswap_ulong(*reinterpret_cast<const uint32_t*>(base + 0x82648BF8 + 1228)));  // tick mode
   if (!rex::diag::TimingLogOn()) return;
   constexpr uint32_t kGVars = 0x82648BF8;
   static const int64_t freq = [] {

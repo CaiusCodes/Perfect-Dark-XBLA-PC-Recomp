@@ -53,7 +53,11 @@ namespace {
 // 4: vertex shaders' texture fetches as SampleLevel.
 // 5: the CUBE instruction's source swizzle (environment-map directions).
 // 6: constants as one register file (no per-name members).
-constexpr int kTranslationVersion = 6;
+// 7: depth flip in the vertex shader (c19).
+// 8, 9: (a precise position output and MAD as mad(), tried for issue #25 and
+//    dropped).
+// 10: user clip planes as clip distances (c19.z, c20-c25; issue #25).
+constexpr int kTranslationVersion = 10;
 
 // XenosRecomp's shared definitions, prepended to every translated shader.
 constexpr char kShaderCommon[] =
@@ -100,10 +104,45 @@ void replace_once(std::string& s, const std::string& from, const std::string& to
   if (at != std::string::npos) s.replace(at, from.size(), to);
 }
 
+// The vertex shader's position output: x/y scale and offset (c18), and Z as
+// z * c19.x + c19.y * w. Perfect Dark's viewport maps depth backwards (MinZ 1,
+// MaxZ 0); the renderer turns that into a forward viewport with Z flipped here
+// (c19 = -1, 1), as the classic renderer does (SDK util/draw.cpp), instead of a
+// reversed host viewport, which Direct3D 12 does not officially allow.
+//
+// Before that, the user clip planes (PA_CL_UCP_0..5, enabled by PA_CL_CLIP_CNTL
+// bits 0-5; c19.z = the enabled bits, c20-c25 = the planes) as clip distances
+// from the game's own clip-space position, as the classic renderer does. Issue
+// #25: Perfect Dark cuts an open sliding door with a clip plane at the wall it
+// slides into; without it the hidden part came through the wall.
+constexpr char kPositionOut[] =
+    "{ const float4 guestPos = oPos; "
+    "oClip0 = float4(g_NativeClipDist(0, guestPos), g_NativeClipDist(1, guestPos), "
+    "g_NativeClipDist(2, guestPos), g_NativeClipDist(3, guestPos)); "
+    "oClip1 = float2(g_NativeClipDist(4, guestPos), g_NativeClipDist(5, guestPos)); } "
+    "oPos.xy = oPos.xy * g_NativePosScale + g_NativePosOffset * oPos.w; "
+    "oPos.z = oPos.z * g_NativeDepthFlip.x + g_NativeDepthFlip.y * oPos.w;";
+
+constexpr char kClipDistMacro[] =
+    "#define g_NativeClipDist(i, p) (((g_NativeClipMask >> (i)) & 1u) != 0 ? dot((p), g_NativeUcp(i)) : 1.0)\n";
+
+// A vertex shader's clip distance outputs, after its last output (the pixel
+// shaders' inputs keep their places), set to "not clipped" first.
+void add_clip_outputs(std::string& text) {
+  const size_t pos = text.find("out float4 oPos : SV_Position");
+  if (pos == std::string::npos) return;
+  const size_t close = text.find(")\n{\n", pos);
+  if (close == std::string::npos) return;
+  text.replace(close, 4,
+               ",\n\tout float4 oClip0 : SV_ClipDistance0,\n\tout float2 oClip1 : SV_ClipDistance1)\n{\n"
+               "\toClip0 = 1.0;\n\toClip1 = 1.0;\n");
+}
+
 // The HLSL the renderer needs, as GoldenEye's native/translate_shaders.ps1 makes it: the
 // spec constants and position scale/offset come from the shared constants
 // (c17.y, c18), alpha test is always compiled in (threshold 0 = off).
 std::string patch_hlsl(std::string text, bool spirv) {
+  add_clip_outputs(text);
   if (spirv) {
     // XenosRecomp's Vulkan side: constants through buffer addresses in push
     // constants. The same shared fields (c17.y, c18) as below, and the spec
@@ -112,17 +151,21 @@ std::string patch_hlsl(std::string text, bool spirv) {
                  "#define g_NativeSpecConstants vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276)\n"
                  "#define g_NativePosScale vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 288)\n"
                  "#define g_NativePosOffset vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 296)\n"
+                 "#define g_NativeDepthFlip vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 304)\n"
+                 "#define g_NativeClipMask vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 312)\n"
+                 "#define g_NativeUcp(i) vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 320 + 16 * (i))\n"
                  "#define g_SpecConstants() g_NativeSpecConstants");
-    replace_once(text, "oPos.xy += g_HalfPixelOffset * oPos.w;",
-                 "oPos.xy = oPos.xy * g_NativePosScale + g_NativePosOffset * oPos.w;");
-    return text;
+    replace_once(text, "oPos.xy += g_HalfPixelOffset * oPos.w;", kPositionOut);
+    return kClipDistMacro + text;
   }
   replace_once(text, "float g_AlphaThreshold : packoffset(c17.x);",
                "float g_AlphaThreshold : packoffset(c17.x); \\\n    uint g_NativeSpecConstants : packoffset(c17.y); \\\n"
-               "    float2 g_NativePosScale : packoffset(c18.x); \\\n    float2 g_NativePosOffset : packoffset(c18.z);");
-  replace_once(text, "oPos.xy += g_HalfPixelOffset * oPos.w;",
-               "oPos.xy = oPos.xy * g_NativePosScale + g_NativePosOffset * oPos.w;");
-  return text + "\nuint g_SpecConstants() { return g_NativeSpecConstants; }\n";
+               "    float2 g_NativePosScale : packoffset(c18.x); \\\n    float2 g_NativePosOffset : packoffset(c18.z); \\\n"
+               "    float2 g_NativeDepthFlip : packoffset(c19.x); \\\n    uint g_NativeClipMask : packoffset(c19.z); \\\n"
+               "    float4 g_NativeUcpArr[6] : packoffset(c20);");
+  replace_once(text, "oPos.xy += g_HalfPixelOffset * oPos.w;", kPositionOut);
+  return std::string(kClipDistMacro) + "#define g_NativeUcp(i) g_NativeUcpArr[i]\n" + text +
+         "\nuint g_SpecConstants() { return g_NativeSpecConstants; }\n";
 }
 
 // Bytes of its constant buffer a shader reads: the highest register its

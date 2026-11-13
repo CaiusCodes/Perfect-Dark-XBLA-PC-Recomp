@@ -76,8 +76,13 @@ void PdInstallCrashReport();
 void PdPreferPerformanceCores();
 REXCVAR_DECLARE(bool, pd_story_complete);
 REXCVAR_DECLARE(bool, pd_frame_stats);
+REXCVAR_DECLARE(bool, pd_trace_stick_look);
+REXCVAR_DECLARE(bool, pd_test_camspy_mouse);
+REXCVAR_DECLARE(bool, pd_keyboard_prompts);
 REXCVAR_DECLARE(bool, pd_menu_mouse);
 REXCVAR_DECLARE(int32_t, pd_mp_facing_delay_ms);
+REXCVAR_DECLARE(int32_t, pd_deadzone_right);
+REXCVAR_DECLARE(int32_t, pd_deadzone_left);
 REXCVAR_DECLARE(double, pd_shine);
 REXCVAR_DECLARE(bool, pd_view_bob);
 REXCVAR_DECLARE(bool, pd_light_capture);
@@ -663,6 +668,21 @@ class PerfectDarkApp : public rex::ReXApp {
   // focus before trusting GetAsyncKeyState/XInput, which both read
   // system-wide input state rather than state scoped to this window.
   bool HasWindowFocus() const { return window() && window()->HasFocus(); }
+
+  // The game ended itself (Exit Game on the main menu): its main thread has
+  // returned. The SDK then quits the UI loop and tears everything down, and
+  // that teardown never finished: the window went, the process stayed (seen
+  // twice in the user's play test of 0.9.1b; a hidden leftover each time a
+  // player quits from the menu). Closing the window has always hard-exited
+  // instead (ReXApp::OnClosing: the teardown "can deadlock on a host lock still
+  // held by a straggler"), so this does the same. Settings and saves are
+  // written when they change, not at exit, so nothing is lost.
+  void OnGuestThreadExit(rex::system::XThread* thread) override {
+    (void)thread;
+    REXLOG_INFO("The game has ended; exiting the process.");
+    rex::FlushLogging();
+    std::_Exit(0);
+  }
 
   // The guest's own "Gamer profile not online" screen (Connect to Xbox LIVE /
   // Continue playing offline) gates on the local profile's signin state; the
@@ -1958,7 +1978,7 @@ class PerfectDarkApp : public rex::ReXApp {
     if (open) {
       menu_open_at_ = now;
       menu_ever_open_ = true;
-      institute_menu_pending_ = false;
+      if (institute_menu_pending_.exchange(false)) REXLOG_INFO("[input] a menu opened: mouse aim allowed again");
     }
     if (!open) {
       // Menus swap dialogs as you move through them, and for a frame or two
@@ -3622,6 +3642,128 @@ class PerfectDarkApp : public rex::ReXApp {
     ctx.r3.u64 = ret;
   }
 
+  // ---- Stick dead zones (issue #23) ----------------------------------------
+  // The game's own dead zone (sub_8225D9F8, HANDOVER 4bx) ignores each stick
+  // axis up to 10000 of 32767 (30.5%) and scales the rest by 80/22767, so full
+  // deflection is 80 N64 stick units. pd_deadzone_right / pd_deadzone_left
+  // (percent, 0-30; 30 = the game's own, which leaves the stick as it is) make
+  // it smaller for controllers: an axis past the chosen dead zone is moved past
+  // the game's 10000, its travel spread over the rest, so the game's scaling
+  // still goes from 0 to 80 and full deflection is unchanged. Per axis like the
+  // game's (a round zone would let a small sideways wobble trip the game's
+  // digital stick directions, which some control styles use as C-buttons).
+  // Applied to each input driver's state before the SDK merges them (SDK
+  // SetGamepadFilterCallback), so keyboard and mouse (the MnK driver: keyboard
+  // movement, mouse on the CamSpy) keep the game's response; the test pipe's
+  // pad is treated as a controller. Before the merge also means it happens
+  // before a network match sends the pad on: other players' sticks are theirs.
+  static constexpr int kDeadZoneOriginal = 30;
+  static inline uint32_t deadzone_strings_ = 0;  // labels: right at +0, left at +32
+
+  // `start`: the raw value where the game first responds. Past the game's
+  // 10000 for most axes, but turning (the right stick's X) also ignores the
+  // first 15 of its 80 units: measured with the test pipe in Defection
+  // (2026-11-12, scen\dz-ladder*.txt), 15.1 units does not turn the view and
+  // 16.2 does, while looking up and down moves from 2 units. So the right X
+  // starts at 16 units (10000 + 16 * 22767 / 80 = 14554), or a small push
+  // would still do nothing.
+  static constexpr int16_t kStartGameZone = 10001;
+  static constexpr int16_t kStartTurn = 14554;
+
+  static int16_t ReshapeAxis(int16_t v, int pct, int16_t start) {
+    constexpr float kMax = 32767.0f;
+    const float zone = kMax * float(pct) / 100.0f;
+    const float a = std::fabs(float(v));
+    if (a <= zone) return 0;
+    const float t = std::min(1.0f, (a - zone) / (kMax - zone));
+    const float out = std::min(kMax, float(start) + t * (kMax - float(start)));
+    return int16_t(v < 0 ? -std::lround(out) : std::lround(out));
+  }
+
+  static void FilterGamepad(const rex::input::InputDriver& driver, uint32_t,
+                            rex::input::X_INPUT_GAMEPAD& pad) {
+    if (dynamic_cast<const rex::input::mnk::MnkInputDriver*>(&driver)) {
+      // The mouse on the CamSpy (StickLookActive): its height in kicks.
+      if (camspy_mouse_height_) pad.thumb_ry = CamSpyHeight(pad.thumb_ry);
+      return;
+    }
+    // Test: the test pipe's pad stands in for the mouse (test windows have none).
+    if (REXCVAR_GET(pd_test_camspy_mouse)) {
+      const char* target = StickLookTarget();
+      if (target && std::string_view(target) == "the CamSpy") pad.thumb_ry = CamSpyHeight(pad.thumb_ry);
+    }
+    const int right = std::clamp(int(REXCVAR_GET(pd_deadzone_right)), 0, kDeadZoneOriginal);
+    const int left = std::clamp(int(REXCVAR_GET(pd_deadzone_left)), 0, kDeadZoneOriginal);
+    if (right < kDeadZoneOriginal) {
+      pad.thumb_rx = ReshapeAxis(pad.thumb_rx, right, kStartTurn);
+      pad.thumb_ry = ReshapeAxis(pad.thumb_ry, right, kStartGameZone);
+    }
+    if (left < kDeadZoneOriginal) {
+      pad.thumb_lx = ReshapeAxis(pad.thumb_lx, left, kStartGameZone);
+      pad.thumb_ly = ReshapeAxis(pad.thumb_ly, left, kStartGameZone);
+    }
+  }
+
+  // Registered once the runtime's input system exists (TickInput, every frame).
+  static void EnsureGamepadFilter() {
+    static bool done = false;
+    if (done) return;
+    PerfectDarkApp* app = current_instance_;
+    auto* input = app && app->runtime()
+                      ? dynamic_cast<rex::input::InputSystem*>(app->runtime()->input_system())
+                      : nullptr;
+    if (!input) return;
+    input->SetGamepadFilterCallback(&FilterGamepad);
+    done = true;
+    REXLOG_INFO("[input] controller dead zones: right {}%, left {}% ({} is the game's own)",
+                int(REXCVAR_GET(pd_deadzone_right)), int(REXCVAR_GET(pd_deadzone_left)),
+                kDeadZoneOriginal);
+  }
+
+  static void PdLabelDeadZoneRight(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = deadzone_strings_; }
+  static void PdLabelDeadZoneLeft(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = deadzone_strings_ + 32; }
+
+  // A slider, as Mouse Sensitivity: 0 to 30 in steps of 1, the value shown
+  // beside it ("Original" at 30). Ops as PdMouseSensHandler.
+  template <bool kRight>
+  static void PdDeadZoneHandler(PPCContext& ctx, uint8_t*) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const char* name = kRight ? "pd_deadzone_right" : "pd_deadzone_left";
+    const uint32_t op = ctx.r3.u32;
+    const uint32_t data = ctx.r5.u32;
+    switch (op) {
+      case 9:  // slider position
+        if (mem && data) {
+          const int v = kRight ? int(REXCVAR_GET(pd_deadzone_right)) : int(REXCVAR_GET(pd_deadzone_left));
+          WriteGuestU32(mem, data, uint32_t(std::clamp(v, 0, kDeadZoneOriginal)));
+        }
+        break;
+      case 6: {  // moved
+        if (!mem || !data) break;
+        const std::string value = std::to_string(std::min<uint32_t>(ReadGuestU32(mem, data), kDeadZoneOriginal));
+        if (rex::cvar::GetFlagByName(name) != value && rex::cvar::SetFlagByName(name, value)) {
+          SavePcSettings();
+        }
+        break;
+      }
+      case 10: {  // the text shown with the slider (into the buffer data + 4 points at)
+        const uint32_t buffer = mem && data ? ReadGuestU32(mem, data + 4) : 0;
+        if (buffer >= 0x40000000) {
+          const uint32_t step = std::min<uint32_t>(ReadGuestU32(mem, data), kDeadZoneOriginal);
+          char buf[16];
+          if (step == uint32_t(kDeadZoneOriginal)) snprintf(buf, sizeof(buf), "Original");
+          else snprintf(buf, sizeof(buf), "%u%%", step);
+          WriteGuestBytes(mem, buffer, buf, strlen(buf) + 1);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    ctx.r3.u64 = 0;
+  }
+
   static bool GetPcInvertLook() {
     std::string value = rex::cvar::GetFlagByName("mnk_invert_y");
     return value == "true" || value == "1";
@@ -4622,13 +4764,71 @@ class PerfectDarkApp : public rex::ReXApp {
   static constexpr float kStickLookGain = 1.25f;
   static void SetStickLookResponseFor(const char* target) {
     using rex::input::mnk::MnkInputDriver;
-    if (target && std::string_view(target) == "the CamSpy") {
-      MnkInputDriver::SetStickLookResponse(kPadDeadZone + int32_t(10 * kRawPerStickUnit),
-                                           kPadDeadZone + int32_t(20 * kRawPerStickUnit), kStickLookGain);
+    const bool camspy = target && std::string_view(target) == "the CamSpy";
+    camspy_mouse_height_ = camspy;
+    if (camspy) {
+      // Up and down: no lift (start 0); FilterGamepad turns the mouse's
+      // vertical movement into height kicks (CamSpyHeight).
+      MnkInputDriver::SetStickLookResponse(kPadDeadZone + int32_t(10 * kRawPerStickUnit), 0, kStickLookGain);
     } else {
       MnkInputDriver::SetStickLookResponse(kPadDeadZone + int32_t(kRawPerStickUnit),
                                            kPadDeadZone + int32_t(kRawPerStickUnit), kStickLookGain);
     }
+  }
+
+  // Test (pd_trace_stick_look), every drawn frame: the CamSpy's turn and height
+  // (eyespy +0x1C theta, +0x60 height above the floor, 80 to 160) while it is
+  // out, to measure how it answers the right stick (test windows have no
+  // keyboard or mouse). Its +0x28 (the decomp's verta) never moved.
+  static void TraceStickLook() {
+    if (!REXCVAR_GET(pd_trace_stick_look)) return;
+    const char* target = StickLookTarget();
+    if (!target) return;
+    auto* mem = current_instance_->runtime()->memory();
+    const uint32_t eyespy = ReadGuestU32(mem, ReadGuestU32(mem, kPlayerPtrGlobal) + kPlayerEyespy);
+    if (eyespy < 0x40000000 || eyespy >= 0x50000000) return;
+    REXLOG_INFO("[stick-look] {} theta {:.4f} height {:.3f}", target, ReadGuestF32(mem, eyespy + 0x1C),
+                ReadGuestF32(mem, eyespy + 0x60));
+  }
+
+  // The CamSpy's up and down is its height (eyespy +0x60, 80 to 160), not a
+  // pitch: measured with the test pipe (scen\cs-resp2.txt), any right-stick Y
+  // past the game's 10000 starts it climbing or sinking with momentum, at the
+  // same rate from 10200 to 13500, and one frame at 16000 moves it ~5 of its 80.
+  // 4bx's lift put every mouse count past that (it took the 20 units of
+  // bondeyespy.c's pitch zone for this axis), so each count of vertical jitter
+  // while turning kicked the CamSpy up or down: it bounced (user, 2026-11-13).
+  // Now the mouse's vertical movement is summed and spent in kicks: one kick
+  // (a frame just past the dead zone) per kCamSpyKickRaw of movement, jitter
+  // cancels out, and leftovers are dropped after a quarter second of no
+  // vertical movement. A big flick (a full stick or more in one poll, or the
+  // right-stick keys) passes as it is.
+  static constexpr int32_t kCamSpyKickRaw = 8000;  // ~21 counts at sensitivity 1.5
+  static constexpr int16_t kCamSpyKickValue = int16_t(kPadDeadZone + 2 * kRawPerStickUnit);
+  static inline std::atomic<bool> camspy_mouse_height_{false};
+  static int16_t CamSpyHeight(int16_t v) {
+    static int32_t sum = 0;
+    static auto last_move = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (std::abs(int32_t(v)) >= 32000) {
+      sum = 0;
+      return v;
+    }
+    if (v != 0) {
+      sum = std::clamp(sum + int32_t(v), -3 * kCamSpyKickRaw, 3 * kCamSpyKickRaw);
+      last_move = now;
+    } else if (now - last_move > std::chrono::milliseconds(250)) {
+      sum = 0;
+    }
+    if (sum >= kCamSpyKickRaw) {
+      sum -= kCamSpyKickRaw;
+      return kCamSpyKickValue;
+    }
+    if (sum <= -kCamSpyKickRaw) {
+      sum += kCamSpyKickRaw;
+      return int16_t(-kCamSpyKickValue);
+    }
+    return 0;
   }
 
   // Guest thread, once per input poll (MnkInputDriver::SetStickLookQuery).
@@ -4964,13 +5164,37 @@ class PerfectDarkApp : public rex::ReXApp {
   // starts again at each load - found by sampling g_Vars over the title loop)
   // going back: Return to Main Menu from inside the Institute reloads stage 38
   // without the number changing (user, 2026-10-27).
-  static void NoteGameStage(uint32_t stage, uint32_t level_frames) {
+  //
+  // Not every load ends in a menu: aborting a Device Lab test (the CamSpy's)
+  // puts Joanna back in the Institute to walk about, and the aim stayed held
+  // with no menu coming to release it (user, 2026-11-13: "mouse locked"). The
+  // walk-in before the main menu is a cutscene (tick mode 6) and the menu
+  // opens on the frame play resumes (measured: 17 ms after tick mode 1), so
+  // half a second of ordinary play with control and no menu means the player
+  // is simply walking: the aim is let go then.
+  static constexpr uint32_t kInstituteFreeAfterFrames = 30;
+  static void NoteGameStage(uint32_t stage, uint32_t level_frames, uint8_t control, uint32_t tick_mode) {
     static uint32_t last_stage = 0;
     static uint32_t last_frames = 0;
+    static uint8_t last_control = 0xFF;
+    static uint32_t playing_frames = 0;
     const bool reloaded = stage != last_stage || level_frames < last_frames;
     last_stage = stage;
     last_frames = level_frames;
-    if (reloaded && stage == kStageInstitute) institute_menu_pending_ = true;
+    if (reloaded && stage == kStageInstitute) {
+      institute_menu_pending_ = true;
+      playing_frames = 0;
+      REXLOG_INFO("[input] Carrington Institute loaded: no mouse aim until a menu opens");
+    }
+    if (control != last_control) {
+      REXLOG_INFO("[input] player control {} (stage {}, frame {})", control, stage, level_frames);
+      last_control = control;
+    }
+    if (institute_menu_pending_) {
+      playing_frames = control != 0 && tick_mode == kTickModeNormal && !menu_mouse_active_ ? playing_frames + 1 : 0;
+      if (playing_frames >= kInstituteFreeAfterFrames && institute_menu_pending_.exchange(false))
+        REXLOG_INFO("[input] walking in the Institute with no menu: mouse aim allowed again");
+    }
   }
  private:
   // The Carrington Institute (the menus' stage) has loaded and no menu has
@@ -5770,7 +5994,99 @@ class PerfectDarkApp : public rex::ReXApp {
     return false;
   }
 
+  // ---- Keys in place of button icons in the game's text ---------------------
+  // Tips and instructions name buttons with tokens the text renderer draws as
+  // icons ("Press #A# next to door to call elevator."; the parser is
+  // sub_82234C58). Without a gamepad an A button means nothing, so while none is
+  // connected each token is written as the key bound to that button: "[E]".
+  // Done where the game looks a string up (sub_8226C9F0, both returns): the
+  // string it found is swapped for a copy with the tokens replaced, so it works
+  // in every language and nothing matches English text. The copies live in the
+  // system heap, one per game string (kept for as long as that string is the
+  // same; a new stage can put different text at the same address). With a pad
+  // connected the game's own strings, and its icons, are back at once.
+  // Tokens (all those in the game's text, `texttokens` in the test pipe) and the
+  // button each one draws (checked on screen, scen\glyphs.txt): #Q# draws LB and
+  // #SFR# draws RB; #BK# (Back) is in one string; #LS# / #RS# in none.
+  struct KeyToken {
+    const char* token;
+    const char* bind;
+  };
+  static constexpr KeyToken kKeyTokens[] = {
+      {"#A#", "keybind_a"},
+      {"#B#", "keybind_b"},
+      {"#X#", "keybind_x"},
+      {"#Y#", "keybind_y"},
+      {"#LB#", "keybind_left_shoulder"},
+      {"#Q#", "keybind_left_shoulder"},
+      {"#RB#", "keybind_right_shoulder"},
+      {"#SFR#", "keybind_right_shoulder"},
+      {"#LT#", "keybind_left_trigger"},
+      {"#RT#", "keybind_right_trigger"},
+      {"#LS#", "keybind_lstick_press"},
+      {"#RS#", "keybind_rstick_press"},
+      {"#BK#", "keybind_back"},
+  };
+  // -1 not checked yet (the game's text as it is), 0 no gamepad, 1 a gamepad.
+  static inline std::atomic<int> pad_present_{-1};
+  struct KeyText {
+    std::string original;  // the game's string when the copy was made
+    std::string binds;     // the binds it was made with
+    uint32_t copy = 0;     // guest address of the copy, 0 = nothing to replace
+  };
+  static inline std::mutex key_text_mutex_;
+  static inline std::unordered_map<uint32_t, KeyText> key_texts_;
+
+  // Guest thread, every text lookup (PdTextForDisplay): the string to show.
+  static uint32_t KeyboardTextFor(uint32_t ptr) {
+    if (pad_present_.load(std::memory_order_relaxed) != 0 || !REXCVAR_GET(pd_keyboard_prompts)) return ptr;
+    if (ptr < 0x30000000 || ptr >= 0xA0000000) return ptr;  // not a string (the game's, or OverrideText's)
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = app && app->runtime() ? app->runtime()->memory() : nullptr;
+    const char* p = mem ? mem->TranslateVirtual<const char*>(ptr) : nullptr;
+    if (!p) return ptr;
+    const size_t n = strnlen(p, 4096);
+    if (!std::memchr(p, '#', n)) return ptr;
+    std::string binds;
+    for (const KeyToken& t : kKeyTokens) binds += rex::cvar::GetFlagByName(t.bind) + "|";
+    std::lock_guard<std::mutex> lock(key_text_mutex_);
+    KeyText& e = key_texts_[ptr];
+    if (e.binds == binds && e.original.size() == n && std::memcmp(e.original.data(), p, n) == 0)
+      return e.copy ? e.copy : ptr;
+    e.original.assign(p, n);
+    e.binds = binds;
+    e.copy = 0;
+    std::string text = e.original;
+    bool changed = false;
+    for (const KeyToken& t : kKeyTokens) {
+      const std::string keys = FormatBinding(rex::cvar::GetFlagByName(t.bind));
+      if (keys == "-") continue;  // nothing bound: the icon stays
+      const std::string shown = "[" + keys + "]";
+      for (size_t at = text.find(t.token); at != std::string::npos; at = text.find(t.token, at + shown.size())) {
+        text.replace(at, std::strlen(t.token), shown);
+        changed = true;
+      }
+    }
+    if (!changed || key_texts_.size() > 4096) return ptr;
+    const uint32_t copy = mem->SystemHeapAlloc(uint32_t(text.size() + 1));
+    if (!copy) return ptr;
+    WriteGuestBytes(mem, copy, text.c_str(), text.size() + 1);  // with its NUL
+    e.copy = copy;
+    return copy;
+  }
+
   static void TickControllerPrompts() {
+    {  // whether a gamepad is connected, for KeyboardTextFor (once a second)
+      static std::chrono::steady_clock::time_point next_check{};
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= next_check) {
+        next_check = now + std::chrono::seconds(1);
+        const int present = GamepadConnected() ? 1 : 0;
+        if (pad_present_.exchange(present) != present)
+          REXLOG_INFO("[input] {}", present ? "gamepad connected: button icons in the game's text"
+                                            : "no gamepad: keys in place of button icons in the game's text");
+      }
+    }
     // After the start-up patches, so the snapshot has the player-info
     // prompts already gone and putting the table back cannot return them.
     if (!menu_patched_ || prompt_state_ == 2) return;
@@ -6061,6 +6377,69 @@ class PerfectDarkApp : public rex::ReXApp {
           if (com) CoUninitialize();
           REXLOG_INFO("[test] wshot {} {}x{}", name, w, h);
         }).detach();
+      } else if (c.verb == "findtext") {  // findtext <word>: every loaded text id whose string has it, bytes escaped
+        const std::string word = arg(0);
+        int found = 0;
+        for (uint32_t tid = 0x200; tid < 0xA000 && found < 40; ++tid) {
+          const uint32_t ptr = GuestTextAddress(mem, tid);
+          const auto* p = ptr ? mem->TranslateVirtual<const uint8_t*>(ptr) : nullptr;
+          if (!p) continue;
+          std::string raw;
+          for (int i = 0; i < 400 && p[i]; ++i) raw += char(p[i]);
+          if (word.empty() || raw.find(word) == std::string::npos) continue;
+          std::string shown;
+          for (unsigned char ch : raw)
+            shown += ch >= 0x20 && ch < 0x7F ? std::string(1, char(ch)) : fmt::format("\\x{:02X}", ch);
+          REXLOG_INFO("[test] text {:04X} at {:08X}: {}", tid, ptr, shown);
+          ++found;
+        }
+        REXLOG_INFO("[test] findtext {}: {} found", word, found);
+      } else if (c.verb == "retext") {  // retext <string> <text...>: loaded strings that are exactly <string> ('_' for spaces) show <text>
+        std::string text, want = arg(0);
+        for (size_t i = 1; i < c.args.size(); ++i) text += (i > 1 ? " " : "") + c.args[i];
+        for (char& ch : want) if (ch == '_') ch = ' ';
+        for (char& ch : text) if (ch == '_') ch = ' ';
+        for (uint32_t tid = 0x200; tid < 0xA000; ++tid) {
+          const uint32_t ptr = GuestTextAddress(mem, tid);
+          const auto* p = ptr ? mem->TranslateVirtual<const char*>(ptr) : nullptr;
+          if (!p || (want != p && want + "\n" != p)) continue;
+          REXLOG_INFO("[test] retext {:04X}: {}", tid, OverrideText(mem, tid, (text + "\n").c_str()) ? "done" : "failed");
+        }
+      } else if (c.verb == "findmem") {  // findmem <ascii>: where the bytes are in the game image (0x82000000-0x82660000)
+        const std::string word = arg(0);
+        const auto* img = mem->TranslateVirtual<const uint8_t*>(0x82000000);
+        int found = 0;
+        for (uint32_t o = 0; img && !word.empty() && o + word.size() < 0x660000 && found < 20; ++o) {
+          if (std::memcmp(img + o, word.data(), word.size()) != 0) continue;
+          std::string around;
+          for (int k = -16; k < 32; ++k) {
+            const uint8_t ch = img[o + k];
+            around += ch >= 0x20 && ch < 0x7F ? std::string(1, char(ch)) : std::string(".");
+          }
+          REXLOG_INFO("[test] mem {:08X}: {}", 0x82000000 + o, around);
+          ++found;
+        }
+        REXLOG_INFO("[test] findmem {}: {} found", word, found);
+      } else if (c.verb == "texttokens") {  // texttokens: the #...# button tokens in all loaded text, with counts
+        std::map<std::string, int> tokens;
+        std::map<std::string, uint32_t> example;
+        for (uint32_t tid = 0x200; tid < 0xA000; ++tid) {
+          const uint32_t ptr = GuestTextAddress(mem, tid);
+          const auto* p = ptr ? mem->TranslateVirtual<const uint8_t*>(ptr) : nullptr;
+          if (!p) continue;
+          for (int i = 0; i < 1000 && p[i]; ++i) {
+            if (p[i] != '#') continue;
+            int j = i + 1;
+            while (j < i + 12 && p[j] && p[j] != '#' && p[j] != '\n' && p[j] != ' ') ++j;
+            if (p[j] == '#' && j > i + 1) {
+              const std::string t(reinterpret_cast<const char*>(p + i), j - i + 1);
+              if (!tokens[t]++) example[t] = tid;
+              i = j;
+            }
+          }
+        }
+        for (const auto& [t, n] : tokens) REXLOG_INFO("[test] token {} x{} (e.g. text {:04X})", t, n, example[t]);
+        REXLOG_INFO("[test] texttokens: {} kinds", tokens.size());
       } else if (c.verb == "log") {
         std::string text;
         for (const auto& a : c.args) text += a + " ";
@@ -6383,6 +6762,11 @@ class PerfectDarkApp : public rex::ReXApp {
           WriteGuestBytes(mem, sharp_strings_ + 32 + uint32_t(i) * 16, kSharpLevelNames[i],
                           strlen(kSharpLevelNames[i]) + 1);
         }
+      }
+      if (!deadzone_strings_) deadzone_strings_ = mem->SystemHeapAlloc(64);
+      if (deadzone_strings_) {
+        WriteGuestBytes(mem, deadzone_strings_, "Right Stick Dead Zone\n", 23);
+        WriteGuestBytes(mem, deadzone_strings_ + 32, "Left Stick Dead Zone\n", 22);
       }
       if (!api_strings_) api_strings_ = mem->SystemHeapAlloc(64 + 2 * 32);
       if (api_strings_) {
@@ -7050,6 +7434,12 @@ class PerfectDarkApp : public rex::ReXApp {
     auto* mem = app->runtime()->memory();
     constexpr uint32_t kTypeEnd = 0x1D;
     constexpr uint32_t kLayoutTid = 0x5672;  // "Button Layout" (see the Settings patch)
+    // The dead zone sliders' label and handler thunks.
+    auto* fd = app->runtime()->function_dispatcher();
+    const uint32_t dz_right_label = fd ? fd->AllocateThunk(&PdLabelDeadZoneRight, 0) : 0;
+    const uint32_t dz_left_label = fd ? fd->AllocateThunk(&PdLabelDeadZoneLeft, 0) : 0;
+    const uint32_t dz_right = fd && dz_right_label ? fd->AllocateThunk(&PdDeadZoneHandler<true>, 0) : 0;
+    const uint32_t dz_left = fd && dz_left_label ? fd->AllocateThunk(&PdDeadZoneHandler<false>, 0) : 0;
     int help = 0, layout = 0;
     std::map<uint32_t, uint32_t> relocated;
     ForEachCommittedRegion(mem, [&](uint32_t region_addr, uint32_t region_size) {
@@ -7096,12 +7486,19 @@ class PerfectDarkApp : public rex::ReXApp {
           continue;
         }
 
-        // Gamepad option screens without a way to the picture.
-        if (ReadGuestU32(mem, a + 4) != kGamepadOptionsTitle || controls >= 0) continue;
+        // Gamepad option screens: a Button Layout row where there is no way to
+        // the picture yet, and the two stick dead zone sliders (issue #23),
+        // above the last row.
+        if (ReadGuestU32(mem, a + 4) != kGamepadOptionsTitle) continue;
         auto it = relocated.find(items);
         if (it == relocated.end()) {
           std::vector<std::array<uint32_t, 5>> built(rows.begin(), rows.end() - 1);
-          built.push_back({0x04000000, 0x00000004, kLayoutTid, 0, kButtonLayoutDialog});
+          if (controls < 0) built.push_back({0x04000000, 0x00000004, kLayoutTid, 0, kButtonLayoutDialog});
+          if (dz_right && dz_left && deadzone_strings_) {
+            // Slider rows as Mouse Sensitivity's: type 0x08, value shown, 30 steps.
+            built.push_back({0x08000000, 0x00100000, dz_right_label, uint32_t(kDeadZoneOriginal), dz_right});
+            built.push_back({0x08000000, 0x00100000, dz_left_label, uint32_t(kDeadZoneOriginal), dz_left});
+          }
           built.push_back(rows.back());
           const uint32_t dest = mem->SystemHeapAlloc(uint32_t(built.size() + 1) * 20);
           if (!dest) continue;
@@ -7111,8 +7508,8 @@ class PerfectDarkApp : public rex::ReXApp {
           WriteGuestU32(mem, term, kTypeEnd << 24);
           for (int w = 1; w < 5; ++w) WriteGuestU32(mem, term + w * 4, 0);
           it = relocated.emplace(items, dest).first;
-          REXLOG_INFO("[menu_patch] Gamepad options array 0x{:08X} -> 0x{:08X}: Button Layout added",
-                      items, dest);
+          REXLOG_INFO("[menu_patch] Gamepad options array 0x{:08X} -> 0x{:08X}: {}dead zone rows added",
+                      items, dest, controls < 0 ? "Button Layout and " : "");
         }
         WriteGuestU32(mem, a + 8, it->second);
         ++layout;
@@ -7768,6 +8165,7 @@ class PerfectDarkApp : public rex::ReXApp {
       if (forced_gpu_ == "vulkan" && !pd::native_vk::VulkanUsable(why)) {
         // (The setting stays Vulkan: Settings > Graphics shows it as waiting.)
         REXLOG_WARN("[native] Graphics API Vulkan cannot run here ({}): using DirectX 12", why);
+        vulkan_fallback_reason_ = why;
         forced_gpu_ = "d3d12";
       }
       running_api_index_ = forced_gpu_ == "vulkan" ? 1 : 0;
@@ -7872,11 +8270,37 @@ class PerfectDarkApp : public rex::ReXApp {
   static inline int pending_api_index_ = -1;
   static constexpr const char* kApiNames[2] = {"DirectX 12\n", "Vulkan\n"};
   static constexpr const char* kApiRestartNames[2] = {"DirectX 12 (requires restart)\n", "Vulkan (requires restart)\n"};
-  static int ApiChoice() { return rex::cvar::GetFlagByName("gpu_native_api") == "vulkan" ? 1 : 0; }
+  // gpu_native_api = vulkan or d3d12 is the menu's choice. Left at auto, the
+  // file's gpu line decides: the README of 0.9.0 to 0.9.1a told players to set
+  // gpu = "vulkan" there, which Plume used to ignore (issue #21's follow-up:
+  // "set it in config or ingame, and after reboot, still dx12"). The player's
+  // own gpu value is config_gpu_ (the cvar holds this run's forced one).
+  static int ApiChoice() {
+    const std::string api = rex::cvar::GetFlagByName("gpu_native_api");
+    if (api == "vulkan") return 1;
+    if (api == "d3d12") return 0;
+    const std::string gpu = config_gpu_.empty() ? rex::cvar::GetFlagByName("gpu") : config_gpu_;
+    return gpu == "vulkan" ? 1 : 0;
+  }
+
+  // Why Vulkan was chosen but DirectX 12 runs (empty when it doesn't), shown
+  // once in the game (TickVulkanNotice) as well as logged.
+  static inline std::string vulkan_fallback_reason_;
+
+  static void TickVulkanNotice() {
+    static bool shown = false;
+    static auto first = std::chrono::steady_clock::now();
+    if (shown || vulkan_fallback_reason_.empty()) return;
+    if (std::chrono::steady_clock::now() - first < std::chrono::seconds(8)) return;  // once the window is up
+    shown = true;
+    rex::kernel::xam::netplay::ShowNotice("Vulkan cannot run on this PC (" + vulkan_fallback_reason_ +
+                                          "), so the game uses DirectX 12.");
+  }
 
   static void ApplyApiIndex(int index) {
     if (index < 0 || index > 1) return;
-    rex::cvar::SetFlagByName("gpu_native_api", index ? "vulkan" : "auto");
+    // Explicit either way, so an old gpu = "vulkan" line can't override DirectX 12.
+    rex::cvar::SetFlagByName("gpu_native_api", index ? "vulkan" : "d3d12");
     SavePcSettings();
     if (index == running_api_index_ || running_renderer_ != 0) {
       pending_api_index_ = -1;
@@ -8675,6 +9099,9 @@ inline void PerfectDarkInputTracker::OnDraw(ImGuiIO& /*io*/) {
   PerfectDarkApp::TickTextOverrides();
   PerfectDarkApp::DrawTitleVersion();
   PerfectDarkApp::TickTestPipe();
+  PerfectDarkApp::EnsureGamepadFilter();
+  PerfectDarkApp::TraceStickLook();
+  PerfectDarkApp::TickVulkanNotice();
   if (app_) app_->TickMatchPicker();
   if (app_) app_->TickUpdateDialog();
 

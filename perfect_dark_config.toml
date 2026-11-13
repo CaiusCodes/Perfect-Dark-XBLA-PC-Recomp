@@ -277,3 +277,20 @@ return = true
 address = 0x822426B8
 name = "PdHookChooseTrack"
 return = true
+
+# ---- Text ---------------------------------------------------------------------------
+
+# Keys in place of button icons while no gamepad is connected (pd_keyboard_prompts):
+# the text lookup sub_8226C9F0, after the `lwzx r3` of each of its two paths, hands
+# the string to PdTextForDisplay ("Press #A# ..." -> "Press [E] ...").
+[[midasm_hook]]
+address = 0x8226CA24
+name = "PdHookTextLookup"
+registers = ["r3"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8226CA54
+name = "PdHookTextLookup"
+registers = ["r3"]
+after_instruction = true

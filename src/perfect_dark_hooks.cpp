@@ -41,6 +41,7 @@ void PdNetLookReceive(uint32_t record, uint32_t input);
 void PdNetLookSend(uint32_t input, uint32_t frame);
 void PdNetLookApply(uint32_t pad);
 void PdMpChooseTrack(PPCContext& ctx, uint8_t* base);
+uint32_t PdTextForDisplay(uint32_t text);
 
 namespace {
 // The calling guest thread's full context and guest memory, for a hook that needs
@@ -261,4 +262,12 @@ void PdHookNetLookApply(PPCRegister& r4) {
 // In place of the tail call to mpChooseTrack (config: return).
 void PdHookChooseTrack() {
   PdMpChooseTrack(HookContext(), HookBase());
+}
+
+// ---- Text ---------------------------------------------------------------------------
+
+// The game's text lookup (sub_8226C9F0) after each of its two `lwzx r3` (r3 = the
+// string): with no gamepad, a copy with the button icons written as keys.
+void PdHookTextLookup(PPCRegister& r3) {
+  r3.u64 = PdTextForDisplay(r3.u32);
 }

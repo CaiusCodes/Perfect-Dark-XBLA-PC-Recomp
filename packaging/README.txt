@@ -206,9 +206,13 @@ DISPLAY
 
   F12 saves a screenshot to resources\userdata\screenshots.
 
-  The graphics API is chosen automatically: Direct3D 12 on NVIDIA cards,
-  Vulkan on others. To pick one yourself, set gpu = "d3d12" or
-  gpu = "vulkan" in resources\userdata\perfect_dark.toml.
+  Settings > Graphics > Graphics API picks DirectX 12 or Vulkan. In
+  resources\userdata\perfect_dark.toml the same setting is
+  gpu_native_api = "d3d12" or "vulkan" (gpu = "vulkan" also picks Vulkan
+  when gpu_native_api is not set). If Vulkan cannot run on your PC, the game
+  says so and uses DirectX 12. With the Classic renderer (gpu_native = false),
+  gpu = "d3d12" or "vulkan" picks its API; otherwise it uses DirectX 12 on
+  NVIDIA cards and Vulkan on others.
 
   Vsync On shows each frame at the screen's next refresh, with no tearing
   and no added input lag; Off shows frames at once (lowest latency, may
