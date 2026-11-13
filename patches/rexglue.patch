@@ -515,7 +515,7 @@ index 4b76791..d8512c9 100644
      uint32_t address = UINT32_MAX;
      uint32_t size = UINT32_MAX;
 diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
-index 8f34d97..b8a445d 100644
+index 8f34d97..207af94 100644
 --- a/include/rex/input/input_system.h
 +++ b/include/rex/input/input_system.h
 @@ -10,6 +10,7 @@
@@ -526,7 +526,7 @@ index 8f34d97..b8a445d 100644
  #include <memory>
  #include <vector>
  
-@@ -37,6 +38,14 @@ class InputSystem : public system::IInputSystem {
+@@ -37,6 +38,22 @@ class InputSystem : public system::IInputSystem {
    void AttachWindow(rex::ui::Window* window);
    void SetActiveCallback(std::function<bool()> callback);
  
@@ -538,14 +538,23 @@ index 8f34d97..b8a445d 100644
 +  // bitmask exactly - this is a no-op for any title that doesn't call it.
 +  void SetButtonFilterCallback(std::function<uint16_t(uint16_t buttons)> callback);
 +
++  // Runs on each driver's state before the drivers are merged, so a title can
++  // reshape one kind of input alone (e.g. a stick dead zone for real
++  // controllers, leaving keyboard and mouse emulation untouched). Registering
++  // none leaves every state exactly as its driver gave it.
++  using GamepadFilter = std::function<void(const InputDriver& driver, uint32_t user_index,
++                                           X_INPUT_GAMEPAD& gamepad)>;
++  void SetGamepadFilterCallback(GamepadFilter callback);
++
    X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
    X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
    X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
-@@ -46,6 +55,7 @@ class InputSystem : public system::IInputSystem {
+@@ -46,6 +63,8 @@ class InputSystem : public system::IInputSystem {
    rex::ui::Window* window_ = nullptr;
  
    std::vector<std::unique_ptr<InputDriver>> drivers_;
 +  std::function<uint16_t(uint16_t buttons)> button_filter_callback_;
++  GamepadFilter gamepad_filter_callback_;
  };
  
  /// Create a default InputSystem with SDL + NOP drivers.
@@ -6170,7 +6179,7 @@ index b52ae15..1fa9396 100644
        if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
          assert_true(upload_buffer_previous != VK_NULL_HANDLE);
 diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
-index e132acb..3c94f5a 100644
+index e132acb..d6d84ed 100644
 --- a/src/input/input_system.cpp
 +++ b/src/input/input_system.cpp
 @@ -13,6 +13,7 @@
@@ -6181,12 +6190,16 @@ index e132acb..3c94f5a 100644
  #include <rex/input/flags.h>
  #include <rex/input/input_driver.h>
  #include <rex/input/input_system.h>
-@@ -57,9 +58,14 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+@@ -57,9 +58,18 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
    }
  }
  
 +void InputSystem::SetButtonFilterCallback(std::function<uint16_t(uint16_t buttons)> callback) {
 +  button_filter_callback_ = std::move(callback);
++}
++
++void InputSystem::SetGamepadFilterCallback(GamepadFilter callback) {
++  gamepad_filter_callback_ = std::move(callback);
 +}
 +
  X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
@@ -6196,7 +6209,7 @@ index e132acb..3c94f5a 100644
  
    bool any_connected = false;
    for (auto& driver : drivers_) {
-@@ -76,6 +82,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+@@ -76,6 +86,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
  
  X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
    SCOPE_profile_cpu_f("hid");
@@ -6204,7 +6217,17 @@ index e132acb..3c94f5a 100644
  
    bool any_connected = false;
    bool first_result = true;
-@@ -120,6 +127,10 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+@@ -88,6 +99,9 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+       any_connected = true;
+     }
+     if (result == X_ERROR_SUCCESS) {
++      if (gamepad_filter_callback_) {
++        gamepad_filter_callback_(*driver, user_index, state.gamepad);
++      }
+       if (first_result) {
+         merged = state;
+         first_result = false;
+@@ -120,6 +134,10 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
      return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
    }
  
@@ -6215,7 +6238,7 @@ index e132acb..3c94f5a 100644
    if (out_state) {
      *out_state = merged;
    }
-@@ -128,6 +139,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+@@ -128,6 +146,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
  
  X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
    SCOPE_profile_cpu_f("hid");
@@ -6223,7 +6246,7 @@ index e132acb..3c94f5a 100644
  
    bool any_connected = false;
    for (auto& driver : drivers_) {
-@@ -145,18 +157,28 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+@@ -145,18 +164,28 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
  X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                     X_INPUT_KEYSTROKE* out_keystroke) {
    SCOPE_profile_cpu_f("hid");
