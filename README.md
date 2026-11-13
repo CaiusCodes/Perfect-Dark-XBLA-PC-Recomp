@@ -42,7 +42,7 @@ Supported packages begin with `4287CC74` (original release) or `8292DB97` (re-re
 
 ### Graphics & Performance
 
-- **Native PC rendering** using Plume, with DirectX 12 or Vulkan
+- **Native PC rendering** using Plume, with DirectX 12 (the default) or Vulkan (Settings → Graphics → Graphics API)
 - **60 FPS** gameplay with improved frame pacing
 - **Up to 4K resolution** with fullscreen and windowed modes
 - **Render Scale:** 1x, 2x or 3x
@@ -54,8 +54,10 @@ Most graphics settings apply instantly; Render Scale and Graphics API restart th
 
 ### Controls & Quality of Life
 
-- Full **keyboard and mouse** support, including raw mouse input and rebindable keys
-- **Xbox controller** support
+- Full **keyboard and mouse** support, including raw mouse input, a Mouse Sensitivity slider and rebindable keys
+- The mouse steers the CamSpy, the hoverbike and the Slayer's guided rocket
+- On-screen tips show your keyboard keys when no controller is connected
+- **Xbox controller** support, with adjustable left and right stick dead zones
 - Native PC settings menus
 - Optional Auto-Aim
 - Skip cutscenes using mouse or controller
