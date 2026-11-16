@@ -1,3 +1,23 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 09ac897..190975a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -137,9 +137,14 @@ endif()
+ add_compile_definitions(REXGLUE_BUILD_CONFIG="$<CONFIG>")
+ 
+ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_version.cmake)
++# The SDK's own checkout, not CMAKE_SOURCE_DIR: when a game builds the SDK as
++# a subdirectory (a submodule), CMAKE_SOURCE_DIR is the game's repository and
++# its tags (e.g. a game's v0.9.1) became the SDK's version; codegen then took
++# the project's sdk_version as older and stopped at the migration prompt.
+ rex_resolve_version(REXGLUE_FULL_VERSION
+     FLOOR_MAJOR ${PROJECT_VERSION_MAJOR}
+-    FLOOR_MINOR ${PROJECT_VERSION_MINOR})
++    FLOOR_MINOR ${PROJECT_VERSION_MINOR}
++    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+ 
+ # Strip the -id trailer (if any) for the numeric-only version.
+ string(REGEX REPLACE "-.*$" "" REXGLUE_NUMERIC_VERSION "${REXGLUE_FULL_VERSION}")
 diff --git a/CMakePresets.json b/CMakePresets.json
 index dd51475..289c3d5 100644
 --- a/CMakePresets.json
