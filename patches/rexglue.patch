@@ -39,6 +39,33 @@ index 14f930b..9e92c6f 100644
          message(FATAL_ERROR "rex_compute_version: unparseable describe output '${ARG_GIT_DESCRIBE_LONG}'")
      endif()
      set(tag_major ${CMAKE_MATCH_1})
+diff --git a/include/rex/cvar.h b/include/rex/cvar.h
+index ed117c5..dc6b359 100644
+--- a/include/rex/cvar.h
++++ b/include/rex/cvar.h
+@@ -124,6 +124,22 @@ void FinalizeInit();
+ bool IsFinalized();
+ void SaveConfig(const std::filesystem::path& config_path);
+ 
++// What LoadConfig ran into, for the app to log and show once logging is up
++// (LoadConfig runs before the log opens). A setting written more than once is
++// read with the last value winning, as people editing the file expect, and
++// reported as kDuplicates; a file that still can't be read is left unused
++// (defaults apply), copied to `bad_copy` first, and reported as kUnreadable,
++// with the parser's line and message.
++struct ConfigLoadReport {
++  enum class Kind { kNone, kDuplicates, kUnreadable };
++  Kind kind = Kind::kNone;
++  std::vector<std::string> duplicate_keys;  // kDuplicates: each key once, in file order
++  int line = 0;                             // kUnreadable: 1-based, 0 if unknown
++  std::string error;                        // kUnreadable: the parser's message
++  std::filesystem::path bad_copy;           // kUnreadable: empty if the copy failed
++};
++ConfigLoadReport GetConfigLoadReport();
++
+ //=============================================================================
+ // Flag Registry
+ //=============================================================================
 diff --git a/include/rex/diag_timing.h b/include/rex/diag_timing.h
 new file mode 100644
 index 0000000..b9ee3f4
@@ -1722,10 +1749,18 @@ index ae72b7a..9d0302a 100644
    } else {
      // Wait until another thread has finished updating the clock.
 diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
-index a9e42f0..583db2e 100644
+index a9e42f0..9c34ec2 100644
 --- a/src/core/cvar.cpp
 +++ b/src/core/cvar.cpp
-@@ -60,6 +60,10 @@ std::unordered_map<std::string, size_t>& GetRegistryIndex() {
+@@ -12,6 +12,7 @@
+ #include <charconv>
+ #include <filesystem>
+ #include <fstream>
++#include <iterator>
+ #include <mutex>
+ #include <optional>
+ #include <string_view>
+@@ -60,6 +61,10 @@ std::unordered_map<std::string, size_t>& GetRegistryIndex() {
  struct PendingValues {
    std::optional<std::string> cmdline;
    std::optional<std::string> config;
@@ -1736,7 +1771,7 @@ index a9e42f0..583db2e 100644
  };
  
  std::unordered_map<std::string, PendingValues>& GetPendingValuesStorage() {
-@@ -67,6 +71,20 @@ std::unordered_map<std::string, PendingValues>& GetPendingValuesStorage() {
+@@ -67,6 +72,20 @@ std::unordered_map<std::string, PendingValues>& GetPendingValuesStorage() {
    return pending;
  }
  
@@ -1757,7 +1792,7 @@ index a9e42f0..583db2e 100644
  // Convert flag name to environment variable: gpu_vsync -> REX_GPU_VSYNC
  std::string FlagNameToEnvVar(std::string_view name) {
    std::string result = "REX_";
-@@ -97,6 +115,10 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
+@@ -97,6 +116,10 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
          REXLOG_WARN("Config: unsupported type for key '{}'", full_key);
          continue;
        }
@@ -1768,7 +1803,7 @@ index a9e42f0..583db2e 100644
  
        if (GetFlagInfo(full_key) == nullptr) {
          std::lock_guard lock(GetRegistryMutex());
-@@ -218,6 +240,7 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
+@@ -218,6 +241,7 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
      auto pending_it = pending.find(stored.name);
      if (pending_it != pending.end() && pending_it->second.cmdline) {
        stored.setter(*pending_it->second.cmdline);
@@ -1776,7 +1811,7 @@ index a9e42f0..583db2e 100644
      }
      auto env_value = rex::platform::env::get(FlagNameToEnvVar(stored.name));
      if (env_value.has_value()) {
-@@ -227,6 +250,11 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
+@@ -227,6 +251,11 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
        if (pending_it->second.config) {
          stored.setter(*pending_it->second.config);
        }
@@ -1788,7 +1823,7 @@ index a9e42f0..583db2e 100644
        pending.erase(pending_it);
      }
    }
-@@ -272,7 +300,11 @@ bool SetFlagByName(std::string_view name, std::string_view value) {
+@@ -272,7 +301,11 @@ bool SetFlagByName(std::string_view name, std::string_view value) {
    std::lock_guard lock(GetRegistryMutex());
    auto it = GetRegistryIndex().find(std::string(name));
    if (it == GetRegistryIndex().end()) {
@@ -1801,7 +1836,7 @@ index a9e42f0..583db2e 100644
    }
  
    const auto& entry = GetRegistryStorage()[it->second];
-@@ -336,6 +368,12 @@ std::string GetFlagByName(std::string_view name) {
+@@ -336,6 +369,12 @@ std::string GetFlagByName(std::string_view name) {
    std::lock_guard lock(GetRegistryMutex());
    auto it = GetRegistryIndex().find(std::string(name));
    if (it == GetRegistryIndex().end()) {
@@ -1814,7 +1849,7 @@ index a9e42f0..583db2e 100644
      return "";
    }
  
-@@ -475,26 +513,82 @@ bool HasNonDefaultValue(std::string_view name) {
+@@ -475,26 +514,82 @@ bool HasNonDefaultValue(std::string_view name) {
    return entry.getter() != entry.default_value;
  }
  
@@ -1901,7 +1936,7 @@ index a9e42f0..583db2e 100644
        }
      }
    }
-@@ -505,9 +599,9 @@ std::string SerializeToTOML(std::string_view category) {
+@@ -505,9 +600,9 @@ std::string SerializeToTOML(std::string_view category) {
    std::lock_guard lock(GetRegistryMutex());
    std::string result;
    for (const auto& entry : GetRegistryStorage()) {
@@ -1913,7 +1948,7 @@ index a9e42f0..583db2e 100644
        } else {
          result += entry.name + " = " + entry.getter() + "\n";
        }
-@@ -538,11 +632,18 @@ std::vector<std::string> Init(int argc, char** argv) {
+@@ -538,11 +633,18 @@ std::vector<std::string> Init(int argc, char** argv) {
      if (entry.type == FlagType::Boolean) {
        app.add_flag_function(
            "--" + entry.name + ",!--no-" + entry.name,
@@ -1934,6 +1969,179 @@ index a9e42f0..583db2e 100644
            entry.description);
      }
    }
+@@ -584,19 +686,123 @@ std::vector<std::string> Init(int argc, char** argv) {
+   return positional;
+ }
+ 
++namespace {
++std::mutex g_config_report_mutex;
++ConfigLoadReport g_config_report;
++
++// The bare key a `key = value` line sets (empty for anything else: comments,
++// table headers, continuation lines). Keys are what SaveConfig writes: letters,
++// digits, '_', '-' and '.'.
++std::string_view LineKey(std::string_view line) {
++  size_t i = 0;
++  while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
++  const size_t start = i;
++  while (i < line.size() && (std::isalnum(static_cast<unsigned char>(line[i])) || line[i] == '_' ||
++                             line[i] == '-' || line[i] == '.'))
++    ++i;
++  if (i == start) return {};
++  const size_t end = i;
++  while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
++  if (i >= line.size() || line[i] != '=') return {};
++  return line.substr(start, end - start);
++}
++
++// The file with every key set more than once (within the same table) kept at
++// its last line only; `dropped` gets each such key once, in file order. The
++// text is unchanged when nothing repeats.
++std::string DropEarlierDuplicates(const std::string& text, std::vector<std::string>& dropped) {
++  std::vector<std::string_view> lines;
++  for (size_t pos = 0; pos <= text.size();) {
++    const size_t nl = text.find('\n', pos);
++    const size_t end = nl == std::string::npos ? text.size() : nl;
++    lines.push_back(std::string_view(text).substr(pos, end - pos));
++    if (nl == std::string::npos) break;
++    pos = nl + 1;
++  }
++  std::unordered_map<std::string, size_t> last;  // "table\nkey" -> its last line
++  std::vector<std::string> keys(lines.size());
++  std::string table;
++  for (size_t i = 0; i < lines.size(); ++i) {
++    std::string_view l = lines[i];
++    size_t s = l.find_first_not_of(" \t");
++    if (s != std::string_view::npos && l[s] == '[') {
++      table = std::string(l.substr(s));
++      continue;
++    }
++    const std::string_view key = LineKey(l);
++    if (key.empty()) continue;
++    keys[i] = table + "\n" + std::string(key);
++    last[keys[i]] = i;
++  }
++  std::string out;
++  out.reserve(text.size());
++  for (size_t i = 0; i < lines.size(); ++i) {
++    if (!keys[i].empty() && last[keys[i]] != i) {
++      const std::string key = keys[i].substr(keys[i].find('\n') + 1);
++      if (std::find(dropped.begin(), dropped.end(), key) == dropped.end()) dropped.push_back(key);
++      continue;
++    }
++    out.append(lines[i]);
++    if (i + 1 < lines.size()) out.push_back('\n');
++  }
++  return out;
++}
++}  // namespace
++
++ConfigLoadReport GetConfigLoadReport() {
++  std::lock_guard lock(g_config_report_mutex);
++  return g_config_report;
++}
++
+ void LoadConfig(const std::filesystem::path& config_path) {
+   if (!std::filesystem::exists(config_path)) {
+     REXLOG_DEBUG("Config file not found: {}", config_path.string());
+     return;
+   }
+ 
++  std::string text;
++  {
++    std::ifstream file(config_path, std::ios::binary);
++    text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
++  }
++  ConfigLoadReport report;
+   try {
+-    auto config = toml::parse_file(config_path.string());
++    auto config = toml::parse(text, config_path.string());
+     ApplyTomlTable(config, "");
+     REXLOG_INFO("Loaded config from {}", config_path.string());
+   } catch (const toml::parse_error& err) {
+-    REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
++    // A setting written twice (an old line left above a new one) is the usual
++    // hand-edit mistake: read the file with the last value of each winning.
++    std::vector<std::string> dropped;
++    const std::string deduped = DropEarlierDuplicates(text, dropped);
++    bool recovered = false;
++    if (!dropped.empty()) {
++      try {
++        auto config = toml::parse(deduped, config_path.string());
++        ApplyTomlTable(config, "");
++        recovered = true;
++        report.kind = ConfigLoadReport::Kind::kDuplicates;
++        report.duplicate_keys = dropped;
++        REXLOG_WARN("Config {}: settings written more than once, the last value used", config_path.string());
++      } catch (const toml::parse_error&) {
++      }
++    }
++    if (!recovered) {
++      // Unreadable: defaults apply, and the next save replaces the file, so
++      // keep the player's copy first.
++      report.kind = ConfigLoadReport::Kind::kUnreadable;
++      report.line = static_cast<int>(err.source().begin.line);
++      report.error = std::string(err.description());
++      std::filesystem::path bad = config_path;
++      bad += ".bad";
++      std::error_code ec;
++      std::filesystem::copy_file(config_path, bad, std::filesystem::copy_options::overwrite_existing, ec);
++      if (!ec) report.bad_copy = bad;
++      REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
++    }
+   }
++  std::lock_guard lock(g_config_report_mutex);
++  g_config_report = std::move(report);
+ }
+ 
+ void ApplyEnvironment() {
+@@ -640,14 +846,40 @@ void SaveConfig(const std::filesystem::path& config_path) {
+     return;
+   }
+ 
++  // Written to a temporary file and moved over the old one, so a crash or a
++  // full disk mid-save leaves the previous file whole rather than truncated.
+   try {
+-    std::ofstream file(config_path);
+-    if (!file) {
+-      REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
+-      return;
++    std::filesystem::path tmp = config_path;
++    tmp += ".tmp";
++    {
++      std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
++      if (!file) {
++        REXLOG_ERROR("SaveConfig: failed to open {}", tmp.string());
++        return;
++      }
++      file << "# Auto-generated cvar configuration\n";
++      file << content;
++      file.flush();
++      if (!file) {
++        REXLOG_ERROR("SaveConfig: failed to write {}", tmp.string());
++        file.close();
++        std::error_code ec;
++        std::filesystem::remove(tmp, ec);
++        return;
++      }
++    }
++    std::error_code ec;
++    std::filesystem::rename(tmp, config_path, ec);
++    if (ec) {
++      // (Another program holding the file open can refuse the move.)
++      std::filesystem::copy_file(tmp, config_path, std::filesystem::copy_options::overwrite_existing, ec);
++      std::error_code ignored;
++      std::filesystem::remove(tmp, ignored);
++      if (ec) {
++        REXLOG_ERROR("SaveConfig: failed to replace {}: {}", config_path.string(), ec.message());
++        return;
++      }
+     }
+-    file << "# Auto-generated cvar configuration\n";
+-    file << content;
+     REXLOG_INFO("Saved config to {}", config_path.string());
+   } catch (const std::exception& e) {
+     REXLOG_ERROR("SaveConfig: {}", e.what());
 diff --git a/src/core/logging.cpp b/src/core/logging.cpp
 index 1645848..cd7758e 100644
 --- a/src/core/logging.cpp
