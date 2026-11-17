@@ -55,6 +55,7 @@
 #include "pd_paths.h"          // the saves folder (userdata-location.txt)
 #include "pd_n64_textures.h"   // N64 textures from the player's N64 ROM
 #include "pd_texture_packs.h"  // texture packs (Settings > Graphics > Experimental)
+#include "pd_texture_dump.h"   // Dump All Textures (same page)
 #include "pd_assets_import.h"  // importing the N64 ROM and texture packs
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/cvar.h>
@@ -6547,8 +6548,10 @@ class PerfectDarkApp : public rex::ReXApp {
         pd::TestInputDriver::Triggers(uint8_t(num(0, 0)), uint8_t(num(1, 0)), num(2, 100));
       } else if (c.verb == "wait") {
         test_next_ = now + std::chrono::milliseconds(num(0, 100));
-      } else if (c.verb == "cvar") {
-        rex::cvar::SetFlagByName(arg(0), arg(1));
+      } else if (c.verb == "cvar") {  // cvar <name> <value...> (the rest of the line: a path may have spaces)
+        std::string value = arg(1);
+        for (size_t i = 2; i < c.args.size(); ++i) value += " " + c.args[i];
+        rex::cvar::SetFlagByName(arg(0), value);
         REXLOG_INFO("[test] cvar {} = {}", arg(0), rex::cvar::GetFlagByName(arg(0)));
       } else if (c.verb == "shot") {
         auto* graphics = ConcreteGraphics();
@@ -8943,10 +8946,10 @@ class PerfectDarkApp : public rex::ReXApp {
   // texture packs with the Windows file picker, the packs folder, and the
   // texture dump for pack makers. HANDOVER 4cn.
   //
-  // exp_strings_ (guest, 32 bytes each): labels 0-6 (kExpTitle..kExpDump), the
+  // exp_strings_ (guest, 32 bytes each): labels 0-7 (kExpTitle..kExpOpenDump), the
   // values from +256 (Remastered, N64, Off, On, None, 16 each), the listed
   // packs' names from +384.
-  enum : int { kExpTitle, kExpTextures, kExpPack, kExpImportRom, kExpImportPack, kExpOpenFolder, kExpDump };
+  enum : int { kExpTitle, kExpTextures, kExpPack, kExpImportRom, kExpImportPack, kExpOpenFolder, kExpDump, kExpOpenDump };
   static constexpr uint32_t kExpValues = 256, kExpPackNames = 384;
   static constexpr uint32_t kExpStringsSize = kExpPackNames + uint32_t(pd::texpack::kMaxListed) * 32;
   static inline uint32_t exp_strings_ = 0;
@@ -8962,8 +8965,8 @@ class PerfectDarkApp : public rex::ReXApp {
     static const char* const kLabels[] = {"Experimental\n",        "Textures\n",
                                           "Texture Pack\n",        "Import N64 ROM\n",
                                           "Import Texture Pack\n", "Open Texture Packs Folder\n",
-                                          "Dump Textures\n"};
-    for (int i = 0; i < 7; ++i)
+                                          "Dump All Textures\n",   "Open Texture Dump Folder\n"};
+    for (int i = 0; i < 8; ++i)
       WriteGuestBytes(mem, exp_strings_ + uint32_t(i) * 32, kLabels[i], strlen(kLabels[i]) + 1);
     static const char* const kValues[] = {"Remastered", "N64", "Off", "On", "None"};
     for (int i = 0; i < 5; ++i) WriteGuestBytes(mem, ExpValue(i), kValues[i], strlen(kValues[i]) + 1);
@@ -9001,9 +9004,17 @@ class PerfectDarkApp : public rex::ReXApp {
     }
     const int pictures = pd::texpack::ChoosePack(name);
     SavePcSettings();
-    rex::kernel::xam::netplay::ShowNotice(
-        name.empty() ? std::string("Texture Pack: None")
-                     : "Texture Pack: " + name + " (" + std::to_string(pictures) + " pictures)");
+    std::string text = name.empty() ? std::string("Texture Pack: None")
+                                    : "Texture Pack: " + name + " (" + std::to_string(pictures) + " pictures)";
+    // An N64 emulator pack: its pictures are redraws of the N64 textures.
+    if (const auto index = pd::texpack::CurrentIndex(); index && index->hires_files > 0) {
+      if (index->waiting_for_rom)
+        text += pd::n64tex::RomPresent() ? "\nIts N64 pictures show with Textures: N64."
+                                         : "\nIts N64 pictures need your N64 ROM: Import N64 ROM.";
+      else
+        text += "\nIts N64 pictures show with Textures: N64.";
+    }
+    rex::kernel::xam::netplay::ShowNotice(text);
   }
 
   // Texture Pack: None, then each installed pack by name.
@@ -9107,9 +9118,25 @@ class PerfectDarkApp : public rex::ReXApp {
         if (kind == PickKind::kRom) {
           r.ok = pd::assets::ImportN64Rom(src, pd::n64tex::RomFolder(), &r.name, &r.message);
         } else {
-          // A picture inside a pack's folder stands for the folder.
+          // A picture inside a pack's folder stands for the folder. An N64 emulator
+          // pack ("Perfect Dark#<crc>#..." pictures in level sub-folders) is the
+          // folder named like the game, above the picture.
           std::error_code ec;
-          if (!std::filesystem::is_directory(src, ec) && pd::assets::PackFileId(src) >= 0) src = src.parent_path();
+          if (!std::filesystem::is_directory(src, ec)) {
+            if (pd::assets::PackFileId(src) >= 0) {
+              src = src.parent_path();
+            } else if (pd::assets::IsPackFile(src)) {
+              const std::wstring stem = src.stem().wstring();
+              const std::wstring game = stem.substr(0, stem.find(L'#'));
+              std::filesystem::path root = src.parent_path();
+              for (std::filesystem::path p = root; !p.empty() && p != p.parent_path(); p = p.parent_path())
+                if (_wcsicmp(p.filename().c_str(), game.c_str()) == 0) {
+                  root = p;
+                  break;
+                }
+              src = root;
+            }
+          }
           int pictures = 0;
           r.ok = pd::assets::ImportTexturePack(src, pd::texpack::PacksFolder(), &r.name, &pictures, &r.message);
         }
@@ -9138,16 +9165,24 @@ class PerfectDarkApp : public rex::ReXApp {
     }
     ctx.r3.u64 = 0;
   }
-  static bool GetTextureDump() { return pd::texpack::Dumping(); }
-  static void SetTextureDump(bool on) {
-    if (on == pd::texpack::Dumping()) return;
-    pd::texpack::SetDumping(on);
-    SavePcSettings();
-    rex::kernel::xam::netplay::ShowNotice(on ? "Saving the textures drawn from now on in resources\\userdata\\texture-dump."
-                                             : "Texture dump off.");
-  }
+  // Dump All Textures: every Textures.raw texture, and every N64 picture with a ROM
+  // imported, into resources\userdata\texture-dump (pd_texture_dump.h), in the
+  // background. The as-drawn dump (only what a scene draws) stays as the cvar
+  // pd_texture_dump.
   static void PdExpDumpHandler(PPCContext& ctx, uint8_t*) {
-    PdTwoStateHandler(ctx, ExpValue(2), ExpValue(3), &GetTextureDump, &SetTextureDump);
+    if (ctx.r3.u32 == 6 &&
+        !pd::texdump::StartDumpAll([](const std::string& text) { rex::kernel::xam::netplay::ShowNotice(text); }))
+      rex::kernel::xam::netplay::ShowNotice("Dump All Textures is already running.");
+    ctx.r3.u64 = 0;
+  }
+  static void PdExpOpenDumpHandler(PPCContext& ctx, uint8_t*) {
+    if (ctx.r3.u32 == 6) {
+      const std::filesystem::path folder = pd::texpack::DumpFolder();
+      std::error_code ec;
+      std::filesystem::create_directories(folder, ec);
+      ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    ctx.r3.u64 = 0;
   }
 
   // Builds the page (once; PatchVideoOptionsMenu, before its rows).
@@ -9169,7 +9204,8 @@ class PerfectDarkApp : public rex::ReXApp {
         {0x04000000, 0, &PdExpLabel<kExpImportRom>, &PdExpImportRomHandler},
         {0x04000000, 0, &PdExpLabel<kExpImportPack>, &PdExpImportPackHandler},
         {0x04000000, 0, &PdExpLabel<kExpOpenFolder>, &PdExpOpenFolderHandler},
-        {0x0C000000, 0, &PdExpLabel<kExpDump>, &PdExpDumpHandler},
+        {0x04000000, 0, &PdExpLabel<kExpDump>, &PdExpDumpHandler},
+        {0x04000000, 0, &PdExpLabel<kExpOpenDump>, &PdExpOpenDumpHandler},
     };
     constexpr uint32_t kRows = sizeof(rows) / sizeof(rows[0]);
     const uint32_t items = mem->SystemHeapAlloc((kRows + 1) * 20 + 24);
@@ -9193,6 +9229,8 @@ class PerfectDarkApp : public rex::ReXApp {
   // Each frame (UI thread): applies finished imports.
   static void TickExperimental() {
     pd::texpack::Init();
+    // An N64 emulator pack waits for the ROM's texture checksums: matched once loaded.
+    pd::texpack::RebuildIfWaiting();
     std::vector<PickResult> results;
     {
       std::lock_guard<std::mutex> lock(pick_mutex_);

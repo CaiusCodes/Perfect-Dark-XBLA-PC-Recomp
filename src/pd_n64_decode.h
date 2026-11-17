@@ -22,7 +22,23 @@ struct Image {
   // 7 I8, 8 I4, 9 CI8 (RGBA16 palette), 10 CI4 (RGBA16), 11 CI8 (IA16), 12 CI4 (IA16).
   uint8_t format = 0;
   std::vector<uint8_t> rgba;
+  // For N64 emulator hi-res packs (Rice / GLideN64 naming): the texture's checksum as
+  // the game leaves it in RDRAM (HiresCrc), its G_IM_FMT / G_IM_SIZ, and for CI the
+  // palette's checksums over 16, 256, its own colour count and (highest index used + 1)
+  // entries (packs differ in which). 0 when not computed.
+  uint32_t hires_crc = 0;
+  uint8_t gbi_fmt = 0, gbi_siz = 0;
+  uint32_t hires_pal[4] = {};
 };
+
+// The classic hi-res texture checksum: over `h` rows of `pitch` bytes of RDRAM data
+// (big-endian bytes, as the N64 has them), each row's ((w << siz) + 1) / 2 bytes as
+// 32-bit words read the way emulators keep RDRAM, last word first:
+// crc = rol4(crc) + (word ^ x), then + (last word ^ y) per row, y counting down from
+// h - 1 while the rows go forward. `data` must hold h * pitch bytes.
+uint32_t HiresCrc(const uint8_t* data, size_t size, int w, int h, int siz, size_t pitch);
+// The checksum of a 16-bit palette of `count` entries (big-endian, as in RDRAM).
+uint32_t HiresPaletteCrc(const uint16_t* palette, size_t count);
 
 // The ROM versions the texture table is known for (the decomp's tools/extract).
 struct RomVersion {
@@ -71,5 +87,13 @@ bool ExtractFile(const std::vector<uint8_t>& rom, const std::vector<uint32_t>& o
 // Checked against the remaster's own N64-size conversions of these textures
 // (N64-NOTES.md). False for a format not handled or data too short.
 bool DecodeTmem(const uint8_t* data, size_t size, int fmt, int siz, int w, int h, Image& out);
+
+// The same for a paletted (CI) in-file texture: `bits` 4 or 8 index bits, the index
+// data for `levels` mip levels (TMEM layout as above), then the 16-bit palette (16 or
+// 256 entries; RGBA16, or IA16 with `ia_palette`). Some texconfigs call these RGBA16:
+// the model's display list loads them with a palette (models_embedded_ci.py). Base
+// level only.
+bool DecodeTmemCI(const uint8_t* data, size_t size, int bits, int w, int h, int levels, bool ia_palette,
+                  Image& out);
 
 }  // namespace pd::n64dec

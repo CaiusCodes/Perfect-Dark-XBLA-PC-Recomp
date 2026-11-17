@@ -287,6 +287,53 @@ void put_rgba(int fmt, uint32_t value, uint8_t* o) {
   }
 }
 
+// PD's texture formats -> G_IM_FMT, G_IM_SIZ.
+const uint8_t kGbiFmt[13] = {0, 0, 0, 0, 3, 3, 3, 4, 4, 2, 2, 2, 2};
+const uint8_t kGbiSiz[13] = {3, 2, 3, 2, 2, 1, 0, 1, 0, 1, 0, 1, 0};
+
+// Fills the hi-res pack checksums of a decoded base level from its pixel values
+// (texel values, or palette indices for formats 9-12): the texture rebuilt as the
+// game leaves it in RDRAM for G_LOADBLOCK (decomp texdecompress.c): rows padded to 8
+// bytes (32-bit texels: 16), odd rows' 32-bit words swapped in pairs (64-bit for
+// 32-bit texels). tools/n64/rice_crc.py matched 1275 of a 1559-file pack this way.
+void set_hires(Image& img, int pd_fmt, int w, int h, const std::vector<uint32_t>& vals, const uint16_t* pal,
+               size_t ncol) {
+  if (pd_fmt < 0 || pd_fmt > 12 || w <= 0 || h <= 0 || vals.size() < size_t(w) * size_t(h)) return;
+  const int siz = kGbiSiz[pd_fmt];
+  const size_t row_px = siz >= 2 ? ((size_t(w) + 3) & ~size_t(3)) : siz == 1 ? ((size_t(w) + 7) & ~size_t(7))
+                                                                               : ((size_t(w) + 15) & ~size_t(15));
+  const size_t row = siz == 3 ? row_px * 4 : (row_px << siz) >> 1;
+  std::vector<uint8_t> rd(row * size_t(h), 0);
+  for (int y = 0; y < h; ++y) {
+    uint8_t* r = rd.data() + size_t(y) * row;
+    for (int x = 0; x < w; ++x) {
+      const uint32_t v = vals[size_t(y) * size_t(w) + size_t(x)];
+      switch (siz) {
+        case 3: r[4 * x] = uint8_t(v >> 24); r[4 * x + 1] = uint8_t(v >> 16); r[4 * x + 2] = uint8_t(v >> 8); r[4 * x + 3] = uint8_t(v); break;
+        case 2: r[2 * x] = uint8_t(v >> 8); r[2 * x + 1] = uint8_t(v); break;
+        case 1: r[x] = uint8_t(v); break;
+        default: r[x >> 1] |= uint8_t((x & 1) ? (v & 15) : ((v & 15) << 4)); break;
+      }
+    }
+    if (y & 1) {
+      const size_t unit = siz == 3 ? 8 : 4;
+      for (size_t k = 0; k + 2 * unit <= row; k += 2 * unit)
+        for (size_t b = 0; b < unit; ++b) std::swap(r[k + b], r[k + unit + b]);
+    }
+  }
+  img.gbi_fmt = kGbiFmt[pd_fmt];
+  img.gbi_siz = uint8_t(siz);
+  img.hires_crc = HiresCrc(rd.data(), rd.size(), w, h, siz, row);
+  if (pal && ncol) {
+    uint32_t cimax = 0;
+    for (size_t i = 0; i < size_t(w) * size_t(h); ++i) cimax = std::max(cimax, vals[i]);
+    std::vector<uint16_t> p(256, 0);
+    std::copy(pal, pal + std::min<size_t>(ncol, 256), p.begin());
+    const size_t counts[4] = {16, 256, std::min<size_t>(ncol, 256), std::min<size_t>(cimax + 1, 256)};
+    for (int k = 0; k < 4; ++k) img.hires_pal[k] = HiresPaletteCrc(p.data(), counts[k]);
+  }
+}
+
 bool channels_to_values(const std::vector<int>& ch, size_t n, int fmt, std::vector<uint32_t>& vals) {
   const size_t need = fmt == 0 || fmt == 1 ? 4 * n : fmt == 2 || fmt == 3 ? 3 * n : fmt == 4 || fmt == 5 ? 2 * n
                       : fmt == 6 ? 4 * n : n;
@@ -428,6 +475,7 @@ bool decode_bitpacked(const uint8_t* d, size_t size, Image& img, std::string* er
   img.h = uint16_t(h);
   img.rgba.resize(n * 4);
   for (size_t i = 0; i < n; ++i) put_rgba(fmt, vals[i], img.rgba.data() + i * 4);
+  set_hires(img, fmt, w, h, vals, nullptr, 0);
   return true;
 }
 
@@ -464,14 +512,17 @@ bool decode_zlib(const uint8_t* d, size_t size, Image& img, std::string* error) 
   img.h = uint16_t(h);
   img.rgba.resize(size_t(w) * size_t(h) * 4);
   uint8_t* o = img.rgba.data();
+  std::vector<uint32_t> indices(size_t(w) * size_t(h));
   for (int y = 0; y < h; ++y) {
     const uint8_t* row = raw.data() + size_t(y) * stride;
     for (int x = 0; x < w; ++x, o += 4) {
       const size_t i = ci4 ? ((x & 1) ? (row[x >> 1] & 15) : (row[x >> 1] >> 4)) : row[x];
+      indices[size_t(y) * size_t(w) + size_t(x)] = uint32_t(i);
       const uint32_t c = i < ncol ? pal[i] : 0;
       put_rgba(fmt == 9 || fmt == 10 ? 1 : 4, c, o);
     }
   }
+  set_hires(img, fmt, w, h, indices, pal.data(), ncol);
   return true;
 }
 
@@ -659,6 +710,80 @@ bool ExtractFile(const std::vector<uint8_t>& rom, const std::vector<uint32_t>& o
   const uint8_t* p = rom.data() + a;
   if (b - a >= 2 && p[0] == 0x11 && p[1] == 0x73) return rarezip(p, b - a, out);
   out.assign(p, p + (b - a));
+  return true;
+}
+
+uint32_t HiresCrc(const uint8_t* data, size_t size, int w, int h, int siz, size_t pitch) {
+  if (w <= 0 || h <= 0 || siz < 0 || siz > 3) return 0;
+  const int bpl = ((w << siz) + 1) >> 1;
+  // An emulator keeps RDRAM as 32-bit words in host (little-endian) order: RDRAM byte
+  // a sits at host offset a ^ 3. A u32 read at host offset o is bytes o..o+3 of that.
+  auto host_word = [&](size_t o) {
+    uint32_t v = 0;
+    for (size_t k = 0; k < 4; ++k) {
+      const size_t a = (o + k) ^ 3;
+      v |= uint32_t(a < size ? data[a] : 0) << (8 * k);
+    }
+    return v;
+  };
+  uint32_t crc = 0;
+  size_t start = 0;
+  for (int y = h - 1; y >= 0; --y) {
+    uint32_t esi = 0;
+    for (int x = bpl - 4; x >= 0; x -= 4) {
+      esi = host_word(start + size_t(x)) ^ uint32_t(x);
+      crc = ((crc << 4) | ((crc >> 28) & 15)) + esi;
+    }
+    esi ^= uint32_t(y);
+    crc += esi;
+    start += pitch;
+  }
+  return crc;
+}
+
+uint32_t HiresPaletteCrc(const uint16_t* palette, size_t count) {
+  std::vector<uint8_t> rd(count * 2 + 8, 0);
+  for (size_t i = 0; i < count; ++i) {
+    rd[2 * i] = uint8_t(palette[i] >> 8);
+    rd[2 * i + 1] = uint8_t(palette[i]);
+  }
+  return HiresCrc(rd.data(), rd.size(), int(count), 1, 2, count * 2);
+}
+
+bool DecodeTmemCI(const uint8_t* data, size_t size, int bits, int w, int h, int levels, bool ia_palette,
+                  Image& out) {
+  if ((bits != 4 && bits != 8) || w <= 0 || h <= 0 || w > 1024 || h > 1024) return false;
+  // Index data for every level (rows padded to 8 bytes), then the 16-bit palette.
+  size_t index_bytes = 0;
+  for (int l = 0; l < std::max(1, levels); ++l) {
+    const size_t lw = size_t(std::max(1, w >> l)), lh = size_t(std::max(1, h >> l));
+    const size_t row = lw * size_t(bits) >= 8 ? ((lw * size_t(bits) / 8 + 7) & ~size_t(7)) : 8;
+    index_bytes += row * lh;
+  }
+  const size_t entries = bits == 4 ? 16 : 256;
+  if (index_bytes + entries * 2 > size) return false;
+  const uint8_t* palette = data + index_bytes;
+  const int pal_format = ia_palette ? 4 : 1;  // IA16 or RGBA16 entries
+  out.w = uint16_t(w);
+  out.h = uint16_t(h);
+  out.format = uint8_t(bits == 4 ? (ia_palette ? 12 : 10) : (ia_palette ? 11 : 9));
+  out.rgba.assign(size_t(w) * size_t(h) * 4, 0);
+  const size_t row = (size_t(w) * size_t(bits) / 8 + 7) & ~size_t(7);
+  for (int y = 0; y < h; ++y) {
+    const uint8_t* line = data + size_t(y) * row;
+    const size_t swap = (y & 1) ? 4 : 0;  // odd rows: the 32-bit words of each 8 bytes swapped
+    for (int x = 0; x < w; ++x) {
+      uint32_t index;
+      if (bits == 4) {
+        const uint8_t v = line[(size_t(x) / 2) ^ swap];
+        index = (x & 1) ? (v & 15u) : (v >> 4);
+      } else {
+        index = line[size_t(x) ^ swap];
+      }
+      const uint32_t value = (uint32_t(palette[index * 2]) << 8) | palette[index * 2 + 1];
+      put_rgba(pal_format, value, out.rgba.data() + (size_t(y) * size_t(w) + size_t(x)) * 4);
+    }
+  }
   return true;
 }
 

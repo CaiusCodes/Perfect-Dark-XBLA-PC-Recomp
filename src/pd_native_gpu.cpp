@@ -2625,6 +2625,9 @@ int pack_id(uint32_t tex, const uint32_t* f) {
   if (!g.pack_index || g.pack_index->by_id.empty()) return -1;
   const int id = bank_texture_id(tex);
   if (id < 0 || !g.pack_index->Has(id) || !plain_rgba_2d(f)) return -1;
+  // An N64 emulator pack's picture is a redraw of the N64 texture: N64 mode only (the
+  // remastered textures of these ids are other pictures, and 44 ids are reused).
+  if (g.pack_index->N64Only(id) && (!pd::n64tex::Active() || remaster_only_id(id))) return -1;
   return id;
 }
 
@@ -5460,4 +5463,10 @@ bool PdN64TextureDrawable(int id) {
                    ok ? "drawn from the ROM" : (remaster_only_id(id) ? "remaster-only id, not drawn" : "no N64 picture"));
   }
   return ok;
+}
+
+// Dump All Textures (pd_texture_dump.cpp): one DXT1/3/5 block (fmt 18/19/20, already in
+// little-endian order) to 16 RGBA texels, with Plume's own decoder.
+void PdDecodeTextureBlock(uint32_t fmt, const uint8_t* block, uint8_t out[16][4]) {
+  decode_block(fmt, block, out);
 }

@@ -6,6 +6,8 @@
 
 #include <filesystem>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "pd_n64_decode.h"
 
@@ -48,6 +50,18 @@ constexpr int kTextureCount = 3503;  // ids 0-3502 are the N64 ones
 // itself: in N64 mode it is drawn from the ROM's file like the N64 ids (raw colours:
 // the remaster's own copies of these have no colour curve).
 bool IsModelTexture(int id);
+// Every such remaster id, ascending (Dump All Textures).
+std::vector<int> ModelTextureIds();
+
+// N64 emulator hi-res packs (Rice / GLideN64 naming, pd_texture_packs.cpp): every N64
+// texture id (0-3502 and the in-file ones) by its hi-res checksum (n64dec::HiresCrc).
+// Built once, when Ready; nullptr before.
+struct HiresEntry {
+  int id;
+  uint8_t fmt, siz;      // G_IM_FMT / G_IM_SIZ
+  uint32_t palette[4];   // CI only (n64dec::Image::hires_pal), else 0
+};
+const std::unordered_multimap<uint32_t, HiresEntry>* HiresTable();
 
 // True while the N64 textures are switched on and loaded.
 bool Active();

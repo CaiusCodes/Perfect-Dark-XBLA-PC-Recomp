@@ -11,6 +11,7 @@
 #include <fstream>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 #include <rex/cvar.h>
@@ -19,6 +20,7 @@
 #include <rex/ui/image_decode.h>
 
 #include "pd_assets_import.h"
+#include "pd_n64_textures.h"
 #include "pd_paths.h"
 
 REXCVAR_DEFINE_STRING(pd_texture_pack, "", "PerfectDark",
@@ -66,15 +68,61 @@ std::shared_ptr<Index> BuildIndex(const std::string& name) {
   const fs::path folder = PacksFolder() / Wide(name);
   std::error_code ec;
   std::vector<fs::path> files;
+  std::vector<std::pair<pd::assets::HiresName, fs::path>> hires;
   for (auto it = fs::recursive_directory_iterator(folder, ec); !ec && it != fs::recursive_directory_iterator();
        it.increment(ec)) {
-    if (it->is_regular_file(ec) && pd::assets::PackFileId(it->path()) >= 0) files.push_back(it->path());
+    if (!it->is_regular_file(ec)) continue;
+    pd::assets::HiresName n;
+    if (pd::assets::PackFileId(it->path()) >= 0) files.push_back(it->path());
+    else if (pd::assets::ParseHiresName(it->path(), &n) && n.kind != "a") hires.emplace_back(n, it->path());
   }
   std::sort(files.begin(), files.end());
   for (const fs::path& f : files) {
     const int id = pd::assets::PackFileId(f);
     if (size_t(id) >= index->by_id.size()) index->by_id.resize(size_t(id) + 1);
     if (index->by_id[size_t(id)].empty()) index->by_id[size_t(id)] = f;  // the first by name wins
+  }
+  // N64 emulator naming: matched through the ROM's texture checksums.
+  index->hires_files = int(hires.size());
+  if (!hires.empty()) {
+    const auto* table = pd::n64tex::HiresTable();
+    if (!table) {
+      index->waiting_for_rom = true;
+    } else {
+      std::sort(hires.begin(), hires.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+      std::unordered_multimap<uint32_t, size_t> by_crc;
+      for (size_t i = 0; i < hires.size(); ++i) by_crc.emplace(hires[i].first.crc, i);
+      std::vector<bool> used(hires.size(), false);
+      for (const auto& [crc, entry] : *table) {
+        // The best of the pack's pictures with this checksum: same format and size,
+        // then a palette checksum the texture has.
+        int best = -1, best_score = -1;
+        const auto range = by_crc.equal_range(crc);
+        for (auto it = range.first; it != range.second; ++it) {
+          const pd::assets::HiresName& n = hires[it->second].first;
+          int score = (n.fmt == entry.fmt && n.siz == entry.siz) ? 2 : (n.siz == entry.siz ? 1 : 0);
+          if (n.has_palette)
+            for (uint32_t p : entry.palette)
+              if (p && p == n.palette) {
+                score += 4;
+                break;
+              }
+          if (score > best_score) {
+            best_score = score;
+            best = int(it->second);
+          }
+        }
+        if (best < 0) continue;
+        const size_t id = size_t(entry.id);
+        if (id >= index->by_id.size()) index->by_id.resize(id + 1);
+        if (id >= index->n64_only.size()) index->n64_only.resize(id + 1, 0);
+        if (!index->by_id[id].empty()) continue;  // a picture named by id wins
+        index->by_id[id] = hires[size_t(best)].second;
+        index->n64_only[id] = 1;
+        used[size_t(best)] = true;
+      }
+      for (bool u : used) index->hires_matched += u ? 1 : 0;
+    }
   }
   return index;
 }
@@ -116,10 +164,22 @@ int ChoosePack(const std::string& name) {
     g_index = index;
   }
   if (!name.empty())
-    REXLOG_INFO("[texpack] \"{}\" chosen: {} pictures in {}", name, count, Utf8((PacksFolder() / Wide(name)).wstring()));
+    REXLOG_INFO("[texpack] \"{}\" chosen: {} pictures in {}{}", name, count, Utf8((PacksFolder() / Wide(name)).wstring()),
+                index->hires_files == 0 ? std::string()
+                : index->waiting_for_rom
+                    ? "; " + std::to_string(index->hires_files) + " N64 emulator pictures wait for the N64 ROM"
+                    : "; N64 emulator pictures: " + std::to_string(index->hires_matched) + " of " +
+                          std::to_string(index->hires_files) + " matched to textures");
   else
     REXLOG_INFO("[texpack] no texture pack");
   return count;
+}
+
+bool RebuildIfWaiting() {
+  std::shared_ptr<const Index> index = CurrentIndex();
+  if (!index || !index->waiting_for_rom || !pd::n64tex::HiresTable()) return false;
+  ChoosePack(index->name);
+  return true;
 }
 
 std::shared_ptr<const Index> CurrentIndex() {
@@ -172,6 +232,18 @@ bool LoadPicture(const fs::path& path, std::vector<uint8_t>& rgba, uint32_t& w, 
   }
   w = uint32_t(iw);
   h = uint32_t(ih);
+  // N64 emulator packs: "..._rgb.png" is opaque unless an "..._a.png" beside it
+  // holds its alpha (grey).
+  const std::wstring stem = path.stem().wstring();
+  if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, L"_rgb") == 0) {
+    for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
+    const fs::path alpha_path = path.parent_path() / (stem.substr(0, stem.size() - 4) + L"_a" + path.extension().wstring());
+    std::vector<uint8_t> a;
+    uint32_t aw = 0, ah = 0;
+    std::string ignored;
+    if (fs::exists(alpha_path, ec) && LoadPicture(alpha_path, a, aw, ah, &ignored) && aw == w && ah == h)
+      for (size_t i = 0; i < rgba.size(); i += 4) rgba[i + 3] = a[i];
+  }
   return true;
 }
 

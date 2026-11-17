@@ -44,6 +44,7 @@ set(PERFECTDARK_SOURCES
     src/pd_n64_rooms.cpp
     src/pd_assets_import.cpp
     src/pd_texture_packs.cpp
+    src/pd_texture_dump.cpp
 )
 
 # The release version: VERSION is the single source of truth. The game shows

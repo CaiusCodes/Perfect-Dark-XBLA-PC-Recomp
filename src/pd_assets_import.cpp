@@ -147,6 +147,53 @@ int PackFileId(const fs::path& file) {
   return id;
 }
 
+bool ParseHiresName(const fs::path& file, HiresName* out) {
+  if (!IsPicture(file)) return false;
+  const std::string stem = Utf8(file.stem().wstring());
+  // From the end: "_<kind>", then "#..." fields: crc, fmt, siz[, palette].
+  const size_t underscore = stem.rfind('_');
+  if (underscore == std::string::npos) return false;
+  const std::string kind = stem.substr(underscore + 1);
+  std::vector<std::string> fields;
+  size_t pos = stem.find('#');
+  if (pos == std::string::npos) return false;
+  const std::string body = stem.substr(pos + 1, underscore - pos - 1);
+  for (size_t start = 0;;) {
+    const size_t hash = body.find('#', start);
+    fields.push_back(body.substr(start, hash == std::string::npos ? std::string::npos : hash - start));
+    if (hash == std::string::npos) break;
+    start = hash + 1;
+  }
+  if (fields.size() != 3 && fields.size() != 4) return false;
+  auto hex32 = [](const std::string& s, uint32_t* v) {
+    if (s.size() != 8) return false;
+    uint32_t r = 0;
+    for (char c : s) {
+      int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+      if (d < 0) return false;
+      r = (r << 4) | uint32_t(d);
+    }
+    *v = r;
+    return true;
+  };
+  auto one_digit = [](const std::string& s, int* v) {
+    if (s.size() != 1 || s[0] < '0' || s[0] > '9') return false;
+    *v = s[0] - '0';
+    return true;
+  };
+  HiresName n;
+  if (!hex32(fields[0], &n.crc) || !one_digit(fields[1], &n.fmt) || !one_digit(fields[2], &n.siz)) return false;
+  if (fields.size() == 4) {
+    if (!hex32(fields[3], &n.palette)) return false;
+    n.has_palette = true;
+  }
+  n.kind = kind;
+  if (out) *out = n;
+  return true;
+}
+
+bool IsPackFile(const fs::path& file) { return PackFileId(file) >= 0 || ParseHiresName(file, nullptr); }
+
 std::string Md5Hex(const uint8_t* data, size_t size) {
   BCRYPT_ALG_HANDLE alg = nullptr;
   BCRYPT_HASH_HANDLE hash = nullptr;
@@ -230,6 +277,16 @@ std::string SafePackName(const std::string& name) {
   return out;
 }
 
+namespace {
+// A picture the player sees counted: named by id, or by hi-res checksum (not the
+// "_a" alpha pictures, which belong to the "_rgb" beside them).
+bool CountsAsPicture(const fs::path& file) {
+  if (PackFileId(file) >= 0) return true;
+  HiresName n;
+  return ParseHiresName(file, &n) && n.kind != "a";
+}
+}  // namespace
+
 bool ImportTexturePack(const fs::path& src, const fs::path& packs_folder, std::string* name, int* pictures,
                        std::string* message) {
   std::error_code ec;
@@ -247,7 +304,7 @@ bool ImportTexturePack(const fs::path& src, const fs::path& packs_folder, std::s
     int count = 0;
     for (auto it = fs::recursive_directory_iterator(dest, ec); !ec && it != fs::recursive_directory_iterator();
          it.increment(ec))
-      if (it->is_regular_file(ec) && PackFileId(it->path()) >= 0) ++count;
+      if (it->is_regular_file(ec) && CountsAsPicture(it->path())) ++count;
     if (name) *name = pack;
     if (pictures) *pictures = count;
     *message = "Texture pack \"" + pack + "\" is already installed (" + std::to_string(count) + " pictures).";
@@ -273,7 +330,7 @@ bool ImportTexturePack(const fs::path& src, const fs::path& packs_folder, std::s
       error = "can't write to " + Utf8(packs_folder.wstring());
       return false;
     }
-    if (PackFileId(file_name) >= 0) ++count;
+    if (CountsAsPicture(file_name)) ++count;
     return true;
   };
   bool ok = true;
@@ -283,7 +340,7 @@ bool ImportTexturePack(const fs::path& src, const fs::path& packs_folder, std::s
          it.increment(ec)) {
       if (!it->is_regular_file(ec)) continue;
       const bool top = it.depth() == 0;
-      if (PackFileId(it->path()) >= 0 || (top && IsNote(it->path()))) files.push_back(it->path());
+      if (IsPackFile(it->path()) || (top && IsNote(it->path()))) files.push_back(it->path());
     }
     std::sort(files.begin(), files.end());
     for (const fs::path& f : files) {
@@ -308,7 +365,7 @@ bool ImportTexturePack(const fs::path& src, const fs::path& packs_folder, std::s
         const fs::path file = Wide(slash == std::string::npos ? e.name : e.name.substr(slash + 1));
         const bool top = e.name.find_first_of("/\\") == std::string::npos ||
                          e.name.find_first_of("/\\") == e.name.find_last_of("/\\");
-        if (!(PackFileId(file) >= 0 || (top && IsNote(file)))) continue;
+        if (!(IsPackFile(file) || (top && IsNote(file)))) continue;
         if (e.size > kMaxPictureBytes) continue;
         std::vector<uint8_t> bytes;
         if (!ZipRead(zip, e, bytes, &error)) { ok = false; break; }
@@ -317,7 +374,7 @@ bool ImportTexturePack(const fs::path& src, const fs::path& packs_folder, std::s
     }
   }
   if (ok && count == 0) {
-    error = "it has no pictures named by texture number (like 0123.png)";
+    error = "it has no pictures named by texture number (like 0123.png) or by N64 emulator checksum";
     ok = false;
   }
   if (!ok) {

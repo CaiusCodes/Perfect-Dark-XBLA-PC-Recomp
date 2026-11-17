@@ -29,12 +29,23 @@ int ChoosePack(const std::string& name);
 struct Index {
   std::string name;
   std::vector<std::filesystem::path> by_id;  // empty path: the pack hasn't that id
+  // Ids whose picture came from N64 emulator naming (a hi-res redraw of the N64
+  // texture): drawn in N64 mode only.
+  std::vector<uint8_t> n64_only;
+  // The pack has emulator-named pictures but the N64 ROM isn't loaded yet, so they
+  // aren't matched: the index is rebuilt once it is (RebuildIfWaiting).
+  bool waiting_for_rom = false;
+  int hires_files = 0, hires_matched = 0;
   uint32_t version = 0;
   bool Has(int id) const { return id >= 0 && size_t(id) < by_id.size() && !by_id[size_t(id)].empty(); }
+  bool N64Only(int id) const { return id >= 0 && size_t(id) < n64_only.size() && n64_only[size_t(id)]; }
 };
 std::shared_ptr<const Index> CurrentIndex();
 // Builds the index for the saved choice (once, at start).
 void Init();
+// Rebuilds the index when it waits for the N64 ROM and that is now loaded (each
+// frame, cheap otherwise). True when it did.
+bool RebuildIfWaiting();
 
 // A pack picture as RGBA8 (any thread). False with `error` set if it can't be
 // used: not a PNG, damaged, or over 4096 on a side.

@@ -24,6 +24,23 @@ constexpr int kMaxTextureId = 8191;
 // The Textures.raw id a pack file stands for, or -1 (not a picture named by id).
 int PackFileId(const std::filesystem::path& file);
 
+// N64 emulator hi-res packs (Rice / GLideN64 naming) also work, over the N64
+// textures: "<game>#<texture crc>#<fmt>#<siz>[#<palette crc>]_<kind>.png" (crc in
+// hex, kind all / rgb / a / ciByRGBA / ciByIA / allciByRGBA; "_a" is the alpha of
+// the "_rgb" beside it), sub-folders allowed. They're matched to texture ids by the
+// checksum of the player's own N64 ROM's textures (pd_n64_textures.h HiresTable).
+struct HiresName {
+  uint32_t crc = 0;
+  int fmt = -1, siz = -1;
+  bool has_palette = false;
+  uint32_t palette = 0;
+  std::string kind;  // "all", "rgb", "a", ...
+};
+bool ParseHiresName(const std::filesystem::path& file, HiresName* out);
+// True for any file a pack keeps: named by id, or by hi-res checksum (the "_a"
+// alpha pictures included).
+bool IsPackFile(const std::filesystem::path& file);
+
 // MD5 of `size` bytes, lower-case hex (empty on failure).
 std::string Md5Hex(const uint8_t* data, size_t size);
 

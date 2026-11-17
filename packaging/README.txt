@@ -262,13 +262,23 @@ EXPERIMENTAL: N64 TEXTURES AND TEXTURE PACKS
   and Texture Pack picks one or None. A pack is drawn over the N64 or the
   remastered textures, so both can be on at once.
 
-  Making a pack: turn on Dump Textures and play. Every texture drawn is saved
-  as resources\userdata\texture-dump\remastered\<number>.png (and ...\n64\
-  while N64 textures are on). Edit them at any size up to 4096 x 4096 and put
-  them in a folder named after your pack, keeping the number at the start of
-  each file name ("0123.png" or "0123 wall.png"). PNG only. Pictures a pack
-  leaves out keep the game's own. A picture the game can't use (not a PNG,
-  too large) is skipped and named in the log.
+  N64 emulator HD packs (made for N64 emulators, pictures named like
+  "Perfect Dark#1A2B3C4D#2#0#..._ciByRGBA.png", the Rice / GLideN64 hi-res
+  naming) work too: import the pack's .zip or any picture in it. They are
+  matched to the game's textures through your own N64 ROM, so they need it
+  imported, and they show in N64 mode.
+
+  Making a pack: Dump All Textures saves every texture of the game as
+  resources\userdata\texture-dump\remastered\<number>.png and, with your N64
+  ROM imported, every N64 texture as ...\n64\<number>.png (it takes about a
+  minute; a notice says when it's done). Open Texture Dump Folder opens it.
+  Edit them at any size up to 4096 x 4096 and put them in a folder named
+  after your pack, keeping the number at the start of each file name
+  ("0123.png" or "0123 wall.png"). PNG only. Pictures a pack leaves out keep
+  the game's own. A picture the game can't use (not a PNG, too large) is
+  skipped and named in the log. To see which numbers a scene uses, set
+  pd_texture_dump = true in resources\userdata\perfect_dark.toml: then only
+  the textures the game draws are saved, as it draws them.
 
   Without the menus: Perfect Dark.exe --setup --unattended --n64-rom <file>
   and --texture-pack <.zip or folder> do the same imports.

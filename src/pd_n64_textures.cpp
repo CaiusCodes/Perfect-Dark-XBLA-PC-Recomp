@@ -235,6 +235,34 @@ const std::unordered_map<int, std::pair<int, int>>& model_texture_sources() {
   return map;
 }
 
+// Whether the model's display lists load in-file texture `number` with a palette:
+// G_SETTIMG of the number, a G_LOADTLUT before the next G_SETTIMG, and the render
+// tile (0) 4- or 8-bit; G_SETOTHERMODE_H TEXTLUT 0xC000 = IA16 palette. Some of
+// these have an RGBA16 texconfig (the door's handles came out as noise:
+// tools/n64/models_embedded_ci.py found 7, all matching the remaster's conversions).
+bool palette_load(const uint8_t* b, size_t n, uint32_t number, int* bits, bool* ia) {
+  auto be32 = [&](size_t a) { return (uint32_t(b[a]) << 24) | (uint32_t(b[a + 1]) << 16) | (uint32_t(b[a + 2]) << 8) | b[a + 3]; };
+  for (size_t o = 0; o + 8 <= n; o += 8) {
+    if ((be32(o) >> 24) != 0xFD || be32(o + 4) != number) continue;
+    bool tlut = false, ia_mode = false;
+    int siz = -1;
+    for (size_t k = o + 8; k + 8 <= n && k < o + 8 * 48; k += 8) {
+      const uint32_t w0 = be32(k), w1 = be32(k + 4);
+      const uint32_t op = w0 >> 24;
+      if (op == 0xFD) break;
+      if (op == 0xF0) tlut = true;
+      if (op == 0xBA && (w0 & 0xFFFF) == 0x0E02) ia_mode = w1 == 0xC000;
+      if (op == 0xF5 && ((w1 >> 24) & 7) == 0 && siz < 0) siz = int((w0 >> 19) & 3);
+    }
+    if (tlut && (siz == 0 || siz == 1)) {
+      *bits = 4 << siz;
+      *ia = ia_mode;
+      return true;
+    }
+  }
+  return false;
+}
+
 std::mutex g_model_tex_mutex;
 std::unordered_map<int, std::unique_ptr<n64dec::Image>> g_model_tex;  // decoded (null: couldn't be)
 
@@ -257,11 +285,16 @@ const n64dec::Image* model_texture(int id) {
     if ((configs >> 24) == 5 && s->second.second < count && at + 12 <= file->size()) {
       const uint32_t number = be32(at);
       const size_t offset = number & 0xFFFFFF;
-      const int w = b[at + 4], h = b[at + 5], fmt = b[at + 7], siz = b[at + 8];
+      const int w = b[at + 4], h = b[at + 5], levels = b[at + 6], fmt = b[at + 7], siz = b[at + 8];
       auto decoded = std::make_unique<n64dec::Image>();
-      if ((number >> 24) == 5 && offset < file->size() &&
-          n64dec::DecodeTmem(b + offset, file->size() - offset, fmt, siz, w, h, *decoded))
-        im = std::move(decoded);
+      int bits = 0;
+      bool ia = false;
+      if ((number >> 24) == 5 && offset < file->size()) {
+        const bool ok = palette_load(b, file->size(), number, &bits, &ia)
+                            ? n64dec::DecodeTmemCI(b + offset, file->size() - offset, bits, w, h, levels, ia, *decoded)
+                            : n64dec::DecodeTmem(b + offset, file->size() - offset, fmt, siz, w, h, *decoded);
+        if (ok) im = std::move(decoded);
+      }
     }
   }
   std::lock_guard<std::mutex> lock(g_model_tex_mutex);
@@ -273,6 +306,89 @@ const n64dec::Image* model_texture(int id) {
 }  // namespace
 
 bool IsModelTexture(int id) { return model_texture_sources().count(id) != 0; }
+
+std::vector<int> ModelTextureIds() {
+  std::vector<int> ids;
+  for (const auto& [id, source] : model_texture_sources()) ids.push_back(id);
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
+namespace {
+
+// An in-file texture's hi-res checksum: the model file is RDRAM as loaded (TMEM
+// layout already), so the checksum runs over its bytes at the texture's offset.
+bool in_file_hires(int id, uint32_t& crc, HiresEntry& e) {
+  const auto& sources = model_texture_sources();
+  const auto s = sources.find(id);
+  if (s == sources.end()) return false;
+  const std::vector<uint8_t>* file = RomFile(s->second.first);
+  if (!file || file->size() < 28) return false;
+  const uint8_t* b = file->data();
+  auto be32 = [&](size_t a) { return (uint32_t(b[a]) << 24) | (uint32_t(b[a + 1]) << 16) | (uint32_t(b[a + 2]) << 8) | b[a + 3]; };
+  const int count = int16_t((b[22] << 8) | b[23]);
+  const uint32_t configs = be32(24);
+  const size_t at = size_t(configs - 0x05000000u) + size_t(s->second.second) * 12;
+  if ((configs >> 24) != 5 || s->second.second >= count || at + 12 > file->size()) return false;
+  const uint32_t number = be32(at);
+  const size_t offset = number & 0xFFFFFF;
+  int w = b[at + 4], h = b[at + 5], levels = b[at + 6], fmt = b[at + 7], siz = b[at + 8];
+  if ((number >> 24) != 5 || !w || !h || offset >= file->size() || siz > 3) return false;
+  int bits = 0;
+  bool ia = false;
+  const bool ci = palette_load(b, file->size(), number, &bits, &ia);
+  if (ci) {
+    fmt = 2;
+    siz = bits == 4 ? 0 : 1;
+  }
+  const size_t row = siz == 3 ? ((size_t(w) * 4 + 7) & ~size_t(7)) : ((((size_t(w) << siz) >> 1) + 7) & ~size_t(7));
+  crc = n64dec::HiresCrc(b + offset, file->size() - offset, w, h, siz, row);
+  e = HiresEntry{id, uint8_t(fmt), uint8_t(siz), {}};
+  if (ci) {
+    // The palette follows the index data (every level).
+    size_t index_bytes = 0;
+    for (int l = 0; l < std::max(1, levels); ++l) {
+      const size_t lw = size_t(std::max(1, w >> l)), lh = size_t(std::max(1, h >> l));
+      index_bytes += (lw * size_t(bits) >= 8 ? ((lw * size_t(bits) / 8 + 7) & ~size_t(7)) : 8) * lh;
+    }
+    const size_t entries = bits == 4 ? 16 : 256;
+    if (offset + index_bytes + entries * 2 <= file->size()) {
+      std::vector<uint16_t> pal(256, 0);
+      for (size_t i = 0; i < entries; ++i)
+        pal[i] = uint16_t((b[offset + index_bytes + 2 * i] << 8) | b[offset + index_bytes + 2 * i + 1]);
+      const size_t counts[4] = {16, 256, entries, entries};
+      for (int k = 0; k < 4; ++k) e.palette[k] = n64dec::HiresPaletteCrc(pal.data(), counts[k]);
+    }
+  }
+  return true;
+}
+
+std::mutex g_hires_mutex;
+std::unique_ptr<std::unordered_multimap<uint32_t, HiresEntry>> g_hires;
+
+}  // namespace
+
+const std::unordered_multimap<uint32_t, HiresEntry>* HiresTable() {
+  if (g_status.load(std::memory_order_acquire) != Status::kReady) return nullptr;
+  std::lock_guard<std::mutex> lock(g_hires_mutex);
+  if (g_hires) return g_hires.get();
+  auto table = std::make_unique<std::unordered_multimap<uint32_t, HiresEntry>>();
+  for (size_t id = 0; id < g_images.size(); ++id) {
+    const n64dec::Image& im = g_images[id];
+    if (im.rgba.empty() || !im.hires_crc) continue;
+    HiresEntry e{int(id), im.gbi_fmt, im.gbi_siz, {}};
+    std::copy(std::begin(im.hires_pal), std::end(im.hires_pal), std::begin(e.palette));
+    table->emplace(im.hires_crc, e);
+  }
+  for (const int id : ModelTextureIds()) {
+    uint32_t crc = 0;
+    HiresEntry e{};
+    if (in_file_hires(id, crc, e)) table->emplace(crc, e);
+  }
+  REXLOG_INFO("[n64] hi-res pack checksums: {} textures", table->size());
+  g_hires = std::move(table);
+  return g_hires.get();
+}
 
 const n64dec::Image* Get(int id) {
   if (id < 0 || g_status.load(std::memory_order_acquire) != Status::kReady) return nullptr;
