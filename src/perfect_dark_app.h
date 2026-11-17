@@ -8932,10 +8932,9 @@ class PerfectDarkApp : public rex::ReXApp {
     }
     pd::n64tex::SetEnabled(on);
     SavePcSettings();
-    const pd::n64tex::Status s = pd::n64tex::GetStatus();
+    // No notice: the picture itself shows the switch (user, 2026-11-17). Only
+    // problems (no ROM, Classic renderer, an unusable ROM) are announced.
     REXLOG_INFO("[n64] textures switched to {}", on ? "N64" : "remastered");
-    rex::kernel::xam::netplay::ShowNotice(on ? (s == Status::kReady ? "Textures: N64" : "Textures: N64 (loading)")
-                                             : "Textures: Remastered");
   }
 
   static void ToggleN64Textures() { SetN64Textures(!pd::n64tex::Enabled()); }
@@ -9275,9 +9274,7 @@ class PerfectDarkApp : public rex::ReXApp {
     if (std::chrono::steady_clock::now() - first < std::chrono::seconds(8)) return;
     last = s;
     if (!pd::n64tex::Enabled()) return;
-    if (s == Status::kReady) {
-      rex::kernel::xam::netplay::ShowNotice("Textures: N64");
-    } else if (s != Status::kLoading && s != Status::kIdle) {
+    if (s != Status::kReady && s != Status::kLoading && s != Status::kIdle) {
       pd::n64tex::SetEnabled(false);  // saved off: no notice at every start
       SavePcSettings();
       REXLOG_INFO("[n64] textures switched back to remastered: the ROM can't be used");
