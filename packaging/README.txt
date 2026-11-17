@@ -154,7 +154,8 @@ two pages of PC options for it:
   Advanced Control      from Rare's 2010 Xbox 360 update: Legacy (left stick moves
                         and turns, right stick strafes and looks up and down),
                         Southpaw (sticks swapped), Swap Triggers, Secondary Fire
-                        Reset, and Aim Sensitivity (how fast you aim while
+                        Reset, Lock Sight (the crosshair stays centred while you
+                        turn), and Aim Sensitivity (how fast you aim while
                         holding Aim; "Original" is this version's own speed).
                         One setting for every controller.
 

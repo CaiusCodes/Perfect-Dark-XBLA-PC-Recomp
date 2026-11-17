@@ -3763,7 +3763,7 @@ class PerfectDarkApp : public rex::ReXApp {
   // like Stick Settings: four checkboxes, labelled with the title update's own words
   // in the game's five languages (Windows-1252, as the game's text). Labels in
   // advanced_strings_, 48 bytes each: the row, the page title, then the options.
-  static constexpr int kAdvancedLabels = 7;
+  static constexpr int kAdvancedLabels = 8;
   static constexpr uint32_t kAdvancedLabelSize = 48;
   static inline uint32_t advanced_strings_ = 0;
   static inline uint32_t advanced_dialog_ = 0;
@@ -3782,6 +3782,8 @@ class PerfectDarkApp : public rex::ReXApp {
          "Inverti grilletti\n"},
         {"Aim Sensitivity\n", "Zielempfindlichkeit\n", "Sensibilit\xE9" " de la vis\xE9" "e\n",
          "Sensibilidad al apuntar\n", "Sensibilit\xE0" " mira\n"},
+        {"Lock Sight\n", "Blick arretieren\n", "Verrouiller la vis\xE9" "e\n", "Fijar mirilla\n",
+         "Aggancia bersaglio\n"},
     };
     int lang = 0;
     switch (running_language_) {
@@ -3804,6 +3806,7 @@ class PerfectDarkApp : public rex::ReXApp {
       case 2: return "pd_southpaw";
       case 3: return "pd_legacy_controls";
       case 4: return "pd_secondary_fire_reset";
+      case 7: return "pd_lock_sight";
       default: return "pd_swap_triggers";
     }
   }
@@ -6544,6 +6547,8 @@ class PerfectDarkApp : public rex::ReXApp {
         const int ms = num(2, 100);
         pd::TestInputDriver::RightStick(int16_t(num(0, 0)), int16_t(num(1, 0)), ms);
         test_next_ = now + std::chrono::milliseconds(ms);
+      } else if (c.verb == "rstickhold") {  // rstickhold <x> <y> <ms>: the right stick held, no wait
+        pd::TestInputDriver::RightStick(int16_t(num(0, 0)), int16_t(num(1, 0)), num(2, 100));
       } else if (c.verb == "trig") {  // trig <left 0-255> <right 0-255> <ms>: held, no wait
         pd::TestInputDriver::Triggers(uint8_t(num(0, 0)), uint8_t(num(1, 0)), num(2, 100));
       } else if (c.verb == "wait") {
@@ -7857,17 +7862,17 @@ class PerfectDarkApp : public rex::ReXApp {
       }
     }
     // Advanced Control (the title update's Advanced Control Options, re-created):
-    // four checkboxes (type 0x09) and the Aim Sensitivity slider (type 0x08, value
-    // shown, kAimSensSteps steps), built the same way. (The update's Lock Sight is not
-    // here: its branch is located but its effect wasn't confirmed, HANDOVER 4dd.)
+    // five checkboxes (type 0x09) in the update's order - Southpaw, Legacy, Secondary
+    // Fire Reset, Swap Triggers, Lock Sight (HANDOVER 4df) - and the Aim Sensitivity
+    // slider (type 0x08, value shown, kAimSensSteps steps), built the same way.
     uint32_t advanced_dialog = 0;
     const uint32_t adv_row_label = fd ? fd->AllocateThunk(&PdLabelAdvanced<0>, 0) : 0;
     if (advanced_strings_ && fd && adv_row_label) {
-      constexpr int kRows = 5;
+      constexpr int kRows = 6;
       PPCFunc* const kLabels[kRows] = {&PdLabelAdvanced<2>, &PdLabelAdvanced<3>, &PdLabelAdvanced<4>,
-                                       &PdLabelAdvanced<5>, &PdLabelAdvanced<6>};
+                                       &PdLabelAdvanced<5>, &PdLabelAdvanced<7>, &PdLabelAdvanced<6>};
       PPCFunc* const kHandlers[kRows] = {&PdAdvancedCheckbox<2>, &PdAdvancedCheckbox<3>, &PdAdvancedCheckbox<4>,
-                                         &PdAdvancedCheckbox<5>, &PdAimSensHandler};
+                                         &PdAdvancedCheckbox<5>, &PdAdvancedCheckbox<7>, &PdAimSensHandler};
       const uint32_t title = fd->AllocateThunk(&PdLabelAdvanced<1>, 0);
       const uint32_t items = mem->SystemHeapAlloc((kRows + 1) * 20 + 24);
       bool ok = title && items;

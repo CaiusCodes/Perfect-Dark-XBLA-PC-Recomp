@@ -325,6 +325,9 @@ REXCVAR_DEFINE_BOOL(pd_swap_triggers, false, "PerfectDark",
 REXCVAR_DEFINE_BOOL(pd_secondary_fire_reset, true, "PerfectDark",
                     "Weapons go back to their primary function at the points the game resets them "
                     "(true, the original); false keeps each weapon's chosen function");
+REXCVAR_DEFINE_BOOL(pd_lock_sight, false, "PerfectDark",
+                    "Lock Sight (the title update's option): when not aiming, the crosshair stays in the centre "
+                    "(or on an auto-aim target) instead of swinging as you turn");
 REXCVAR_DEFINE_INT32(pd_aim_sensitivity, -1, "PerfectDark",
                      "Aim Sensitivity (the title update's slider): the look speed while aiming, 0-255 "
                      "(128 = the update's default); -1 = this version's own fixed speed")
@@ -680,6 +683,17 @@ REXCVAR_DEFINE_BOOL(pd_skip_arcade_logo, true, "PerfectDark",
 
 bool PdSkipArcadeLogo() {
   return REXCVAR_GET(pd_skip_arcade_logo);
+}
+
+// Lock Sight (Advanced Control; the title update's option bit 0x100000, HANDOVER 4df).
+// When not aiming, the main control function either moves the crosshair towards an
+// auto-aim target (bgun_swivel to autoaimx / autoaimy; also the CMP150's follow lock-on,
+// weapon 10 with its secondary function) or lets it swing with the turn speed and the
+// gun's extra aim and drift back to the centre. The update, with the option on, always
+// takes the first path: with no target autoaimx / autoaimy are 0, so the crosshair stays
+// in the centre while turning. Re-created at 1.3 0x820F4BA0 (the CMP150 test's branch).
+bool PdLockSightOn() {
+  return REXCVAR_GET(pd_lock_sight);
 }
 
 // Secondary Fire Reset (Advanced Control, HANDOVER 4co): off keeps each weapon's

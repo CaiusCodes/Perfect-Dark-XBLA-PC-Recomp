@@ -343,6 +343,13 @@ address = 0x820F4A20
 name = "PdHookAimSensitivity"
 registers = ["r3", "f0"]
 
+# Lock Sight (pd_lock_sight, Advanced Control): not aiming, the crosshair takes the
+# target / lock-on path (centred with no target) instead of swinging with the turn.
+[[midasm_hook]]
+address = 0x820F4BA0
+name = "PdHookLockSight"
+jump_address_on_true = 0x820F4BB0
+
 # ---- N64 models (Experimental) --------------------------------------------------------
 
 # The model renderer (sub_82194778) draws a DL / GUNDL node's remastered companion

@@ -51,6 +51,7 @@ void PdMpChooseTrack(PPCContext& ctx, uint8_t* base);
 uint32_t PdTextForDisplay(uint32_t text);
 bool PdKeepGunFunctions();
 bool PdAimSensitivityFactor(uint32_t weapon, double* factor);
+bool PdLockSightOn();
 uint32_t PdSmokePoolSize(uint32_t count);
 
 namespace {
@@ -294,6 +295,13 @@ bool PdHookKeepGunFunctions() {
 void PdHookAimSensitivity(PPCRegister& r3, PPCRegister& f0) {
   double factor = 0.0;
   if (PdAimSensitivityFactor(r3.u32, &factor)) f0.f64 = factor;
+}
+
+// Lock Sight: at 1.3 0x820F4BA0 (`bne cr6,0x820f4c1c` after the CMP150 test, not
+// aiming, no auto-aim target), true takes the target / lock-on crosshair path at
+// 0x820F4BB0 for every weapon, as the title update does with its option on.
+bool PdHookLockSight() {
+  return PdLockSightOn();
 }
 
 // sub_82160E30 (smoke reset) before `stw r11,-7480(r10)`: r11 = the smoke count (30 / 60).
