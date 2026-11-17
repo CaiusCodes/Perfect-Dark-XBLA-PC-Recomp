@@ -72,7 +72,7 @@ Most graphics settings apply instantly; Render Scale and Graphics API restart th
 ### Experimental: N64 Mode & Texture Packs
 
 - **N64 mode**: import your own N64 Perfect Dark ROM under **Settings → Graphics → Experimental → Import N64 ROM**, then press **G** (or D-pad Down on a controller) to switch live between the N64 and remastered looks. N64 mode draws the N64's textures, characters, guns, props, level rooms, skies and water from your ROM; the HUD, fonts and menus keep their current look.
-- **Texture packs**: import a pack's `.zip` under **Import Texture Pack** and choose it in **Texture Pack**; it works over either look. Pack makers can turn on **Dump Textures** to save every texture the game draws as a numbered PNG.
+- **Texture packs**: import a pack's `.zip` under **Import Texture Pack** and choose it in **Texture Pack**; it works over either look. Pack makers can use **Dump All Textures** to save every texture of the game as a numbered PNG.
 - **N64 emulator HD packs** (Rice / GLideN64 hi-res naming) work too: import one the same way and it shows in N64 mode, matched through your N64 ROM.
 - Both need Plume (the default renderer). No N64 game data is included: N64 mode only reads the ROM you import.
 
