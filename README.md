@@ -57,7 +57,9 @@ Most graphics settings apply instantly; Render Scale and Graphics API restart th
 - Full **keyboard and mouse** support, including raw mouse input, a Mouse Sensitivity slider and rebindable keys
 - The mouse steers the CamSpy, the hoverbike and the Slayer's guided rocket
 - On-screen tips show your keyboard keys when no controller is connected
-- **Xbox controller** support, with adjustable left and right stick dead zones
+- **Xbox controller** support, with **Stick Settings**: adjustable dead zones and response curves for each stick, for finer aiming
+- **Advanced Control** options from Rare's 2010 Xbox 360 update: Legacy, Southpaw, Swap Triggers and Secondary Fire Reset
+- Explosions last as long as on the N64, as in Rare's 2010 update
 - Native PC settings menus
 - Optional Auto-Aim
 - Skip cutscenes using mouse or controller
@@ -66,6 +68,12 @@ Most graphics settings apply instantly; Render Scale and Graphics API restart th
 - Local achievements and leaderboards
 - Portable installation with local saves and settings
 - Built-in update checker
+
+### Experimental: N64 Mode & Texture Packs
+
+- **N64 mode**: import your own N64 Perfect Dark ROM under **Settings → Graphics → Experimental → Import N64 ROM**, then press **G** (or D-pad Down on a controller) to switch live between the N64 and remastered looks. N64 mode draws the N64's textures, characters, guns, props, level rooms, skies and water from your ROM; the HUD, fonts and menus keep their current look.
+- **Texture packs**: import a pack's `.zip` under **Import Texture Pack** and choose it in **Texture Pack**; it works over either look. Pack makers can turn on **Dump Textures** to save every texture the game draws as a numbered PNG.
+- Both need Plume (the default renderer). No N64 game data is included: N64 mode only reads the ROM you import.
 
 ### Multiplayer
 
@@ -95,6 +103,7 @@ Most graphics settings apply instantly; Render Scale and Graphics API restart th
 | Mouse Wheel | Switch weapons |
 | Ctrl | Crouch |
 | Tab | Objectives |
+| G | Switch Graphics (N64 / remastered, with an imported N64 ROM) |
 | Esc | Pause / Back |
 
 All key bindings can be customised under **Help & Options → Settings → Keyboard & Mouse**.
@@ -116,6 +125,7 @@ For detailed changes and bug fixes, see the [release notes](https://github.com/C
 - Windows only.
 - Some multiplayer configurations.
 - Vulkan has not been fully tested on AMD and Intel GPUs.
+- N64 mode and texture packs are experimental. N64 mode is tested with the PAL ROM; the NTSC versions are accepted but untested.
 - Windows SmartScreen may warn about the unsigned executable. Download only from the official release page.
 - Windows Firewall may request permission for network multiplayer.
 - Displays running at 144 or 165 Hz without variable refresh may exhibit uneven 60 FPS pacing. Use G-Sync / FreeSync or a 120 Hz refresh rate if available.
