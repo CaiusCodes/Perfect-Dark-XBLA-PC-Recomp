@@ -325,6 +325,10 @@ REXCVAR_DEFINE_BOOL(pd_swap_triggers, false, "PerfectDark",
 REXCVAR_DEFINE_BOOL(pd_secondary_fire_reset, true, "PerfectDark",
                     "Weapons go back to their primary function at the points the game resets them "
                     "(true, the original); false keeps each weapon's chosen function");
+REXCVAR_DEFINE_INT32(pd_aim_sensitivity, -1, "PerfectDark",
+                     "Aim Sensitivity (the title update's slider): the look speed while aiming, 0-255 "
+                     "(128 = the update's default); -1 = this version's own fixed speed")
+    .range(-1, 255);
 // Explosion durations as on the N64 (title update fix, HANDOVER 4cp; perfect_dark_app.h
 // TickExplosionDurations). This version shows explosions for about a quarter of the time.
 REXCVAR_DEFINE_BOOL(pd_n64_explosions, true, "PerfectDark",
@@ -682,6 +686,25 @@ bool PdSkipArcadeLogo() {
 // chosen function where the game would set it back to the primary one.
 bool PdKeepGunFunctions() {
   return !REXCVAR_GET(pd_secondary_fire_reset);
+}
+
+// Aim Sensitivity (Advanced Control; the title update's slider at player config +122,
+// HANDOVER 4dd). The look speed while aiming (player +296 set) is scaled by a fixed
+// 0.25, or 0.5 with the Farsight (weapon 22), in two places: the main control function
+// (stored at player +336) and sub_820F1EA8. The update replaces that factor with
+// sens / 255 * 0.12 + 0.2 (Farsight: * 0.2 + 0.4), sens 0-255, default 128 (0.260 /
+// 0.500). Computed as the update does, in single precision (the reciprocal 1/255 and
+// the constants are the update's floats). -1 keeps 1.3's fixed factor (returns false).
+bool PdAimSensitivityFactor(uint32_t weapon, double* factor) {
+  const int sens = REXCVAR_GET(pd_aim_sensitivity);
+  if (sens < 0) return false;
+  const bool farsight = weapon == 22;
+  const float scale = 0.003921568859368563f;  // 1/255 as a float
+  const float a = farsight ? 0.20000001788139343f : 0.11999998986721039f;
+  const float b = farsight ? 0.4000000059604645f : 0.20000000298023224f;
+  const float f8 = float(std::min(sens, 255)) * scale;
+  *factor = double(float(double(f8) * double(a) + double(b)));  // fmadds: one rounding
+  return true;
 }
 
 // The smoke pool (title update, HANDOVER / TU-NOTES "Smoke"): sub_82160E30 sizes it at

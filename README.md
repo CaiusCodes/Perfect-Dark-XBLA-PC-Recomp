@@ -58,7 +58,7 @@ Most graphics settings apply instantly; Render Scale and Graphics API restart th
 - The mouse steers the CamSpy, the hoverbike and the Slayer's guided rocket
 - On-screen tips show your keyboard keys when no controller is connected
 - **Xbox controller** support, with **Stick Settings**: adjustable dead zones and response curves for each stick, for finer aiming
-- **Advanced Control** options from Rare's 2010 Xbox 360 update: Legacy, Southpaw, Swap Triggers and Secondary Fire Reset
+- **Advanced Control** options from Rare's 2010 Xbox 360 update: Legacy, Southpaw, Swap Triggers, Secondary Fire Reset and Aim Sensitivity
 - Explosions last as long as on the N64, as in Rare's 2010 update
 - Native PC settings menus
 - Optional Auto-Aim

@@ -153,8 +153,10 @@ two pages of PC options for it:
                         unchanged). "Original" plays as the game always did.
   Advanced Control      from Rare's 2010 Xbox 360 update: Legacy (left stick moves
                         and turns, right stick strafes and looks up and down),
-                        Southpaw (sticks swapped), Swap Triggers, and Secondary
-                        Fire Reset. One setting for every controller.
+                        Southpaw (sticks swapped), Swap Triggers, Secondary Fire
+                        Reset, and Aim Sensitivity (how fast you aim while
+                        holding Aim; "Original" is this version's own speed).
+                        One setting for every controller.
 
 Diagonals: holding two movement keys (W+A, W+D) moves as fast as the fastest an
 Xbox controller's thumbstick can go on a diagonal, so keyboard and controller

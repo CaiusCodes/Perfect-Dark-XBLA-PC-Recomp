@@ -92,6 +92,7 @@ REXCVAR_DECLARE(int32_t, pd_stick_response_right);
 REXCVAR_DECLARE(int32_t, pd_stick_response_left);
 REXCVAR_DECLARE(bool, pd_n64_textures_pad);
 REXCVAR_DECLARE(bool, pd_southpaw);
+REXCVAR_DECLARE(int32_t, pd_aim_sensitivity);
 REXCVAR_DECLARE(bool, pd_legacy_controls);
 REXCVAR_DECLARE(bool, pd_swap_triggers);
 REXCVAR_DECLARE(bool, pd_secondary_fire_reset);
@@ -3761,7 +3762,7 @@ class PerfectDarkApp : public rex::ReXApp {
   // like Stick Settings: four checkboxes, labelled with the title update's own words
   // in the game's five languages (Windows-1252, as the game's text). Labels in
   // advanced_strings_, 48 bytes each: the row, the page title, then the options.
-  static constexpr int kAdvancedLabels = 6;
+  static constexpr int kAdvancedLabels = 7;
   static constexpr uint32_t kAdvancedLabelSize = 48;
   static inline uint32_t advanced_strings_ = 0;
   static inline uint32_t advanced_dialog_ = 0;
@@ -3778,6 +3779,8 @@ class PerfectDarkApp : public rex::ReXApp {
          "R\xE9" "initialiser tir secondaire\n", "Restablecer disparo secundario\n", "Reimposta Fuoco secondario\n"},
         {"Swap Triggers\n", "Schalter vertauschen\n", "Inverser les g\xE2" "chettes\n", "Cambiar gatillos\n",
          "Inverti grilletti\n"},
+        {"Aim Sensitivity\n", "Zielempfindlichkeit\n", "Sensibilit\xE9" " de la vis\xE9" "e\n",
+         "Sensibilidad al apuntar\n", "Sensibilit\xE0" " mira\n"},
     };
     int lang = 0;
     switch (running_language_) {
@@ -3802,6 +3805,51 @@ class PerfectDarkApp : public rex::ReXApp {
       case 4: return "pd_secondary_fire_reset";
       default: return "pd_swap_triggers";
     }
+  }
+
+  // Aim Sensitivity (label 6): a slider of 17 steps. Step 0 is "Original" (1.3's fixed
+  // aiming speed, pd_aim_sensitivity -1); steps 1-17 are the title update's 0-255 in
+  // sixteenths (step 9 = 128, the update's default), shown as 0-100%.
+  static constexpr uint32_t kAimSensSteps = 17;
+  static uint32_t AimSensStep(int sens) {
+    if (sens < 0) return 0;
+    return 1 + uint32_t(std::lround(double(std::min(sens, 255)) * 16.0 / 255.0));
+  }
+  static void PdAimSensHandler(PPCContext& ctx, uint8_t*) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t op = ctx.r3.u32;
+    const uint32_t data = ctx.r5.u32;
+    switch (op) {
+      case 9:  // slider position
+        if (mem && data) WriteGuestU32(mem, data, AimSensStep(int(REXCVAR_GET(pd_aim_sensitivity))));
+        break;
+      case 6: {  // moved
+        if (!mem || !data) break;
+        const uint32_t step = std::min(ReadGuestU32(mem, data), kAimSensSteps);
+        const int sens = step == 0 ? -1 : int(std::lround(double(step - 1) * 255.0 / 16.0));
+        const std::string value = std::to_string(sens);
+        if (rex::cvar::GetFlagByName("pd_aim_sensitivity") != value &&
+            rex::cvar::SetFlagByName("pd_aim_sensitivity", value)) {
+          SavePcSettings();
+        }
+        break;
+      }
+      case 10: {  // the text shown with the slider
+        const uint32_t buffer = mem && data ? ReadGuestU32(mem, data + 4) : 0;
+        if (buffer >= 0x40000000) {
+          const uint32_t step = std::min(ReadGuestU32(mem, data), kAimSensSteps);
+          char buf[16];
+          if (step == 0) snprintf(buf, sizeof(buf), "Original");
+          else snprintf(buf, sizeof(buf), "%u%%", unsigned(std::lround(double(step - 1) * 100.0 / 16.0)));
+          WriteGuestBytes(mem, buffer, buf, strlen(buf) + 1);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    ctx.r3.u64 = 0;
   }
   template <int kWhich>
   static void PdAdvancedCheckbox(PPCContext& ctx, uint8_t*) {
@@ -7806,25 +7854,31 @@ class PerfectDarkApp : public rex::ReXApp {
       }
     }
     // Advanced Control (the title update's Advanced Control Options, re-created):
-    // four checkboxes (type 0x09), built the same way.
+    // four checkboxes (type 0x09) and the Aim Sensitivity slider (type 0x08, value
+    // shown, kAimSensSteps steps), built the same way. (The update's Lock Sight is not
+    // here: its branch is located but its effect wasn't confirmed, HANDOVER 4dd.)
     uint32_t advanced_dialog = 0;
     const uint32_t adv_row_label = fd ? fd->AllocateThunk(&PdLabelAdvanced<0>, 0) : 0;
     if (advanced_strings_ && fd && adv_row_label) {
-      PPCFunc* const kLabels[4] = {&PdLabelAdvanced<2>, &PdLabelAdvanced<3>, &PdLabelAdvanced<4>, &PdLabelAdvanced<5>};
-      PPCFunc* const kHandlers[4] = {&PdAdvancedCheckbox<2>, &PdAdvancedCheckbox<3>, &PdAdvancedCheckbox<4>,
-                                     &PdAdvancedCheckbox<5>};
+      constexpr int kRows = 5;
+      PPCFunc* const kLabels[kRows] = {&PdLabelAdvanced<2>, &PdLabelAdvanced<3>, &PdLabelAdvanced<4>,
+                                       &PdLabelAdvanced<5>, &PdLabelAdvanced<6>};
+      PPCFunc* const kHandlers[kRows] = {&PdAdvancedCheckbox<2>, &PdAdvancedCheckbox<3>, &PdAdvancedCheckbox<4>,
+                                         &PdAdvancedCheckbox<5>, &PdAimSensHandler};
       const uint32_t title = fd->AllocateThunk(&PdLabelAdvanced<1>, 0);
-      const uint32_t items = mem->SystemHeapAlloc(5 * 20 + 24);
+      const uint32_t items = mem->SystemHeapAlloc((kRows + 1) * 20 + 24);
       bool ok = title && items;
-      for (int i = 0; ok && i < 4; ++i) {
+      for (int i = 0; ok && i < kRows; ++i) {
         const uint32_t label = fd->AllocateThunk(kLabels[i], 0);
         const uint32_t handler = fd->AllocateThunk(kHandlers[i], 0);
         ok = label && handler;
-        const uint32_t row[5] = {0x09000000, 0, label, 0, handler};
+        const bool slider = i == kRows - 1;
+        const uint32_t row[5] = {slider ? 0x08000000u : 0x09000000u, slider ? 0x00100000u : 0u, label,
+                                 slider ? kAimSensSteps : 0u, handler};
         for (int w = 0; ok && w < 5; ++w) WriteGuestU32(mem, items + uint32_t(i) * 20 + w * 4, row[w]);
       }
       if (ok) {
-        const uint32_t term = items + 4 * 20;
+        const uint32_t term = items + uint32_t(kRows) * 20;
         WriteGuestU32(mem, term, kTypeEnd << 24);
         for (int w = 1; w < 5; ++w) WriteGuestU32(mem, term + w * 4, 0);
         advanced_dialog = term + 20;

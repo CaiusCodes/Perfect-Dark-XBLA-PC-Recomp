@@ -50,6 +50,7 @@ void PdNetLookApply(uint32_t pad);
 void PdMpChooseTrack(PPCContext& ctx, uint8_t* base);
 uint32_t PdTextForDisplay(uint32_t text);
 bool PdKeepGunFunctions();
+bool PdAimSensitivityFactor(uint32_t weapon, double* factor);
 uint32_t PdSmokePoolSize(uint32_t count);
 
 namespace {
@@ -286,6 +287,13 @@ void PdHookTextLookup(PPCRegister& r3) {
 // Secondary Fire Reset off: the reset of the weapons' functions is skipped.
 bool PdHookKeepGunFunctions() {
   return PdKeepGunFunctions();
+}
+
+// Aim Sensitivity: before `fmuls f12,f13,f0` in sub_820F1EA8 and sub_820F2988, where
+// f0 is the fixed 0.25 (0.5 for the Farsight) and r3 the weapon: the slider's factor.
+void PdHookAimSensitivity(PPCRegister& r3, PPCRegister& f0) {
+  double factor = 0.0;
+  if (PdAimSensitivityFactor(r3.u32, &factor)) f0.f64 = factor;
 }
 
 // sub_82160E30 (smoke reset) before `stw r11,-7480(r10)`: r11 = the smoke count (30 / 60).
