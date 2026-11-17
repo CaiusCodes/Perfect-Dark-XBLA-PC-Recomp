@@ -14,7 +14,10 @@
 #include <algorithm>
 #include <csignal>
 #include <filesystem>
+#include <mutex>
+#include <set>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #pragma comment(lib, "dbghelp.lib")
@@ -128,6 +131,81 @@ uint32_t PdRoomBrightnessFloor(uint32_t brightness) {
 REXCVAR_DEFINE_BOOL(pd_view_bob, true, "PerfectDark",
                     "Camera bob while walking (off = the camera stays level and steady)");
 
+// N64 models (Experimental, N64-NOTES.md). Every file the game loads goes through
+// sub_822549C0 (PackedSegFile, file id, destination): its address -> id map tells
+// the model renderer which model file a node belongs to (model+8 = the modeldef =
+// the loaded file).
+namespace {
+std::mutex g_file_mutex;
+std::unordered_map<uint32_t, uint16_t> g_file_at;  // load address -> file id
+}  // namespace
+
+void PdNoteFileLoad(uint32_t fileid, uint32_t dst) {
+  std::lock_guard<std::mutex> lock(g_file_mutex);
+  g_file_at[dst] = uint16_t(fileid);
+}
+
+// Also read by pd_n64_models.cpp (PdFileIdAt).
+int PdFileAt(uint32_t address) {
+  std::lock_guard<std::mutex> lock(g_file_mutex);
+  auto it = g_file_at.find(address);
+  return it == g_file_at.end() ? -1 : int(it->second);
+}
+
+// The model renderer's per-node choice: `link` is the node's u16 link sign-extended
+// (-1 = no remastered mesh), `model` the guest model. True draws the N64 display
+// list instead of the remaster's companion mesh. pd_n64_trace logs each model file
+// the first time one of its remastered meshes is drawn in a stage.
+REXCVAR_DECLARE(bool, pd_n64_trace);
+bool PdN64ModelLink(uint8_t* base, uint32_t link, uint32_t model) {
+  // -1: no remastered part (the N64 display list is drawn anyway). 0: a part of a
+  // remastered mesh drawn at another node (the remaster draws nothing here); the N64
+  // files had 0 everywhere, so in N64 mode these are drawn too.
+  const int16_t value = int16_t(link);
+  if (value == -1) return false;
+  const bool trace = REXCVAR_GET(pd_n64_trace);
+  if (!trace && !pd::n64tex::ModelsActive()) return false;
+  auto load = [&](uint32_t a) { return _byteswap_ulong(*reinterpret_cast<const uint32_t*>(base + a)); };
+  const int file = model ? PdFileAt(load(model + 8)) : -1;
+  if (trace) {
+    static std::mutex mutex;
+    static std::set<uint64_t> seen;
+    const uint32_t stage = load(0x826492E0u);
+    std::lock_guard<std::mutex> lock(mutex);
+    if (seen.insert((uint64_t(stage) << 32) | uint32_t(file & 0xFFFF)).second)
+      REXLOG_INFO("[n64] model: file {} (0x{:X}) has remastered meshes, drawn in stage {}{}", file, file & 0xFFFF,
+                  stage, pd::n64tex::RemasterOnlyModel(file) ? "; kept remastered" : "");
+  }
+  return pd::n64tex::ModelsActive() && !pd::n64tex::RemasterOnlyModel(file);
+}
+
+// The N64 DL node renderer (sub_82193B68) after it fetched the node's rwdata (r3) and
+// its display list (r11 = rwdata->gdl): the remaster leaves the rwdata of nodes that
+// have a remastered mesh empty, so in N64 mode it is set up as the N64 does on first
+// use (vertices, opagdl, colours after the vertices; model_init_rw_data). Returns the
+// display list to use.
+uint32_t PdN64ModelRwData(uint8_t* base, uint32_t rwdata, uint32_t gdl, uint32_t rodata, uint32_t node) {
+  if (!rwdata || !rodata || !node || !pd::n64tex::ModelsActive()) return gdl;
+  auto load = [&](uint32_t a) { return _byteswap_ulong(*reinterpret_cast<const uint32_t*>(base + a)); };
+  auto store = [&](uint32_t a, uint32_t v) { *reinterpret_cast<uint32_t*>(base + a) = _byteswap_ulong(v); };
+  const int16_t link = int16_t(_byteswap_ushort(*reinterpret_cast<const uint16_t*>(base + node + 2)));
+  if (link == -1) return gdl;  // the game's own N64 node: left alone
+  const uint32_t opagdl = load(rodata + 0), vertices = load(rodata + 12);
+  const int16_t numvertices = int16_t(_byteswap_ushort(*reinterpret_cast<const uint16_t*>(base + rodata + 16)));
+  if (REXCVAR_GET(pd_n64_trace)) {
+    static int logged = 0;
+    if (logged++ < 40)
+      REXLOG_INFO("[n64] model rwdata 0x{:08X} for node 0x{:08X} (link {:04X}): {:08X} {:08X} {:08X}; rodata gdl {:08X} xlu {:08X} vtx {:08X} n {} mode {}",
+                  rwdata, node, uint16_t(link), load(rwdata), load(rwdata + 4), load(rwdata + 8), opagdl,
+                  load(rodata + 4), vertices, numvertices, int16_t(_byteswap_ushort(*reinterpret_cast<const uint16_t*>(base + rodata + 18))));
+  }
+  if (gdl || !opagdl) return gdl;
+  store(rwdata + 0, vertices);
+  store(rwdata + 4, opagdl);
+  store(rwdata + 8, (vertices + uint32_t(std::max<int16_t>(numvertices, 0)) * 12 + 7) & ~7u);
+  return opagdl;
+}
+
 void PdViewBobHold(uint8_t* base, uint32_t sp) {
   if (REXCVAR_GET(pd_view_bob)) return;
   auto load = [base](uint32_t a) {
@@ -225,6 +303,37 @@ REXCVAR_DEFINE_INT32(pd_deadzone_left, 30, "PerfectDark",
                      "Controller left stick dead zone, percent of its travel (0-30). "
                      "30 is the game's own; lower reacts to smaller movements")
     .range(0, 30);
+// Stick response (issue #26): a curve on each controller stick's travel past
+// its dead zone, in tenths of a power (10 = 1.0 = the game's own linear
+// response, 20 = squared like the N64's turning: finer near the centre). Full
+// deflection is unchanged.
+// Settings > Gamepad Controls > Stick Settings (perfect_dark_app.h, "Stick dead zones").
+REXCVAR_DEFINE_INT32(pd_stick_response_right, 10, "PerfectDark",
+                     "Controller right stick response curve, tenths (10-20). 10 is the game's own; "
+                     "higher is slower near the centre, full tilt unchanged")
+    .range(10, 20);
+// Advanced Control Options (Rare's 2010 title update, re-created on 1.3: TU-NOTES.md,
+// HANDOVER 4co). Controllers only; keyboard and mouse are not affected.
+// Settings > Gamepad Controls > Advanced Control (perfect_dark_app.h, "Advanced Control").
+REXCVAR_DEFINE_BOOL(pd_southpaw, false, "PerfectDark",
+                    "Controller Southpaw: the two sticks swapped (move and strafe on the right)");
+REXCVAR_DEFINE_BOOL(pd_legacy_controls, false, "PerfectDark",
+                    "Controller Legacy: left stick moves and turns, right stick strafes and looks up/down "
+                    "(with Southpaw too: only the up/down axes swapped)");
+REXCVAR_DEFINE_BOOL(pd_swap_triggers, false, "PerfectDark",
+                    "Controller: the left and right triggers swapped in play");
+REXCVAR_DEFINE_BOOL(pd_secondary_fire_reset, true, "PerfectDark",
+                    "Weapons go back to their primary function at the points the game resets them "
+                    "(true, the original); false keeps each weapon's chosen function");
+// Explosion durations as on the N64 (title update fix, HANDOVER 4cp; perfect_dark_app.h
+// TickExplosionDurations). This version shows explosions for about a quarter of the time.
+REXCVAR_DEFINE_BOOL(pd_n64_explosions, true, "PerfectDark",
+                    "Explosions last as long as on the N64 (the 2010 title update's fix); false: as in "
+                    "the original release");
+REXCVAR_DEFINE_INT32(pd_stick_response_left, 10, "PerfectDark",
+                     "Controller left stick response curve, tenths (10-20). 10 is the game's own; "
+                     "higher is slower near the centre, full tilt unchanged")
+    .range(10, 20);
 
 int64_t PdMpFacingDelayMs() {
   return REXCVAR_GET(pd_mp_facing_delay_ms);
@@ -567,6 +676,21 @@ REXCVAR_DEFINE_BOOL(pd_skip_arcade_logo, true, "PerfectDark",
 
 bool PdSkipArcadeLogo() {
   return REXCVAR_GET(pd_skip_arcade_logo);
+}
+
+// Secondary Fire Reset (Advanced Control, HANDOVER 4co): off keeps each weapon's
+// chosen function where the game would set it back to the primary one.
+bool PdKeepGunFunctions() {
+  return !REXCVAR_GET(pd_secondary_fire_reset);
+}
+
+// The smoke pool (title update, HANDOVER / TU-NOTES "Smoke"): sub_82160E30 sizes it at
+// each stage load, 30 or 60 smokes of 1612 bytes from the stage memory pool. Explosions
+// that last as long as on the N64 (pd_n64_explosions) leave more smoke alive at once, so
+// the update doubled it (60 / 120) with them; so does this, while they are on. Read at
+// the next stage load.
+uint32_t PdSmokePoolSize(uint32_t count) {
+  return REXCVAR_GET(pd_n64_explosions) ? count * 2 : count;
 }
 
 // The blue "Xbox 360 Product Identification" screen is the N64 game's legal

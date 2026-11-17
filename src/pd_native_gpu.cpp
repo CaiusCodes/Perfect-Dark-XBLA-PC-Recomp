@@ -30,9 +30,12 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <cmath>
@@ -46,7 +49,9 @@
 #include <vector>
 
 #include "generated/default/perfect_dark_init.h"  // PPCContext, generated function declarations
+#include "pd_n64_textures.h"
 #include "pd_native_shaders.h"
+#include "pd_texture_packs.h"
 #include "pd_native_vk_out.h"
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -169,6 +174,10 @@ REXCVAR_DEFINE_INT32(gpu_native_frame_stats, 0, "GPU",
                      "Log guest frame times (Swap to Swap) every this many frames, native or Xenos (0 = off)");
 REXCVAR_DEFINE_INT32(gpu_native_debug_clear, 0, "GPU",
                      "Native renderer test: clear to this 0xRRGGBB instead of the game's colour (0 = off)");
+REXCVAR_DEFINE_BOOL(pd_n64_trace, false, "PerfectDark",
+                    "N64 textures test: log each new texture's Textures.raw id and the guest object it came from");
+REXCVAR_DEFINE_STRING(pd_n64_ids, "", "PerfectDark",
+                      "N64 textures test: only these Textures.raw ids get the N64 picture, \"a-b\" (empty = all)");
 
 namespace pd {
 // Texture Filtering: sampler_slot applies this anisotropy (GoldenEye's
@@ -520,6 +529,14 @@ struct Native {
   // texture from memory gave black (the Perfect Menu's blurred background).
   std::unordered_map<uint32_t, uint32_t> resolved_base;      // base address -> guest texture in `resolved`
   std::unordered_map<uint64_t, ResolvedTexture> textures_by_fetch;  // fetch constant hash -> upload
+  // N64 textures (pd_n64_textures.h): Textures.raw id -> the N64 picture's upload
+  // (`content` = the colour lookup's version it was made with).
+  std::unordered_map<uint32_t, ResolvedTexture> classic;
+  // Texture packs (pd_texture_packs.h): Textures.raw id -> the pack picture's
+  // upload (its `job` while the worker decodes it); the chosen pack's index as
+  // of this frame.
+  std::unordered_map<uint32_t, ResolvedTexture> pack;
+  std::shared_ptr<const pd::texpack::Index> pack_index;
   uint32_t textures_stage = 0;  // the stage textures_by_fetch was filled in (begin_frame)
   std::vector<std::unique_ptr<RenderSampler>> sampler_objects;
   std::unordered_map<uint64_t, uint32_t> sampler_slots;        // filter/clamp/mip key -> sampler slot
@@ -2392,6 +2409,9 @@ struct TextureJob {
   uint32_t f[6] = {}, addr = 0, tex = 0;
   PreparedTexture result;
   std::atomic<bool> done{false};
+  // Other work for the worker (a pack picture's decode, a texture dump):
+  // run instead of preparing the guest texture.
+  std::function<void(PreparedTexture&)> make;
 };
 
 struct TextureWorker {
@@ -2421,7 +2441,8 @@ struct TextureWorker {
         job = std::move(queue.front());
         queue.pop_front();
       }
-      prepare_texture(job->f, job->addr, job->tex, job->result);
+      if (job->make) job->make(job->result);
+      else prepare_texture(job->f, job->addr, job->tex, job->result);
       job->done.store(true, std::memory_order_release);
     }
   }
@@ -2461,8 +2482,251 @@ uint32_t resolved_slot(uint32_t tex, ResolvedTexture& r) {
   return v.second;
 }
 
+// The game's texture bank (Textures.raw; N64-NOTES.md): +2860 count, +2872 the
+// file's 52-byte D3DTexture headers, +2876 a copy of them.
+constexpr uint32_t kTexBank = 0x82655BE0u;
+
+// The Textures.raw id of a guest texture object (-1 if it isn't one of the
+// bank's headers); `which` = 0 for the +2876 array, 1 for +2872.
+int bank_texture_id(uint32_t tex, int* which = nullptr) {
+  const uint32_t count = g32(kTexBank + 2860);
+  if (!count || count > 8192) return -1;
+  const uint32_t arrays[2] = {g32(kTexBank + 2876), g32(kTexBank + 2872)};
+  for (int a = 0; a < 2; ++a) {
+    const uint32_t base = arrays[a];
+    if (base && tex >= base && tex < base + count * 52u && (tex - base) % 52u == 0) {
+      if (which) *which = a;
+      return int((tex - base) / 52u);
+    }
+  }
+  return -1;
+}
+
+// N64 textures (pd_n64_textures.h): while they're switched on, a Textures.raw
+// id 0-3502 (the N64 texture numbers, used by the levels and the N64 models)
+// is drawn with the N64 picture from the player's ROM. Ids from 3503 (the
+// remastered models' own) and everything else keep theirs. Only 2D textures
+// whose swizzle gives plain RGBA (the only two the game's N64 ids use: 8888
+// 0x60A, DXT 0x688) - the N64 picture is RGBA as the shader expects it, the
+// layout the remaster's own N64-size copies have (N64-NOTES.md).
+//
+// Ids the remaster gave a different picture for a different surface (N64 signs
+// and posters made into building atlases, rock, vehicle panels): its new
+// geometry maps them with new texture coordinates, so the N64 picture would be
+// smeared across it (Defection's skyline). They keep the remastered picture.
+// Picked by eye from all 404 ids whose remastered picture correlates below 0.3
+// with the N64 one both texel by texel and in its 8x8 layout
+// (tools/n64/compare_tex.py stats + grid; N64-NOTES.md): the other 360 are the
+// same subject redrawn (reliefs, stone, letters, flares) and get the N64 one.
+// Found in play: 123/534/539 (Defection's skyline), 2210 (Villa's cliff tops).
+// While the level rooms are drawn from the ROM (pd_n64_rooms.cpp) that geometry
+// isn't drawn, and these ids get their N64 pictures too.
+bool remaster_only_id(int id) {
+  if (pd::n64tex::RoomsDrawing()) return false;
+  static constexpr int16_t kIds[] = {123,  165,  169,  170,  212,  497,  498,  511,  534,  535,  537,
+                                     538,  539,  545,  546,  547,  548,  550,  551,  559,  560,  1784,
+                                     2206, 2207, 2210, 2211, 2220, 2221, 2232, 2235, 2239, 2240, 2241,
+                                     2243, 2359, 2464, 2504, 2553, 2554, 2587, 2708, 2901, 2966, 3323};
+  return std::binary_search(std::begin(kIds), std::end(kIds), int16_t(id));
+}
+
+int classic_id(uint32_t tex, const uint32_t* f) {
+  if (!pd::n64tex::Active()) return -1;
+  const int id = bank_texture_id(tex);
+  if (id < 0 || remaster_only_id(id)) return -1;
+  if (id >= pd::n64tex::kTextureCount && !pd::n64tex::IsModelTexture(id)) return -1;
+  const uint32_t dim = (f[5] >> 9) & 3, swizzle = (f[3] >> 1) & 0xFFF;
+  if (dim != 1 || (swizzle != 0x60A && swizzle != 0x688)) return -1;
+  {  // test: pd_n64_ids "a-b"
+    static std::string spec;
+    static int lo = 0, hi = INT32_MAX;
+    const std::string now = REXCVAR_GET(pd_n64_ids);
+    if (now != spec) {
+      spec = now;
+      lo = 0;
+      hi = INT32_MAX;
+      int a = 0, b = 0;
+      if (std::sscanf(spec.c_str(), "%d-%d", &a, &b) == 2) { lo = a; hi = b; }
+    }
+    if (id < lo || id > hi) return -1;
+  }
+  return pd::n64tex::Get(id) ? id : -1;
+}
+
+// The slot of id's N64 picture, made at the start of a draw (may_commit); its
+// colours go through the remaster's curve (ColourLut) and it gets a full mip
+// chain. An N64 intensity texture (I4 / I8) whose remastered picture carries
+// alpha (DXT2-5: glows, flares, light beams) gets alpha = intensity, as the N64
+// samples it; drawn opaque it covered the screen in Defection. Elsewhere the
+// remaster's own N64-size copies have intensity textures opaque, as decoded.
+// UINT32_MAX: it couldn't be made, use the remastered texture.
+// id's N64 picture as drawn (the colour curve, intensity as alpha where the
+// remaster's picture has alpha); false if there is none.
+bool classic_rgba(int id, const uint32_t* f, std::vector<uint8_t>& rgba, const pd::n64dec::Image** image,
+                  uint32_t* lut_version) {
+  const uint8_t* lut = pd::n64tex::ColourLut(lut_version);
+  const pd::n64dec::Image* im = pd::n64tex::Get(id);
+  if (!im) return false;
+  rgba = im->rgba;
+  const uint32_t remaster_fmt = f[1] & 0x3F;
+  const bool intensity_alpha = (im->format == 7 || im->format == 8) && (remaster_fmt == 19 || remaster_fmt == 20);
+  // Textures from inside model files: the remaster's own copies have the raw N64
+  // colours (no curve), so these keep them too.
+  const bool raw = id >= pd::n64tex::kTextureCount;
+  for (size_t i = 0; i + 3 < rgba.size(); i += 4) {
+    if (intensity_alpha) rgba[i + 3] = rgba[i];  // (the raw intensity, before the colour curve)
+    if (raw) continue;
+    rgba[i] = lut[rgba[i]];
+    rgba[i + 1] = lut[rgba[i + 1]];
+    rgba[i + 2] = lut[rgba[i + 2]];
+  }
+  if (image) *image = im;
+  return true;
+}
+
+uint32_t classic_slot(int id, const uint32_t* f, bool may_commit) {
+  uint32_t lut_version = 0;
+  pd::n64tex::ColourLut(&lut_version);
+  ResolvedTexture& t = g.classic[uint32_t(id)];
+  if (!t.texture && t.slot == UINT32_MAX) return UINT32_MAX;
+  if (t.texture && (t.content == lut_version || !may_commit)) return t.slot;
+  if (!may_commit) return 0;
+  std::vector<uint8_t> rgba;
+  const pd::n64dec::Image* im = nullptr;
+  if (!classic_rgba(id, f, rgba, &im, &lut_version)) return UINT32_MAX;
+  if (t.texture) g.retired_textures.push_back({g.frames, std::move(t.texture), t.slot});
+  uint32_t levels = 1;
+  while ((std::max(im->w, im->h) >> levels) != 0) ++levels;
+  PreparedTexture p;
+  fill_rgba_levels(p, std::move(rgba), im->w, im->h, levels);
+  t.content = lut_version;
+  t.slot = 0;
+  const uint32_t slot = commit_texture(t, p);
+  if (REXCVAR_GET(pd_n64_trace)) {
+    const uint32_t hdr = g32(kTexBank + 2872) + uint32_t(id) * 52u, ix = g32(kTexBank + 2864) + uint32_t(id) * 52u;
+    const uint32_t f1 = g32(hdr + 28 + 4), f2 = g32(hdr + 28 + 8);
+    REXKRNL_INFO("[n64] id {} N64 fmt {} {}x{} -> slot {}; remaster fmt {} {}x{}, index N64 size {}x{}", id,
+                 im->format, im->w, im->h, slot, f1 & 0x3F, (f2 & 0x1FFF) + 1, ((f2 >> 13) & 0x1FFF) + 1,
+                 g32(ix + 12), g32(ix + 16));
+  }
+  return t.texture ? slot : UINT32_MAX;
+}
+
+// Textures a pack (or the dump) can stand in for: the bank's 2D textures with
+// the two swizzles that give plain RGBA (as classic_id: every N64 id has one
+// of them), so a picture is sampled as the game samples its own.
+bool plain_rgba_2d(const uint32_t* f) {
+  const uint32_t dim = (f[5] >> 9) & 3, swizzle = (f[3] >> 1) & 0xFFF;
+  return dim == 1 && (swizzle == 0x60A || swizzle == 0x688);
+}
+
+// The pack's id for `tex`, or -1 (no pack, not a bank texture, or the pack hasn't it).
+int pack_id(uint32_t tex, const uint32_t* f) {
+  if (!g.pack_index || g.pack_index->by_id.empty()) return -1;
+  const int id = bank_texture_id(tex);
+  if (id < 0 || !g.pack_index->Has(id) || !plain_rgba_2d(f)) return -1;
+  return id;
+}
+
+// The slot of id's pack picture. Decoded on the texture worker; until it is
+// ready (or if it can't be used) UINT32_MAX: the base picture is drawn
+// meanwhile, so a pack never makes a draw wait.
+uint32_t pack_slot(int id, bool may_commit) {
+  ResolvedTexture& t = g.pack[uint32_t(id)];
+  if (t.texture) return t.slot;
+  if (t.job) {
+    if (!may_commit || !t.job->done.load(std::memory_order_acquire)) return UINT32_MAX;
+    const std::shared_ptr<TextureJob> job = std::move(t.job);
+    const uint32_t slot = commit_texture(t, job->result);
+    return t.texture ? slot : UINT32_MAX;
+  }
+  if (t.slot == UINT32_MAX || !may_commit) return UINT32_MAX;
+  auto job = std::make_shared<TextureJob>();
+  const std::filesystem::path path = g.pack_index->by_id[size_t(id)];
+  job->make = [path, id](PreparedTexture& p) {
+    std::vector<uint8_t> rgba;
+    uint32_t w = 0, h = 0;
+    std::string error;
+    if (!pd::texpack::LoadPicture(path, rgba, w, h, &error)) {
+      REXKRNL_WARN("[texpack] {} (texture {}) not used: {}", path.filename().string(), id, error);
+      return;  // p.ok stays false: committed as unusable, the base picture stays
+    }
+    uint32_t levels = 1;
+    while ((std::max(w, h) >> levels) != 0) ++levels;
+    fill_rgba_levels(p, std::move(rgba), w, h, levels);
+  };
+  t.job = job;
+  g_texture_worker.push(std::move(job));
+  return UINT32_MAX;
+}
+
+// The texture dump (pd_texture_dump): each bank texture a pack can replace is
+// written once a session as resources\userdata\texture-dump\remastered\<id>.png
+// (the base level, as the game's own data has it), and while N64 textures are
+// on, its N64 picture as drawn in ...\n64\<id>.png. Written on the worker.
+void dump_texture_once(uint32_t tex, const uint32_t* f) {
+  const int id = bank_texture_id(tex);
+  if (id < 0 || !plain_rgba_2d(f)) return;
+  const bool n64 = pd::n64tex::Active() && (id < pd::n64tex::kTextureCount || pd::n64tex::IsModelTexture(id)) &&
+                   pd::n64tex::Get(id);
+  const bool want_remastered = pd::texpack::ClaimDump(id, 0);
+  const bool want_n64 = n64 && pd::texpack::ClaimDump(id, 1);
+  if (!want_remastered && !want_n64) return;
+  const uint32_t fmt = f[1] & 0x3F;
+  const uint32_t width = (f[2] & 0x1FFF) + 1, height = ((f[2] >> 13) & 0x1FFF) + 1;
+  const uint32_t pitch = ((f[0] >> 22) & 0x1FF) * 32, phys = f[1] & 0xFFFFF000u;
+  const bool tiled = (f[0] >> 31) & 1;
+  TexFormat tf{};
+  if (!tex_format(fmt, tf) || width > 4096 || height > 4096) return;
+  const uint32_t bh = (height + tf.block - 1) / tf.block, pitch_blocks = std::max<uint32_t>(pitch, width) / tf.block;
+  const uint32_t span = tiled ? ((pitch_blocks + 31) & ~31u) * ((bh + 31) & ~31u) * tf.bpb : pitch_blocks * bh * tf.bpb;
+  const uint32_t addr = phys >= 0xE0000000u ? gpu_view(phys) : cpu_view_of_physical(phys & 0x1FFFFFFFu, span);
+  if (!addr) return;
+  std::vector<uint8_t> n64_rgba;
+  uint32_t n64_w = 0, n64_h = 0;
+  if (want_n64) {
+    const pd::n64dec::Image* im = nullptr;
+    if (classic_rgba(id, f, n64_rgba, &im, nullptr)) {
+      n64_w = im->w;
+      n64_h = im->h;
+    }
+  }
+  auto job = std::make_shared<TextureJob>();
+  std::array<uint32_t, 6> fc;
+  std::memcpy(fc.data(), f, sizeof(uint32_t) * 6);
+  job->make = [fc, addr, id, want_remastered, n64_rgba = std::move(n64_rgba), n64_w, n64_h](PreparedTexture&) {
+    char name[16];
+    std::snprintf(name, sizeof(name), "%04d.png", id);
+    const std::filesystem::path folder = pd::texpack::DumpFolder();
+    if (want_remastered) {
+      const uint32_t fmt = fc[1] & 0x3F, endian = (fc[1] >> 6) & 3;
+      const bool tiled = (fc[0] >> 31) & 1;
+      const uint32_t w = (fc[2] & 0x1FFF) + 1, h = ((fc[2] >> 13) & 0x1FFF) + 1;
+      const uint32_t pitch = ((fc[0] >> 22) & 0x1FF) * 32, swizzle = (fc[3] >> 1) & 0xFFF;
+      TexFormat tf{};
+      tex_format(fmt, tf);
+      uint32_t ox = 0, oy = 0;
+      packed_base_offset(fc.data(), w, h, std::max(1u, tf.block), ox, oy);
+      std::vector<uint8_t> rgba(size_t(w) * h * 4);
+      if (decode_texture_seh(addr, fmt, endian, tiled, w, h, std::max(pitch, w), swizzle, rgba.data(), w * 4, ox, oy))
+        pd::texpack::WritePng(folder / "remastered" / name, rgba.data(), w, h);
+    }
+    if (!n64_rgba.empty()) pd::texpack::WritePng(folder / "n64" / name, n64_rgba.data(), n64_w, n64_h);
+  };
+  g_texture_worker.push(std::move(job));  // (nobody waits for it)
+}
+
 uint32_t texture_slot(uint32_t tex, bool may_commit = false) {
   if (!tex) return 0;
+  if (REXCVAR_GET(pd_n64_trace)) {
+    static std::unordered_set<uint32_t> seen;
+    if (seen.insert(tex).second) {
+      int which = -1;
+      const int id = bank_texture_id(tex, &which);
+      REXKRNL_INFO("[n64] tex {:08X} id {} arr {} base {:08X} fetch {:08X} {:08X} stage {}", tex, id, which,
+                   g32(tex + 28 + 4) & 0xFFFFF000u, g32(tex + 28), g32(tex + 28 + 8), g32(kStageNum));
+    }
+  }
   const auto r = g.resolved.find(tex);
   if (r != g.resolved.end()) {
     if (r->second.depth_pending && may_commit) {
@@ -2476,6 +2740,17 @@ uint32_t texture_slot(uint32_t tex, bool may_commit = false) {
   if (const auto rb = g.resolved_base.find(f[1] & 0xFFFFF000u); rb != g.resolved_base.end()) {
     const auto rr = g.resolved.find(rb->second);
     if (rr != g.resolved.end() && rr->second.texture) return resolved_slot(tex, rr->second);
+  }
+  if (may_commit && pd::texpack::Dumping()) dump_texture_once(tex, f);
+  // A texture pack's picture first (over the N64 or the remastered one), then
+  // the N64 picture, then the game's own.
+  if (const int id = pack_id(tex, f); id >= 0) {
+    const uint32_t s = pack_slot(id, may_commit);
+    if (s != UINT32_MAX) return s;
+  }
+  if (const int id = classic_id(tex, f); id >= 0) {
+    const uint32_t s = classic_slot(id, f, may_commit);
+    if (s != UINT32_MAX) return s;
   }
   const uint64_t key = fnv1a(reinterpret_cast<const uint8_t*>(f), sizeof(f));
   ResolvedTexture& t = g.textures_by_fetch[key];
@@ -2566,6 +2841,17 @@ bool texture_pending(uint32_t tex) {
   if (!tex || g.resolved.count(tex)) return false;
   uint32_t f[6];
   for (int i = 0; i < 6; ++i) f[i] = g32(tex + 28 + i * 4);
+  // A texture pack's picture that is ready: drawn with it, whatever the base
+  // picture (whose upload, started while the pack's was decoding, is never
+  // collected and would keep the draw waiting) is doing.
+  if (const int id = pack_id(tex, f); id >= 0) {
+    const auto p = g.pack.find(uint32_t(id));
+    if (p != g.pack.end() && p->second.texture) return false;
+  }
+  if (const int id = classic_id(tex, f); id >= 0) {  // the N64 picture is made in the draw: never waits
+    const auto c = g.classic.find(uint32_t(id));
+    if (c == g.classic.end() || c->second.texture || c->second.slot != UINT32_MAX) return false;
+  }
   const auto it = g.textures_by_fetch.find(fnv1a(reinterpret_cast<const uint8_t*>(f), sizeof(f)));
   return it != g.textures_by_fetch.end() && it->second.job != nullptr;
 }
@@ -2850,7 +3136,34 @@ void begin_frame() {
       ++n;
     }
     g.textures_by_fetch.clear();  // (a texture still on the worker is dropped with its job)
-    if (n) REXKRNL_INFO("PDNATIVE stage {}: {} textures from the last stage released", stage, n);
+    size_t n64 = 0;
+    for (auto& [id, t] : g.classic) {
+      if (!t.texture) continue;
+      g.retired_textures.push_back({g.frames, std::move(t.texture), t.slot});
+      ++n64;
+    }
+    g.classic.clear();
+    size_t packed = 0;
+    for (auto& [id, t] : g.pack) {
+      if (!t.texture) continue;
+      g.retired_textures.push_back({g.frames, std::move(t.texture), t.slot});
+      ++packed;
+    }
+    g.pack.clear();  // (a picture still on the worker is dropped with its job)
+    if (n) REXKRNL_INFO("PDNATIVE stage {}: {} textures from the last stage released{}{}", stage, n,
+                        n64 ? fmt::format(" (and {} N64 ones)", n64) : std::string(),
+                        packed ? fmt::format(" (and {} from the texture pack)", packed) : std::string());
+  }
+  // Texture packs: another pack chosen (or none) since the last frame: its
+  // pictures go, the new one's come as they're drawn.
+  {
+    std::shared_ptr<const pd::texpack::Index> index = pd::texpack::CurrentIndex();
+    if (!g.pack_index || index->version != g.pack_index->version) {
+      for (auto& [id, t] : g.pack)
+        if (t.texture) g.retired_textures.push_back({g.frames, std::move(t.texture), t.slot});
+      g.pack.clear();
+      g.pack_index = std::move(index);
+    }
   }
   g.cmd->begin();
   g.prof_active = g.prof_pool && REXCVAR_GET(gpu_native_profile_frame) > 0 &&
@@ -5128,4 +5441,23 @@ extern "C" REX_FUNC(sub_82339D50) {
   const auto ms = [&](int64_t ticks) { return double(ticks) * 1000.0 / double(freq.QuadPart); };
   frame_stats(last.QuadPart ? ms(t0.QuadPart - last.QuadPart) : 0.0, ms(t1.QuadPart - t0.QuadPart));
   last = t0;
+}
+
+// N64 mode: the display-list interpreter binds a texture only when the game loaded it
+// (index entry +50 = 1 or 3); the N64 models' textures never are (the remaster loads
+// its own meshes' instead). Plume draws an N64 id from the ROM, without the game's
+// copy, so those ids count as loaded while N64 textures are on (PdHookN64TextureLoaded).
+bool PdN64TextureDrawable(int id) {
+  if (!pd::n64tex::Active()) return false;
+  const bool ok = id >= 0 && (id < pd::n64tex::kTextureCount || pd::n64tex::IsModelTexture(id)) &&
+                  !remaster_only_id(id) && pd::n64tex::Get(id) != nullptr;
+  if (REXCVAR_GET(pd_n64_trace)) {
+    static std::mutex mutex;
+    static std::unordered_set<int> seen;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (seen.insert(id).second)
+      REXKRNL_INFO("[n64] texture {} not loaded by the game: {}", id,
+                   ok ? "drawn from the ROM" : (remaster_only_id(id) ? "remaster-only id, not drawn" : "no N64 picture"));
+  }
+  return ok;
 }

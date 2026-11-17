@@ -13,6 +13,8 @@
 #include <dxgi1_4.h>
 #include <intrin.h>
 #include <wincodec.h>
+#include <shellapi.h>
+#include <shobjidl.h>
 #pragma comment(lib, "windowscodecs.lib")
 
 #include <algorithm>
@@ -51,6 +53,9 @@
 #include "pd_native_vk_out.h"  // Graphics API: pd::native_vk::VulkanUsable
 #include "pd_update.h"         // Check for Updates
 #include "pd_paths.h"          // the saves folder (userdata-location.txt)
+#include "pd_n64_textures.h"   // N64 textures from the player's N64 ROM
+#include "pd_texture_packs.h"  // texture packs (Settings > Graphics > Experimental)
+#include "pd_assets_import.h"  // importing the N64 ROM and texture packs
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/cvar.h>
 #include <rex/diag_timing.h>
@@ -83,6 +88,14 @@ REXCVAR_DECLARE(bool, pd_menu_mouse);
 REXCVAR_DECLARE(int32_t, pd_mp_facing_delay_ms);
 REXCVAR_DECLARE(int32_t, pd_deadzone_right);
 REXCVAR_DECLARE(int32_t, pd_deadzone_left);
+REXCVAR_DECLARE(int32_t, pd_stick_response_right);
+REXCVAR_DECLARE(int32_t, pd_stick_response_left);
+REXCVAR_DECLARE(bool, pd_n64_textures_pad);
+REXCVAR_DECLARE(bool, pd_southpaw);
+REXCVAR_DECLARE(bool, pd_legacy_controls);
+REXCVAR_DECLARE(bool, pd_swap_triggers);
+REXCVAR_DECLARE(bool, pd_secondary_fire_reset);
+REXCVAR_DECLARE(bool, pd_n64_explosions);
 REXCVAR_DECLARE(double, pd_shine);
 REXCVAR_DECLARE(bool, pd_view_bob);
 REXCVAR_DECLARE(bool, pd_light_capture);
@@ -557,6 +570,7 @@ class PerfectDarkInputTracker : public rex::ui::ImGuiDialog {
   PerfectDarkApp* app_;
   bool f9_was_down_ = false;
   bool f12_shot_was_down_ = false;
+  bool n64_key_was_down_ = false;
   // TEMP_MENU_SCAN: F10 triggers a one-shot guest-memory scan for known
   // Video Options menu strings, to locate the real menu-item table for the
   // native-menu injection work. Remove once that table's address is known.
@@ -714,6 +728,13 @@ class PerfectDarkApp : public rex::ReXApp {
     // mnk_mode switched off - key rebinding, the Online page - would otherwise
     // leave the next run with no keyboard.
     rex::cvar::SetFlagByName("mnk_mode", "true");
+    // The same for direct look (the mouse turns the view itself rather than
+    // pushing an emulated right stick; HANDOVER 4cn). It also feeds the menu
+    // pointer, so without it the mouse did nothing in menus and barely turned
+    // the view through the stick's dead zone: a copy whose toml had lost the
+    // line looked like a frozen mouse (the 2026-11-14 N64 test copy). Setup
+    // writes it, but a file rebuilt after a parse error wouldn't have it.
+    rex::cvar::SetFlagByName("mnk_direct_look", "true");
     // Internet play: the built-in online server (tools/relay/pd_relay.py).
     // Empty until one is deployed; a net_relay_server line in the toml or on
     // the command line wins.
@@ -876,6 +897,11 @@ class PerfectDarkApp : public rex::ReXApp {
   // dialog is created on the next UI frame (TickNameEntry).
   static void RequestNameEntry() { name_entry_wanted_ = true; }
   static void RequestAddressEntry() { address_entry_wanted_ = true; }
+
+  // True while the player is typing (the name / address box, or any ImGui text
+  // field has the keyboard): letter keys such as the Switch Graphics key G
+  // are text then. UI thread, inside the ImGui frame.
+  static bool TypingText() { return name_entry_open_ || ImGui::GetIO().WantTextInput; }
 
   static void TickNameEntry() {
     PerfectDarkApp* app = current_instance_;
@@ -3658,7 +3684,8 @@ class PerfectDarkApp : public rex::ReXApp {
   // pad is treated as a controller. Before the merge also means it happens
   // before a network match sends the pad on: other players' sticks are theirs.
   static constexpr int kDeadZoneOriginal = 30;
-  static inline uint32_t deadzone_strings_ = 0;  // labels: right at +0, left at +32
+  static inline uint32_t deadzone_strings_ = 0;  // the stick labels (kStickStringsSize)
+  static inline uint32_t stick_dialog_ = 0;      // Settings > Gamepad Controls > Stick Settings
 
   // `start`: the raw value where the game first responds. Past the game's
   // 10000 for most axes, but turning (the right stick's X) also ignores the
@@ -3670,22 +3697,157 @@ class PerfectDarkApp : public rex::ReXApp {
   static constexpr int16_t kStartGameZone = 10001;
   static constexpr int16_t kStartTurn = 14554;
 
-  static int16_t ReshapeAxis(int16_t v, int pct, int16_t start) {
+  // Stick response (issue #26, pd_stick_response_right / _left, tenths of a
+  // power, 10-20): the travel past the dead zone, t = 0..1, becomes t^p before
+  // it is spread from `start` to full deflection, so a small push moves less
+  // and full tilt is unchanged. The N64 squared the stick for turning
+  // (bondmove), but this version turns linearly: measured in Defection
+  // (scen\stick-turn.txt, stick_turn.py; HANDOVER 4cm) about 3 degrees a second
+  // per stick unit past the turning zone, up to 165 at 70 of 80 units. So 2.0,
+  // the top of the range, is the N64's own squared feel. At the game's own dead zone ("Original")
+  // only the travel the game acts on is curved: everything up to `start` is
+  // passed on as it was, so the game's digital stick directions (its +-10000
+  // checks) and the turning zone are unchanged.
+  static constexpr int kResponseOriginal = 10;
+  static constexpr int kResponseMax = 20;
+
+  static int16_t ReshapeAxis(int16_t v, int pct, int16_t start, int response) {
     constexpr float kMax = 32767.0f;
-    const float zone = kMax * float(pct) / 100.0f;
     const float a = std::fabs(float(v));
-    if (a <= zone) return 0;
-    const float t = std::min(1.0f, (a - zone) / (kMax - zone));
+    float zone;
+    if (pct >= kDeadZoneOriginal) {
+      if (a <= float(start)) return v;
+      zone = float(start);
+    } else {
+      zone = kMax * float(pct) / 100.0f;
+      if (a <= zone) return 0;
+    }
+    float t = std::min(1.0f, (a - zone) / (kMax - zone));
+    if (response != kResponseOriginal) t = std::pow(t, float(response) / 10.0f);
     const float out = std::min(kMax, float(start) + t * (kMax - float(start)));
     return int16_t(v < 0 ? -std::lround(out) : std::lround(out));
   }
 
-  static void FilterGamepad(const rex::input::InputDriver& driver, uint32_t,
+  // ---- Advanced Control (Rare's 2010 title update, re-created; HANDOVER 4co) ----------
+  // The update's Southpaw and Legacy layouts and Swap Triggers act on each controller's
+  // state as it is read, before anything else sees it, and not while that controller's
+  // player has a menu open (so menus keep the usual sticks). Southpaw swaps the two
+  // sticks; Legacy swaps only their left/right axes (the left stick turns, the right
+  // strafes); both together swap only the up/down axes - the update's own rules. Here the
+  // choice is one for all controllers (PC settings), where the update kept it per player.
+  static constexpr uint32_t kPlayerConfigs = 0x82641950;  // 4 x 216: +109 controller (s8)
+  static constexpr uint32_t kPlayerConfigSize = 216;
+  static constexpr uint32_t kMenusBase = 0x826384B0;      // 4 x 8636: +5784 open dialog
+  static constexpr uint32_t kMenuSize = 8636;
+  static constexpr uint32_t kMenuOpenDialog = 5784;
+
+  // Whether the player using controller `user_index` has a menu open (player 1's, when
+  // no player has that controller).
+  static bool MenuOpenForController(uint32_t user_index) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    if (!mem) return true;
+    uint32_t player = 0;
+    for (uint32_t p = 0; p < 4; ++p) {
+      if (int8_t(ReadGuestU8(mem, kPlayerConfigs + p * kPlayerConfigSize + 109)) == int(user_index)) {
+        player = p;
+        break;
+      }
+    }
+    return ReadGuestU32(mem, kMenusBase + player * kMenuSize + kMenuOpenDialog) != 0;
+  }
+
+  // The Advanced Control page (Settings > Gamepad Controls > Advanced Control), built
+  // like Stick Settings: four checkboxes, labelled with the title update's own words
+  // in the game's five languages (Windows-1252, as the game's text). Labels in
+  // advanced_strings_, 48 bytes each: the row, the page title, then the options.
+  static constexpr int kAdvancedLabels = 6;
+  static constexpr uint32_t kAdvancedLabelSize = 48;
+  static inline uint32_t advanced_strings_ = 0;
+  static inline uint32_t advanced_dialog_ = 0;
+  static const char* AdvancedLabel(int which) {
+    // English, German, French, Spanish, Italian.
+    static const char* const kText[kAdvancedLabels][5] = {
+        {"Advanced Control\n", "Erweiterte Steuerung\n", "Commandes avanc\xE9" "es\n", "Controles avanzados\n",
+         "Comandi avanzati\n"},
+        {"Advanced Control Options\n", "Erweiterte Steuerungsoptionen\n", "Options de commandes avanc\xE9" "es\n",
+         "Opciones de controles avanzados\n", "Opzioni comandi avanzati\n"},
+        {"Southpaw\n", "Linksh\xE4" "nder\n", "Gaucher\n", "Zurdo\n", "Per mancini\n"},
+        {"Legacy\n", "Legacy\n", "Classique\n", "Antiguo\n", "Originali\n"},
+        {"Secondary Fire Reset\n", "Sekund\xE4" "res Feuern zur\xFC" "cksetzen\n",
+         "R\xE9" "initialiser tir secondaire\n", "Restablecer disparo secundario\n", "Reimposta Fuoco secondario\n"},
+        {"Swap Triggers\n", "Schalter vertauschen\n", "Inverser les g\xE2" "chettes\n", "Cambiar gatillos\n",
+         "Inverti grilletti\n"},
+    };
+    int lang = 0;
+    switch (running_language_) {
+      case 3: lang = 1; break;
+      case 4: lang = 2; break;
+      case 5: lang = 3; break;
+      case 6: lang = 4; break;
+      default: break;
+    }
+    return kText[which][lang];
+  }
+  template <int kWhich>
+  static void PdLabelAdvanced(PPCContext& ctx, uint8_t*) {
+    ctx.r3.u64 = advanced_strings_ ? advanced_strings_ + uint32_t(kWhich) * kAdvancedLabelSize : 0;
+  }
+  // A checkbox (menu item type 0x09): op 8 asks for its state (returned in r3), op 6
+  // sets it from the word at r5.
+  static const char* AdvancedCvar(int which) {
+    switch (which) {
+      case 2: return "pd_southpaw";
+      case 3: return "pd_legacy_controls";
+      case 4: return "pd_secondary_fire_reset";
+      default: return "pd_swap_triggers";
+    }
+  }
+  template <int kWhich>
+  static void PdAdvancedCheckbox(PPCContext& ctx, uint8_t*) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const char* name = AdvancedCvar(kWhich);
+    const uint32_t op = ctx.r3.u32;
+    if (op == 8) {
+      ctx.r3.u64 = rex::cvar::GetFlagByName(name) == "true" ? 1 : 0;
+      return;
+    }
+    if (op == 6 && mem && ctx.r5.u32) {
+      const char* value = ReadGuestU32(mem, ctx.r5.u32) ? "true" : "false";
+      if (rex::cvar::GetFlagByName(name) != value && rex::cvar::SetFlagByName(name, value)) SavePcSettings();
+    }
+    ctx.r3.u64 = 0;
+  }
+
+  static void FilterGamepad(const rex::input::InputDriver& driver, uint32_t user_index,
                             rex::input::X_INPUT_GAMEPAD& pad) {
     if (dynamic_cast<const rex::input::mnk::MnkInputDriver*>(&driver)) {
       // The mouse on the CamSpy (StickLookActive): its height in kicks.
       if (camspy_mouse_height_) pad.thumb_ry = CamSpyHeight(pad.thumb_ry);
       return;
+    }
+    // D-pad Down in play: the graphics switch (pd_n64_textures_pad). The press
+    // is hidden from the game while playing; in menus it passes through.
+    {
+      // The filter runs for every driver for the same player (SDL, the test
+      // pipe's pad), so each driver keeps its own "was down": shared, a pad
+      // that is down on one driver and up on another made every poll a press.
+      constexpr uint16_t kDpadDown = 0x0002;  // XINPUT_GAMEPAD_DPAD_DOWN
+      static std::mutex mutex;
+      static std::map<std::pair<const void*, uint32_t>, bool> was_down;
+      const bool down = (uint16_t(pad.buttons) & kDpadDown) != 0;
+      bool pressed = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        bool& prev = was_down[{static_cast<const void*>(&driver), user_index}];
+        pressed = down && !prev;
+        prev = down;
+      }
+      if (pad_switch_in_play_.load() && REXCVAR_GET(pd_n64_textures_pad)) {
+        if (pressed) pad_switch_requested_ = true;
+        if (down) pad.buttons = uint16_t(uint16_t(pad.buttons) & ~kDpadDown);
+      }
     }
     // Test: the test pipe's pad stands in for the mouse (test windows have none).
     if (REXCVAR_GET(pd_test_camspy_mouse)) {
@@ -3694,13 +3856,42 @@ class PerfectDarkApp : public rex::ReXApp {
     }
     const int right = std::clamp(int(REXCVAR_GET(pd_deadzone_right)), 0, kDeadZoneOriginal);
     const int left = std::clamp(int(REXCVAR_GET(pd_deadzone_left)), 0, kDeadZoneOriginal);
-    if (right < kDeadZoneOriginal) {
-      pad.thumb_rx = ReshapeAxis(pad.thumb_rx, right, kStartTurn);
-      pad.thumb_ry = ReshapeAxis(pad.thumb_ry, right, kStartGameZone);
+    const int right_curve = std::clamp(int(REXCVAR_GET(pd_stick_response_right)), kResponseOriginal, kResponseMax);
+    const int left_curve = std::clamp(int(REXCVAR_GET(pd_stick_response_left)), kResponseOriginal, kResponseMax);
+    // Advanced Control: which axes trade places (none while a menu is open).
+    const bool southpaw = REXCVAR_GET(pd_southpaw);
+    const bool legacy = REXCVAR_GET(pd_legacy_controls);
+    const bool swap_triggers = REXCVAR_GET(pd_swap_triggers);
+    bool swap_x = false, swap_y = false;
+    if ((southpaw || legacy || swap_triggers) && !MenuOpenForController(user_index)) {
+      swap_x = southpaw != legacy;  // Southpaw alone or Legacy alone
+      swap_y = southpaw;            // Southpaw, with or without Legacy
+      if (swap_triggers) {
+        const uint8_t lt = pad.left_trigger;
+        pad.left_trigger = pad.right_trigger;
+        pad.right_trigger = lt;
+      }
     }
-    if (left < kDeadZoneOriginal) {
-      pad.thumb_lx = ReshapeAxis(pad.thumb_lx, left, kStartGameZone);
-      pad.thumb_ly = ReshapeAxis(pad.thumb_ly, left, kStartGameZone);
+    // Both at the game's own: the pad is left exactly as the driver gave it. Each
+    // physical stick keeps its own dead zone and response; an X axis that will turn
+    // the view (the game's right X) starts where turning starts.
+    if (right < kDeadZoneOriginal || right_curve != kResponseOriginal) {
+      pad.thumb_rx = ReshapeAxis(pad.thumb_rx, right, swap_x ? kStartGameZone : kStartTurn, right_curve);
+      pad.thumb_ry = ReshapeAxis(pad.thumb_ry, right, kStartGameZone, right_curve);
+    }
+    if (left < kDeadZoneOriginal || left_curve != kResponseOriginal) {
+      pad.thumb_lx = ReshapeAxis(pad.thumb_lx, left, swap_x ? kStartTurn : kStartGameZone, left_curve);
+      pad.thumb_ly = ReshapeAxis(pad.thumb_ly, left, kStartGameZone, left_curve);
+    }
+    if (swap_x) {
+      const int16_t lx = pad.thumb_lx;
+      pad.thumb_lx = pad.thumb_rx;
+      pad.thumb_rx = lx;
+    }
+    if (swap_y) {
+      const int16_t ly = pad.thumb_ly;
+      pad.thumb_ly = pad.thumb_ry;
+      pad.thumb_ry = ly;
     }
   }
 
@@ -3715,13 +3906,62 @@ class PerfectDarkApp : public rex::ReXApp {
     if (!input) return;
     input->SetGamepadFilterCallback(&FilterGamepad);
     done = true;
-    REXLOG_INFO("[input] controller dead zones: right {}%, left {}% ({} is the game's own)",
-                int(REXCVAR_GET(pd_deadzone_right)), int(REXCVAR_GET(pd_deadzone_left)),
-                kDeadZoneOriginal);
+    REXLOG_INFO("[input] controller dead zones: right {}%, left {}% ({} is the game's own); "
+                "response: right {:.1f}, left {:.1f} (1.0 is the game's own)",
+                int(REXCVAR_GET(pd_deadzone_right)), int(REXCVAR_GET(pd_deadzone_left)), kDeadZoneOriginal,
+                REXCVAR_GET(pd_stick_response_right) / 10.0, REXCVAR_GET(pd_stick_response_left) / 10.0);
   }
 
+  // Labels, 32 bytes each in deadzone_strings_: the dead zones at +0 / +32, the
+  // response rows at +64 / +96, the Stick Settings row and page title at +128.
+  static constexpr uint32_t kStickStringsSize = 160;
   static void PdLabelDeadZoneRight(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = deadzone_strings_; }
   static void PdLabelDeadZoneLeft(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = deadzone_strings_ + 32; }
+  static void PdLabelResponseRight(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = deadzone_strings_ + 64; }
+  static void PdLabelResponseLeft(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = deadzone_strings_ + 96; }
+  static void PdLabelStickSettings(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = deadzone_strings_ + 128; }
+
+  // Right / Left Stick Response: a slider like the dead zones, 0-10 steps for
+  // 1.0-2.0 ("Original" at 1.0, otherwise the power, "1.5").
+  template <bool kRight>
+  static void PdResponseHandler(PPCContext& ctx, uint8_t*) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const char* name = kRight ? "pd_stick_response_right" : "pd_stick_response_left";
+    constexpr uint32_t kSteps = kResponseMax - kResponseOriginal;
+    const uint32_t op = ctx.r3.u32;
+    const uint32_t data = ctx.r5.u32;
+    switch (op) {
+      case 9:  // slider position
+        if (mem && data) {
+          const int v = kRight ? int(REXCVAR_GET(pd_stick_response_right)) : int(REXCVAR_GET(pd_stick_response_left));
+          WriteGuestU32(mem, data, uint32_t(std::clamp(v, kResponseOriginal, kResponseMax) - kResponseOriginal));
+        }
+        break;
+      case 6: {  // moved
+        if (!mem || !data) break;
+        const std::string value = std::to_string(kResponseOriginal + std::min(ReadGuestU32(mem, data), kSteps));
+        if (rex::cvar::GetFlagByName(name) != value && rex::cvar::SetFlagByName(name, value)) {
+          SavePcSettings();
+        }
+        break;
+      }
+      case 10: {  // the text shown with the slider (into the buffer data + 4 points at)
+        const uint32_t buffer = mem && data ? ReadGuestU32(mem, data + 4) : 0;
+        if (buffer >= 0x40000000) {
+          const uint32_t step = std::min(ReadGuestU32(mem, data), kSteps);
+          char buf[16];
+          if (step == 0) snprintf(buf, sizeof(buf), "Original");
+          else snprintf(buf, sizeof(buf), "%u.%u", (kResponseOriginal + step) / 10, (kResponseOriginal + step) % 10);
+          WriteGuestBytes(mem, buffer, buf, strlen(buf) + 1);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    ctx.r3.u64 = 0;
+  }
 
   // A slider, as Mouse Sensitivity: 0 to 30 in steps of 1, the value shown
   // beside it ("Original" at 30). Ops as PdMouseSensHandler.
@@ -3818,6 +4058,8 @@ class PerfectDarkApp : public rex::ReXApp {
         {"Move Back", "keybind_lstick_down", "S"},
         {"Strafe Left", "keybind_lstick_left", "A"},
         {"Strafe Right", "keybind_lstick_right", "D"},
+        // Not a pad button: the N64 / remastered graphics switch (Experimental).
+        {"Switch Graphics", "pd_n64_textures_key", "G"},
     };
     return kRows;
   }
@@ -3825,7 +4067,7 @@ class PerfectDarkApp : public rex::ReXApp {
   // does the looking, they ship unbound, and a row that always reads "-" only
   // makes the page longer. The binds themselves still exist for anyone who
   // wants them in perfect_dark.toml.
-  static constexpr int kBindRowCount = 16;
+  static constexpr int kBindRowCount = 17;
 
   // Each binding row is a dropdown. Entry 0 is the current key - it is what the
   // row shows, because op 7 always reports it as selected - and the rest are
@@ -5178,6 +5420,9 @@ class PerfectDarkApp : public rex::ReXApp {
     static uint32_t last_frames = 0;
     static uint8_t last_control = 0xFF;
     static uint32_t playing_frames = 0;
+    // D-pad Down switches graphics only in ordinary play with control (not in
+    // a menu, the pause menu, a cutscene or on the title).
+    pad_switch_in_play_ = control != 0 && tick_mode == kTickModeNormal && stage != kStageTitle;
     const bool reloaded = stage != last_stage || level_frames < last_frames;
     last_stage = stage;
     last_frames = level_frames;
@@ -5890,6 +6135,8 @@ class PerfectDarkApp : public rex::ReXApp {
                    VK_F9, VK_F12}) {
       skip[vk] = true;
     }
+    // The Switch Graphics key switches graphics, it doesn't start the game.
+    for (const int n64_vk : N64TexturesKeys()) skip[n64_vk] = true;
     bool pressed = false;
     for (int vk = 0x08; vk < 0xFF; ++vk) {  // keyboard keys; mouse buttons are below 0x08
       const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
@@ -6280,6 +6527,62 @@ class PerfectDarkApp : public rex::ReXApp {
         const uint32_t value = uint32_t(std::strtoul(arg(1).c_str(), nullptr, 16));
         WriteGuestU32(mem, addr, value);
         REXLOG_INFO("[test] poke {:08X} = {:08X}", addr, value);
+      } else if (c.verb == "n64nodes") {  // n64nodes on|off|count: EXPERIMENT, model DL/GUNDL nodes' companion link
+        // A model node: u16 type, u16 link (XBLA: (batch << 12) | (companion entry + 1), 0xFFFF none),
+        // then rodata, parent, next, prev, child pointers. "on" sets the link to 0xFFFF in every
+        // loaded node and remembers the old value; "off" puts them back.
+        static std::map<uint32_t, uint16_t> saved;
+        const std::string mode = arg(0);
+        if (mode == "off") {
+          for (const auto& [addr, link] : saved) WriteGuestS16(mem, addr + 2, int16_t(link));
+          REXLOG_INFO("[test] n64nodes off: {} restored", saved.size());
+          saved.clear();
+        } else {
+          std::vector<std::pair<uint32_t, uint32_t>> regions;
+          ForEachCommittedRegion(mem, [&](uint32_t start, uint32_t size) {
+            // The game's heaps only (not the low reserved range, not the physical mirrors).
+            if (start >= 0x40000000u && start < 0xA0000000u && size < 0x20000000u) regions.emplace_back(start, size);
+          });
+          auto ptr_ok = [&](uint32_t q) {
+            for (const auto& [s, n] : regions)
+              if (q >= s && uint64_t(q) + 0x18 <= uint64_t(s) + n) return true;
+            return false;
+          };
+          std::map<uint32_t, int> by_entry;
+          int nodes = 0;
+          for (const auto& [start, size] : regions) {
+            const uint8_t* p = mem->TranslateVirtual<const uint8_t*>(start);
+            if (!p) continue;
+            for (uint32_t o = 0; o + 0x18 <= size; o += 4) {
+              const uint16_t type = uint16_t(p[o] << 8 | p[o + 1]);
+              if ((type & 0xFF) != 0x18 && (type & 0xFF) != 0x04) continue;
+              const uint16_t link = uint16_t(p[o + 2] << 8 | p[o + 3]);
+              if (link == 0xFFFF || link == 0) continue;
+              const uint32_t entry = (link & 0xFFF);
+              if (entry < 2022 || entry > 2616) continue;
+              auto rd = [&](uint32_t k) { return uint32_t(p[o + k] << 24 | p[o + k + 1] << 16 | p[o + k + 2] << 8 | p[o + k + 3]); };
+              const uint32_t rodata = rd(4), parent = rd(8);
+              if (!ptr_ok(rodata) || (parent && !ptr_ok(parent))) continue;
+              if (parent) {
+                const uint8_t ptype = ReadGuestU8(mem, parent + 1);
+                if (ptype == 0 || ptype > 0x18) continue;
+              }
+              const uint32_t addr = start + o;
+              ++nodes;
+              ++by_entry[entry - 1];
+              if (mode == "on") {
+                if (!saved.count(addr)) saved[addr] = link;
+                WriteGuestS16(mem, addr + 2, int16_t(-1));
+              }
+            }
+          }
+          std::string list;
+          int shown = 0;
+          for (const auto& [entry, count] : by_entry) {
+            if (shown++ < 40) list += fmt::format(" {}x{}", entry, count);
+          }
+          REXLOG_INFO("[test] n64nodes {}: {} nodes, {} companion meshes:{}", mode, nodes, by_entry.size(), list);
+        }
       } else if (c.verb == "watch") {  // watch <start> <end>: log guest writes there (hex), and who made them
         pd_watch::ArmMemoryWriteWatchRange(mem, uint32_t(std::strtoul(arg(0).c_str(), nullptr, 16)),
                                            uint32_t(std::strtoul(arg(1).c_str(), nullptr, 16)));
@@ -6317,6 +6620,13 @@ class PerfectDarkApp : public rex::ReXApp {
           if (app->window()) static_cast<rex::ui::WindowSDL*>(app->window())->SetLogicalSize(w, h);
         });
         REXLOG_INFO("[test] window {}x{}", w, h);
+      } else if (c.verb == "texpack") {  // texpack <name> | texpack -: as choosing it on the Experimental page
+        ChooseTexturePack(arg(0) == "-" ? std::string() : arg(0));
+        REXLOG_INFO("[test] texpack: \"{}\"", pd::texpack::ChosenPack());
+      } else if (c.verb == "n64key") {  // as pressing the N64 Textures key
+        ToggleN64Textures();
+        REXLOG_INFO("[test] n64key: N64 textures {} ({})", pd::n64tex::Enabled() ? "on" : "off",
+                    pd::n64tex::StatusDetail());
       } else if (c.verb == "winmin" || c.verb == "winrestore") {  // never activates the window
         HWND hwnd = app->window() ? static_cast<HWND>(app->window()->GetNativeWindowHandle()) : nullptr;
         if (hwnd) ShowWindowAsync(hwnd, c.verb == "winmin" ? SW_SHOWMINNOACTIVE : SW_SHOWNOACTIVATE);
@@ -6763,10 +7073,20 @@ class PerfectDarkApp : public rex::ReXApp {
                           strlen(kSharpLevelNames[i]) + 1);
         }
       }
-      if (!deadzone_strings_) deadzone_strings_ = mem->SystemHeapAlloc(64);
+      if (!deadzone_strings_) deadzone_strings_ = mem->SystemHeapAlloc(kStickStringsSize);
       if (deadzone_strings_) {
         WriteGuestBytes(mem, deadzone_strings_, "Right Stick Dead Zone\n", 23);
         WriteGuestBytes(mem, deadzone_strings_ + 32, "Left Stick Dead Zone\n", 22);
+        WriteGuestBytes(mem, deadzone_strings_ + 64, "Right Stick Response\n", 22);
+        WriteGuestBytes(mem, deadzone_strings_ + 96, "Left Stick Response\n", 21);
+        WriteGuestBytes(mem, deadzone_strings_ + 128, "Stick Settings\n", 16);
+      }
+      if (!advanced_strings_) advanced_strings_ = mem->SystemHeapAlloc(kAdvancedLabels * kAdvancedLabelSize);
+      if (advanced_strings_) {
+        for (int i = 0; i < kAdvancedLabels; ++i) {
+          const char* text = AdvancedLabel(i);
+          WriteGuestBytes(mem, advanced_strings_ + uint32_t(i) * kAdvancedLabelSize, text, strlen(text) + 1);
+        }
       }
       if (!api_strings_) api_strings_ = mem->SystemHeapAlloc(64 + 2 * 32);
       if (api_strings_) {
@@ -7018,6 +7338,7 @@ class PerfectDarkApp : public rex::ReXApp {
       }
     }
 
+    BuildExperimentalPage(mem, fd);
     struct RowDef {
       const char* name;
       PPCFunc* label_fn;
@@ -7091,6 +7412,15 @@ class PerfectDarkApp : public rex::ReXApp {
         WriteGuestU32(mem, ni + 8, r.label_addr);
         WriteGuestU32(mem, ni + 12, 0);
         WriteGuestU32(mem, ni + 16, r.handler_addr);
+        ++added;
+      }
+      // Experimental (a page of its own; BuildExperimentalPage), last of ours.
+      if (exp_dialog_) {
+        static uint32_t exp_label = 0;
+        if (!exp_label) exp_label = fd->AllocateThunk(&PdExpLabel<kExpTitle>, 0);
+        const uint32_t ni = dest + added * 20;
+        const uint32_t words[5] = {0x04000000, 0x00000004, exp_label, 0, exp_dialog_};
+        for (int w = 0; w < 5; ++w) WriteGuestU32(mem, ni + uint32_t(w) * 4, words[w]);
         ++added;
       }
       // The game's "2-Player Screen Split" row moves to Display Options as
@@ -7184,6 +7514,7 @@ class PerfectDarkApp : public rex::ReXApp {
           &PdBindRowLabel<4>,  &PdBindRowLabel<5>, &PdBindRowLabel<6>,  &PdBindRowLabel<7>,
           &PdBindRowLabel<8>,  &PdBindRowLabel<9>, &PdBindRowLabel<10>, &PdBindRowLabel<11>,
           &PdBindRowLabel<12>, &PdBindRowLabel<13>, &PdBindRowLabel<14>, &PdBindRowLabel<15>,
+          &PdBindRowLabel<16>,
       };
       PPCFunc* const kBindHandlerFns[kBindRowCount] = {
           &PdBindRowHandler<0>,  &PdBindRowHandler<1>,  &PdBindRowHandler<2>,
@@ -7191,7 +7522,7 @@ class PerfectDarkApp : public rex::ReXApp {
           &PdBindRowHandler<6>,  &PdBindRowHandler<7>,  &PdBindRowHandler<8>,
           &PdBindRowHandler<9>,  &PdBindRowHandler<10>, &PdBindRowHandler<11>,
           &PdBindRowHandler<12>, &PdBindRowHandler<13>, &PdBindRowHandler<14>,
-          &PdBindRowHandler<15>,
+          &PdBindRowHandler<15>, &PdBindRowHandler<16>,
       };
       for (int i = 0; i < kBindRowCount; ++i) {
         uint32_t lbl = fd->AllocateThunk(kBindLabelFns[i], 0);
@@ -7440,6 +7771,69 @@ class PerfectDarkApp : public rex::ReXApp {
     const uint32_t dz_left_label = fd ? fd->AllocateThunk(&PdLabelDeadZoneLeft, 0) : 0;
     const uint32_t dz_right = fd && dz_right_label ? fd->AllocateThunk(&PdDeadZoneHandler<true>, 0) : 0;
     const uint32_t dz_left = fd && dz_left_label ? fd->AllocateThunk(&PdDeadZoneHandler<false>, 0) : 0;
+    const uint32_t rs_right_label = fd ? fd->AllocateThunk(&PdLabelResponseRight, 0) : 0;
+    const uint32_t rs_left_label = fd ? fd->AllocateThunk(&PdLabelResponseLeft, 0) : 0;
+    const uint32_t rs_right = fd ? fd->AllocateThunk(&PdResponseHandler<true>, 0) : 0;
+    const uint32_t rs_left = fd ? fd->AllocateThunk(&PdResponseHandler<false>, 0) : 0;
+    const uint32_t stick_label = fd ? fd->AllocateThunk(&PdLabelStickSettings, 0) : 0;
+    // Stick Settings (issues #23, #26): the controller stick sliders on a page
+    // of their own, opened from every Control Options screen, which had no room
+    // for four two-line sliders. Like Keyboard & Mouse: the rows, then the
+    // dialogdef {0x01000000, title, items, 0, 0, 0}; the title is the label thunk.
+    // Slider rows as Mouse Sensitivity's: type 0x08, value shown (0x00100000),
+    // the number of steps at +12.
+    uint32_t stick_dialog = 0;
+    if (deadzone_strings_ && dz_right && dz_left && rs_right_label && rs_left_label && rs_right && rs_left &&
+        stick_label) {
+      const std::array<std::array<uint32_t, 5>, 4> rows = {{
+          {0x08000000, 0x00100000, dz_right_label, uint32_t(kDeadZoneOriginal), dz_right},
+          {0x08000000, 0x00100000, dz_left_label, uint32_t(kDeadZoneOriginal), dz_left},
+          {0x08000000, 0x00100000, rs_right_label, uint32_t(kResponseMax - kResponseOriginal), rs_right},
+          {0x08000000, 0x00100000, rs_left_label, uint32_t(kResponseMax - kResponseOriginal), rs_left},
+      }};
+      const uint32_t items = mem->SystemHeapAlloc(uint32_t(rows.size() + 1) * 20 + 24);
+      if (items) {
+        for (size_t i = 0; i < rows.size(); ++i)
+          for (int w = 0; w < 5; ++w) WriteGuestU32(mem, items + uint32_t(i) * 20 + w * 4, rows[i][w]);
+        const uint32_t term = items + uint32_t(rows.size()) * 20;
+        WriteGuestU32(mem, term, kTypeEnd << 24);
+        for (int w = 1; w < 5; ++w) WriteGuestU32(mem, term + w * 4, 0);
+        stick_dialog = term + 20;
+        const uint32_t dialog_words[6] = {0x01000000, stick_label, items, 0, 0, 0};
+        for (int w = 0; w < 6; ++w) WriteGuestU32(mem, stick_dialog + w * 4, dialog_words[w]);
+        stick_dialog_ = stick_dialog;
+        REXLOG_INFO("[menu_patch] Stick Settings dialog at 0x{:08X} (items 0x{:08X})", stick_dialog, items);
+      }
+    }
+    // Advanced Control (the title update's Advanced Control Options, re-created):
+    // four checkboxes (type 0x09), built the same way.
+    uint32_t advanced_dialog = 0;
+    const uint32_t adv_row_label = fd ? fd->AllocateThunk(&PdLabelAdvanced<0>, 0) : 0;
+    if (advanced_strings_ && fd && adv_row_label) {
+      PPCFunc* const kLabels[4] = {&PdLabelAdvanced<2>, &PdLabelAdvanced<3>, &PdLabelAdvanced<4>, &PdLabelAdvanced<5>};
+      PPCFunc* const kHandlers[4] = {&PdAdvancedCheckbox<2>, &PdAdvancedCheckbox<3>, &PdAdvancedCheckbox<4>,
+                                     &PdAdvancedCheckbox<5>};
+      const uint32_t title = fd->AllocateThunk(&PdLabelAdvanced<1>, 0);
+      const uint32_t items = mem->SystemHeapAlloc(5 * 20 + 24);
+      bool ok = title && items;
+      for (int i = 0; ok && i < 4; ++i) {
+        const uint32_t label = fd->AllocateThunk(kLabels[i], 0);
+        const uint32_t handler = fd->AllocateThunk(kHandlers[i], 0);
+        ok = label && handler;
+        const uint32_t row[5] = {0x09000000, 0, label, 0, handler};
+        for (int w = 0; ok && w < 5; ++w) WriteGuestU32(mem, items + uint32_t(i) * 20 + w * 4, row[w]);
+      }
+      if (ok) {
+        const uint32_t term = items + 4 * 20;
+        WriteGuestU32(mem, term, kTypeEnd << 24);
+        for (int w = 1; w < 5; ++w) WriteGuestU32(mem, term + w * 4, 0);
+        advanced_dialog = term + 20;
+        const uint32_t dialog_words[6] = {0x01000000, title, items, 0, 0, 0};
+        for (int w = 0; w < 6; ++w) WriteGuestU32(mem, advanced_dialog + w * 4, dialog_words[w]);
+        advanced_dialog_ = advanced_dialog;
+        REXLOG_INFO("[menu_patch] Advanced Control dialog at 0x{:08X} (items 0x{:08X})", advanced_dialog, items);
+      }
+    }
     int help = 0, layout = 0;
     std::map<uint32_t, uint32_t> relocated;
     ForEachCommittedRegion(mem, [&](uint32_t region_addr, uint32_t region_size) {
@@ -7487,18 +7881,16 @@ class PerfectDarkApp : public rex::ReXApp {
         }
 
         // Gamepad option screens: a Button Layout row where there is no way to
-        // the picture yet, and the two stick dead zone sliders (issue #23),
-        // above the last row.
+        // the picture yet, and the Stick Settings row (issues #23, #26), above
+        // the last row.
         if (ReadGuestU32(mem, a + 4) != kGamepadOptionsTitle) continue;
         auto it = relocated.find(items);
         if (it == relocated.end()) {
           std::vector<std::array<uint32_t, 5>> built(rows.begin(), rows.end() - 1);
           if (controls < 0) built.push_back({0x04000000, 0x00000004, kLayoutTid, 0, kButtonLayoutDialog});
-          if (dz_right && dz_left && deadzone_strings_) {
-            // Slider rows as Mouse Sensitivity's: type 0x08, value shown, 30 steps.
-            built.push_back({0x08000000, 0x00100000, dz_right_label, uint32_t(kDeadZoneOriginal), dz_right});
-            built.push_back({0x08000000, 0x00100000, dz_left_label, uint32_t(kDeadZoneOriginal), dz_left});
-          }
+          // A row that opens a page, as Button Layout's.
+          if (stick_dialog) built.push_back({0x04000000, 0x00000004, stick_label, 0, stick_dialog});
+          if (advanced_dialog) built.push_back({0x04000000, 0x00000004, adv_row_label, 0, advanced_dialog});
           built.push_back(rows.back());
           const uint32_t dest = mem->SystemHeapAlloc(uint32_t(built.size() + 1) * 20);
           if (!dest) continue;
@@ -7508,7 +7900,7 @@ class PerfectDarkApp : public rex::ReXApp {
           WriteGuestU32(mem, term, kTypeEnd << 24);
           for (int w = 1; w < 5; ++w) WriteGuestU32(mem, term + w * 4, 0);
           it = relocated.emplace(items, dest).first;
-          REXLOG_INFO("[menu_patch] Gamepad options array 0x{:08X} -> 0x{:08X}: {}dead zone rows added",
+          REXLOG_INFO("[menu_patch] Gamepad options array 0x{:08X} -> 0x{:08X}: {}Stick Settings row added",
                       items, dest, controls < 0 ? "Button Layout and " : "");
         }
         WriteGuestU32(mem, a + 8, it->second);
@@ -8102,7 +8494,15 @@ class PerfectDarkApp : public rex::ReXApp {
   static void MigrateSettings() {
     constexpr int kRevision = 1;
     const int had = std::atoi(rex::cvar::GetFlagByName("pd_settings_revision").c_str());
-    if (had >= kRevision) return;
+    if (had >= kRevision) {
+      // A file with a setting written twice was read with the last value
+      // winning (ReportSettingsFile): save it once so the file says so too.
+      if (rex::cvar::GetConfigLoadReport().kind == rex::cvar::ConfigLoadReport::Kind::kDuplicates) {
+        SavePcSettings();
+        REXLOG_INFO("[settings] perfect_dark.toml saved with each setting once");
+      }
+      return;
+    }
     std::string changed;
     if (had < 1) {
       // v0.9.9.2 shipped 0.34; 0.37 since 2026-10-25 (the user found dark
@@ -8143,6 +8543,7 @@ class PerfectDarkApp : public rex::ReXApp {
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
     PdInstallCrashReport();
+    ReportSettingsFile();
     EnsurePortSettings(config);
     // A test build (its version contains "test") is for one bug report: the
     // detailed log is always on and the pacing experiment always off, whatever
@@ -8287,14 +8688,509 @@ class PerfectDarkApp : public rex::ReXApp {
   // once in the game (TickVulkanNotice) as well as logged.
   static inline std::string vulkan_fallback_reason_;
 
+  // ---- Explosion durations (Rare's 2010 title update, re-created; HANDOVER 4cp) -------
+  // The explosion types (26 entries of 44 bytes at 0x825CBC70, duration an s16 at
+  // +0x1C, in frames) carry about a quarter of the N64's durations in this version, so
+  // blasts vanish early; the title update put the N64 ones back and changed nothing
+  // else in the table. pd_n64_explosions (default on) does the same, live: each entry
+  // is written only while it still holds one of the two known values.
+  static constexpr uint32_t kExplosionTypes = 0x825CBC70;
+  static constexpr int kExplosionTypeCount = 26;
+  static void TickExplosionDurations() {
+    static int applied = -1;  // -1 unknown, 0 this version's, 1 the N64's
+    const int want = REXCVAR_GET(pd_n64_explosions) ? 1 : 0;
+    if (want == applied) return;
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    if (!mem) return;
+    static constexpr int16_t kOriginal[kExplosionTypeCount] = {1,  7,  10, 11, 15, 15, 15, 15, 15, 15, 20, 22, 22,
+                                                               22, 37, 1,  1,  125, 15, 45, 15, 11, 10, 22, 22, 45};
+    static constexpr int16_t kN64[kExplosionTypeCount] = {1,  30, 40, 45, 60, 60, 60, 60, 60,  60, 80, 90, 90,
+                                                          90, 150, 1, 1,  500, 60, 180, 60, 45, 40, 90, 90, 180};
+    // Not until the game image is in place: entry 17 (the biggest blast) is 125 or 500.
+    {
+      auto* p17 = mem->TranslateVirtual<uint8_t*>(kExplosionTypes + 17 * 44 + 0x1C);
+      const int16_t d17 = p17 ? int16_t((p17[0] << 8) | p17[1]) : 0;
+      if (d17 != kOriginal[17] && d17 != kN64[17]) return;
+    }
+    int written = 0, unknown = 0;
+    for (int i = 0; i < kExplosionTypeCount; ++i) {
+      const uint32_t at = kExplosionTypes + uint32_t(i) * 44 + 0x1C;
+      auto* p = mem->TranslateVirtual<uint8_t*>(at);
+      const int16_t now = int16_t((p[0] << 8) | p[1]);
+      const int16_t to = want ? kN64[i] : kOriginal[i];
+      if (now == to) continue;
+      if (now != kOriginal[i] && now != kN64[i]) {
+        ++unknown;
+        continue;
+      }
+      p[0] = uint8_t(uint16_t(to) >> 8);
+      p[1] = uint8_t(to);
+      ++written;
+    }
+    applied = want;
+    REXLOG_INFO("[tu] explosion durations: {} ({} entries written{})", want ? "N64" : "this version's", written,
+                unknown ? fmt::format(", {} unknown left alone", unknown) : std::string());
+  }
+
+  // Settings file problems (issue #21): the SDK reads perfect_dark.toml before
+  // the log opens, and an unreadable file used to be ignored silently and then
+  // overwritten with defaults by the next save (a second gpu line deleted the
+  // player's choice). The SDK now reads a setting written twice with the last
+  // value winning and keeps an unreadable file as perfect_dark.toml.bad
+  // (rex::cvar::GetConfigLoadReport); this logs it and shows it once.
+  static inline std::string settings_notice_;
+
+  static void ReportSettingsFile() {
+    using Kind = rex::cvar::ConfigLoadReport::Kind;
+    const rex::cvar::ConfigLoadReport report = rex::cvar::GetConfigLoadReport();
+    if (report.kind == Kind::kDuplicates) {
+      std::string keys;
+      for (const std::string& key : report.duplicate_keys) keys += (keys.empty() ? "" : ", ") + key;
+      REXLOG_WARN("[settings] perfect_dark.toml sets {} more than once; the last value is used", keys);
+      settings_notice_ = "perfect_dark.toml sets " + keys + " more than once:\nthe last value is used.";
+    } else if (report.kind == Kind::kUnreadable) {
+      const std::string bad = report.bad_copy.empty() ? std::string() : report.bad_copy.filename().string();
+      REXLOG_ERROR("[settings] perfect_dark.toml could not be read (line {}: {}); default settings are in use{}",
+                   report.line, report.error, bad.empty() ? std::string() : "; the file was kept as " + bad);
+      settings_notice_ = "perfect_dark.toml has an error on line " + std::to_string(report.line) +
+                         ", so default settings are in use." +
+                         (bad.empty() ? std::string() : "\nYour file was kept as " + bad + ".");
+    }
+  }
+
   static void TickVulkanNotice() {
+    // The settings notice first (8 s, once the window is up), then the Vulkan one.
+    static bool settings_shown = false;
     static bool shown = false;
     static auto first = std::chrono::steady_clock::now();
+    const auto age = std::chrono::steady_clock::now() - first;
+    if (!settings_shown && !settings_notice_.empty() && age >= std::chrono::seconds(8)) {
+      settings_shown = true;
+      rex::kernel::xam::netplay::ShowNotice(settings_notice_);
+      return;
+    }
     if (shown || vulkan_fallback_reason_.empty()) return;
-    if (std::chrono::steady_clock::now() - first < std::chrono::seconds(8)) return;  // once the window is up
+    const auto wait = settings_notice_.empty() ? std::chrono::seconds(8) : std::chrono::seconds(14);
+    if (age < wait) return;  // once the window is up (and after the settings notice)
     shown = true;
     rex::kernel::xam::netplay::ShowNotice("Vulkan cannot run on this PC (" + vulkan_fallback_reason_ +
                                           "), so the game uses DirectX 12.");
+  }
+
+  // N64 textures (pd_n64_textures.h): the player's own N64 ROM in
+  // resources\n64, switched live by a key (pd_n64_textures_key, G; D-pad Down on a pad) or by
+  // Settings > Graphics > Experimental > Textures, Plume only. The choice is
+  // saved; the ROM loads at start when it is on, or at the first switch. A
+  // problem with the ROM switches it back off with a notice.
+  static bool PlumeRunning() { return rex::cvar::GetFlagByName("gpu_native") == "true"; }
+
+  static void ShowN64Problem(pd::n64tex::Status s) {
+    using pd::n64tex::Status;
+    std::string text;
+    switch (s) {
+      case Status::kNoRom:
+        text = "For N64 textures, import your N64 Perfect Dark ROM: Settings > Graphics > Experimental.";
+        break;
+      case Status::kBadRom:
+        text = "The N64 ROM isn't a Perfect Dark ROM this game knows (NTSC or PAL): import yours again.";
+        break;
+      case Status::kUnsupported:
+        text = "N64 textures from the Japanese N64 ROM aren't supported yet.";
+        break;
+      default:
+        text = "The N64 ROM's textures could not be read (the log says why).";
+        break;
+    }
+    rex::kernel::xam::netplay::ShowNotice(text);
+  }
+
+  // The Switch Graphics key(s) (pd_n64_textures_key, default G; a row on
+  // Settings > Keyboard & Mouse, so rebinding it swaps with a game action as
+  // any row does). None while a key is being captured for a binding, and a key
+  // that is also one of the game's own binds (the hidden look / D-pad / guide
+  // binds, or a hand-edited file) is left to the game.
+  static std::vector<int> N64TexturesKeys() {
+    static std::string name;
+    static std::vector<int> parsed;
+    const std::string now = rex::cvar::GetFlagByName("pd_n64_textures_key");
+    if (now != name) {
+      name = now;
+      parsed.clear();
+      for (const std::string& key : SplitKeys(name)) {
+        const int vk = int(rex::ui::ParseVirtualKey(key));
+        if (vk > 0 && vk < 256) parsed.push_back(vk);
+      }
+    }
+    if (parsed.empty() || capture_row_.load() >= 0) return {};
+    static const char* const kExtraBinds[] = {"keybind_rstick_up", "keybind_rstick_down", "keybind_rstick_left",
+                                              "keybind_rstick_right", "keybind_dpad_up", "keybind_dpad_down",
+                                              "keybind_dpad_left", "keybind_dpad_right", "keybind_guide"};
+    const auto bound = [](const char* cvar, int vk) {
+      for (const std::string& key : SplitKeys(rex::cvar::GetFlagByName(cvar)))
+        if (int(rex::ui::ParseVirtualKey(key)) == vk) return true;
+      return false;
+    };
+    std::vector<int> keys;
+    for (const int vk : parsed) {
+      bool taken = false;
+      for (int row = 0; row < kBindRowCount && !taken; ++row)
+        if (std::string_view(BindRows()[row].cvar) != "pd_n64_textures_key") taken = bound(BindRows()[row].cvar, vk);
+      for (const char* cvar : kExtraBinds)
+        if (!taken) taken = bound(cvar, vk);
+      if (!taken) keys.push_back(vk);
+    }
+    return keys;
+  }
+
+  // D-pad Down on a controller during play (pd_n64_textures_pad): no control
+  // style uses the D-pad (Button Layout, all three styles), and in menus it
+  // still moves the highlight. FilterGamepad sees the press (any controller
+  // driver), hides it from the game while playing and asks the UI thread to
+  // switch, as the key does.
+  static inline std::atomic<bool> pad_switch_in_play_{false};
+  static inline std::atomic<bool> pad_switch_requested_{false};
+
+  // N64 (on) or remastered textures, with a notice; refused with a notice
+  // (and the choice left as it was) without Plume or a usable ROM.
+  static void SetN64Textures(bool on) {
+    using pd::n64tex::Status;
+    if (on == pd::n64tex::Enabled()) return;
+    if (on) {
+      if (!PlumeRunning()) {
+        rex::kernel::xam::netplay::ShowNotice("N64 textures need the Plume renderer.");
+        return;
+      }
+      Status s = pd::n64tex::GetStatus();
+      if ((s == Status::kIdle || s == Status::kNoRom) && !pd::n64tex::RomPresent()) {
+        ShowN64Problem(Status::kNoRom);
+        return;
+      }
+      pd::n64tex::BeginLoad();  // (once; retried while there was no ROM)
+      s = pd::n64tex::GetStatus();
+      if (s != Status::kLoading && s != Status::kReady) {
+        ShowN64Problem(s);
+        return;
+      }
+    }
+    pd::n64tex::SetEnabled(on);
+    SavePcSettings();
+    const pd::n64tex::Status s = pd::n64tex::GetStatus();
+    REXLOG_INFO("[n64] textures switched to {}", on ? "N64" : "remastered");
+    rex::kernel::xam::netplay::ShowNotice(on ? (s == Status::kReady ? "Textures: N64" : "Textures: N64 (loading)")
+                                             : "Textures: Remastered");
+  }
+
+  static void ToggleN64Textures() { SetN64Textures(!pd::n64tex::Enabled()); }
+
+  // ---- Settings > Graphics > Experimental -----------------------------------
+  // A page of its own (built like Stick Settings): the base textures
+  // (Remastered / N64), a texture pack over them, importing the N64 ROM and
+  // texture packs with the Windows file picker, the packs folder, and the
+  // texture dump for pack makers. HANDOVER 4cn.
+  //
+  // exp_strings_ (guest, 32 bytes each): labels 0-6 (kExpTitle..kExpDump), the
+  // values from +256 (Remastered, N64, Off, On, None, 16 each), the listed
+  // packs' names from +384.
+  enum : int { kExpTitle, kExpTextures, kExpPack, kExpImportRom, kExpImportPack, kExpOpenFolder, kExpDump };
+  static constexpr uint32_t kExpValues = 256, kExpPackNames = 384;
+  static constexpr uint32_t kExpStringsSize = kExpPackNames + uint32_t(pd::texpack::kMaxListed) * 32;
+  static inline uint32_t exp_strings_ = 0;
+  static inline uint32_t exp_dialog_ = 0;
+  static uint32_t ExpValue(int i) { return exp_strings_ + kExpValues + uint32_t(i) * 16; }  // 0 Remastered .. 4 None
+
+  template <int N>
+  static void PdExpLabel(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = exp_strings_ + uint32_t(N) * 32; }
+
+  static void WriteExpStrings(rex::memory::Memory* mem) {
+    if (!exp_strings_) exp_strings_ = mem->SystemHeapAlloc(kExpStringsSize);
+    if (!exp_strings_) return;
+    static const char* const kLabels[] = {"Experimental\n",        "Textures\n",
+                                          "Texture Pack\n",        "Import N64 ROM\n",
+                                          "Import Texture Pack\n", "Open Texture Packs Folder\n",
+                                          "Dump Textures\n"};
+    for (int i = 0; i < 7; ++i)
+      WriteGuestBytes(mem, exp_strings_ + uint32_t(i) * 32, kLabels[i], strlen(kLabels[i]) + 1);
+    static const char* const kValues[] = {"Remastered", "N64", "Off", "On", "None"};
+    for (int i = 0; i < 5; ++i) WriteGuestBytes(mem, ExpValue(i), kValues[i], strlen(kValues[i]) + 1);
+  }
+
+  // Textures: Remastered / N64 (same op protocol as PdResolutionMenuHandler).
+  static void PdExpTexturesHandler(PPCContext& ctx, uint8_t*) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t op = ctx.r3.u32, data = ctx.r5.u32;
+    uint32_t ret = 0;
+    switch (op) {
+      case 1:
+        if (mem) WriteGuestU32(mem, data, 2);
+        break;
+      case 3:
+        ret = ExpValue(mem && ReadGuestU32(mem, data) == 1 ? 1 : 0);
+        break;
+      case 6:
+        if (mem) SetN64Textures(ReadGuestU32(mem, data) == 1);
+        break;
+      case 7:
+        if (mem) WriteGuestU32(mem, data, pd::n64tex::Enabled() ? 1u : 0u);
+        break;
+      default:
+        break;
+    }
+    ctx.r3.u64 = ret;
+  }
+
+  static void ChooseTexturePack(const std::string& name) {
+    if (!name.empty() && !PlumeRunning()) {
+      rex::kernel::xam::netplay::ShowNotice("Texture packs need the Plume renderer.");
+      return;
+    }
+    const int pictures = pd::texpack::ChoosePack(name);
+    SavePcSettings();
+    rex::kernel::xam::netplay::ShowNotice(
+        name.empty() ? std::string("Texture Pack: None")
+                     : "Texture Pack: " + name + " (" + std::to_string(pictures) + " pictures)");
+  }
+
+  // Texture Pack: None, then each installed pack by name.
+  static void PdExpPackHandler(PPCContext& ctx, uint8_t*) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t op = ctx.r3.u32, data = ctx.r5.u32;
+    uint32_t ret = 0;
+    const std::vector<std::string> packs = pd::texpack::ListPacks();
+    switch (op) {
+      case 1:
+        if (mem) {
+          for (size_t i = 0; i < packs.size(); ++i) {
+            std::string shown = packs[i].substr(0, 31);
+            WriteGuestBytes(mem, exp_strings_ + kExpPackNames + uint32_t(i) * 32, shown.c_str(), shown.size() + 1);
+          }
+          WriteGuestU32(mem, data, uint32_t(packs.size() + 1));
+        }
+        break;
+      case 3: {
+        const uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        ret = i >= 1 && i <= packs.size() ? exp_strings_ + kExpPackNames + (i - 1) * 32 : ExpValue(4);
+        break;
+      }
+      case 6: {
+        const uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        const std::string name = i >= 1 && i <= packs.size() ? packs[i - 1] : std::string();
+        if (name != pd::texpack::ChosenPack()) ChooseTexturePack(name);
+        break;
+      }
+      case 7: {
+        uint32_t i = 0;
+        const std::string chosen = pd::texpack::ChosenPack();
+        for (size_t k = 0; k < packs.size(); ++k)
+          if (packs[k] == chosen) i = uint32_t(k + 1);
+        if (mem) WriteGuestU32(mem, data, i);
+        break;
+      }
+      default:
+        break;
+    }
+    ctx.r3.u64 = ret;
+  }
+
+  // Importing: the Windows file picker on a thread of its own (owned by the
+  // game window, so it stays in front of it, fullscreen included), the import
+  // on that thread too; the result is applied on the UI thread
+  // (TickExperimental). pd_test_pick: a path used instead of the picker.
+  enum class PickKind { kRom, kPack };
+  struct PickResult {
+    PickKind kind;
+    bool ok;
+    std::string message, name;
+  };
+  static inline std::atomic<bool> picker_busy_{false};
+  static inline std::mutex pick_mutex_;
+  static inline std::vector<PickResult> pick_results_;
+
+  static std::wstring PickFile(HWND owner, PickKind kind) {
+    std::wstring out;
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    IFileOpenDialog* dialog = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+      DWORD options = 0;
+      dialog->GetOptions(&options);
+      dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+      const COMDLG_FILTERSPEC rom[] = {{L"N64 ROM (*.z64, *.n64, *.v64)", L"*.z64;*.n64;*.v64"},
+                                       {L"All files", L"*.*"}};
+      const COMDLG_FILTERSPEC pack[] = {{L"Texture pack (its .zip, or any picture in its folder)", L"*.zip;*.png"},
+                                        {L"All files", L"*.*"}};
+      dialog->SetFileTypes(2, kind == PickKind::kRom ? rom : pack);
+      dialog->SetTitle(kind == PickKind::kRom ? L"Import your N64 Perfect Dark ROM"
+                                              : L"Import a texture pack: its .zip, or any picture in its folder");
+      IShellItem* item = nullptr;
+      if (SUCCEEDED(dialog->Show(owner)) && SUCCEEDED(dialog->GetResult(&item))) {
+        PWSTR path = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+          out = path;
+          CoTaskMemFree(path);
+        }
+        item->Release();
+      }
+      dialog->Release();
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    return out;
+  }
+
+  static void StartImport(PickKind kind) {
+    PerfectDarkApp* app = current_instance_;
+    if (!app || picker_busy_.exchange(true)) return;
+    HWND owner = app->window() ? static_cast<HWND>(app->window()->GetNativeWindowHandle()) : nullptr;
+    const std::string test_pick = rex::cvar::GetFlagByName("pd_test_pick");
+    std::thread([owner, kind, test_pick]() {
+      std::filesystem::path src = test_pick.empty() ? std::filesystem::path(PickFile(owner, kind))
+                                                    : std::filesystem::path(std::u8string(test_pick.begin(), test_pick.end()));
+      PickResult r{kind, false, {}, {}};
+      if (!src.empty()) {
+        REXLOG_INFO("[experimental] import {}: {}", kind == PickKind::kRom ? "N64 ROM" : "texture pack",
+                    pd::update::Narrow(src.wstring()));
+        if (kind == PickKind::kRom) {
+          r.ok = pd::assets::ImportN64Rom(src, pd::n64tex::RomFolder(), &r.name, &r.message);
+        } else {
+          // A picture inside a pack's folder stands for the folder.
+          std::error_code ec;
+          if (!std::filesystem::is_directory(src, ec) && pd::assets::PackFileId(src) >= 0) src = src.parent_path();
+          int pictures = 0;
+          r.ok = pd::assets::ImportTexturePack(src, pd::texpack::PacksFolder(), &r.name, &pictures, &r.message);
+        }
+        REXLOG_INFO("[experimental] {}", r.message);
+        std::lock_guard<std::mutex> lock(pick_mutex_);
+        pick_results_.push_back(std::move(r));
+      }
+      picker_busy_ = false;
+    }).detach();
+  }
+
+  static void PdExpImportRomHandler(PPCContext& ctx, uint8_t*) {
+    if (ctx.r3.u32 == 6) StartImport(PickKind::kRom);
+    ctx.r3.u64 = 0;
+  }
+  static void PdExpImportPackHandler(PPCContext& ctx, uint8_t*) {
+    if (ctx.r3.u32 == 6) StartImport(PickKind::kPack);
+    ctx.r3.u64 = 0;
+  }
+  static void PdExpOpenFolderHandler(PPCContext& ctx, uint8_t*) {
+    if (ctx.r3.u32 == 6) {
+      const std::filesystem::path folder = pd::texpack::PacksFolder();
+      std::error_code ec;
+      std::filesystem::create_directories(folder, ec);
+      ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    ctx.r3.u64 = 0;
+  }
+  static bool GetTextureDump() { return pd::texpack::Dumping(); }
+  static void SetTextureDump(bool on) {
+    if (on == pd::texpack::Dumping()) return;
+    pd::texpack::SetDumping(on);
+    SavePcSettings();
+    rex::kernel::xam::netplay::ShowNotice(on ? "Saving the textures drawn from now on in resources\\userdata\\texture-dump."
+                                             : "Texture dump off.");
+  }
+  static void PdExpDumpHandler(PPCContext& ctx, uint8_t*) {
+    PdTwoStateHandler(ctx, ExpValue(2), ExpValue(3), &GetTextureDump, &SetTextureDump);
+  }
+
+  // Builds the page (once; PatchVideoOptionsMenu, before its rows).
+  static void BuildExperimentalPage(rex::memory::Memory* mem, rex::runtime::FunctionDispatcher* fd) {
+    if (exp_dialog_ || !fd) return;
+    WriteExpStrings(mem);
+    if (!exp_strings_) return;
+    const uint32_t title = fd->AllocateThunk(&PdExpLabel<kExpTitle>, 0);
+    struct Row {
+      uint32_t type, flags;
+      PPCFunc* label;
+      PPCFunc* handler;
+    };
+    // Spinner rows (0x0C) as Settings > Graphics' own; press rows (0x04, no
+    // dialog flag) as Check for Updates.
+    const Row rows[] = {
+        {0x0C000000, 0, &PdExpLabel<kExpTextures>, &PdExpTexturesHandler},
+        {0x0C000000, 0, &PdExpLabel<kExpPack>, &PdExpPackHandler},
+        {0x04000000, 0, &PdExpLabel<kExpImportRom>, &PdExpImportRomHandler},
+        {0x04000000, 0, &PdExpLabel<kExpImportPack>, &PdExpImportPackHandler},
+        {0x04000000, 0, &PdExpLabel<kExpOpenFolder>, &PdExpOpenFolderHandler},
+        {0x0C000000, 0, &PdExpLabel<kExpDump>, &PdExpDumpHandler},
+    };
+    constexpr uint32_t kRows = sizeof(rows) / sizeof(rows[0]);
+    const uint32_t items = mem->SystemHeapAlloc((kRows + 1) * 20 + 24);
+    if (!title || !items) return;
+    for (uint32_t i = 0; i < kRows; ++i) {
+      const uint32_t label = fd->AllocateThunk(rows[i].label, 0), handler = fd->AllocateThunk(rows[i].handler, 0);
+      if (!label || !handler) return;
+      const uint32_t words[5] = {rows[i].type, rows[i].flags, label, 0, handler};
+      for (int w = 0; w < 5; ++w) WriteGuestU32(mem, items + i * 20 + uint32_t(w) * 4, words[w]);
+    }
+    const uint32_t term = items + kRows * 20;
+    WriteGuestU32(mem, term, 0x1D000000);
+    for (int w = 1; w < 5; ++w) WriteGuestU32(mem, term + uint32_t(w) * 4, 0);
+    const uint32_t dialog = term + 20;
+    const uint32_t dialog_words[6] = {0x01000000, title, items, 0, 0, 0};
+    for (int w = 0; w < 6; ++w) WriteGuestU32(mem, dialog + uint32_t(w) * 4, dialog_words[w]);
+    exp_dialog_ = dialog;
+    REXLOG_INFO("[menu_patch] Experimental dialog at 0x{:08X} (items 0x{:08X})", dialog, items);
+  }
+
+  // Each frame (UI thread): applies finished imports.
+  static void TickExperimental() {
+    pd::texpack::Init();
+    std::vector<PickResult> results;
+    {
+      std::lock_guard<std::mutex> lock(pick_mutex_);
+      results.swap(pick_results_);
+    }
+    for (const PickResult& r : results) {
+      std::string text = r.message;
+      if (r.ok && r.kind == PickKind::kRom) {
+        pd::n64tex::Reload();
+        if (PlumeRunning() && !pd::n64tex::Enabled()) {
+          pd::n64tex::SetEnabled(true);
+          SavePcSettings();
+          text += " Textures: N64.";
+        }
+      } else if (r.ok && r.kind == PickKind::kPack) {
+        pd::texpack::ListPacks(true);
+        if (PlumeRunning()) {
+          pd::texpack::ChoosePack(r.name);
+          SavePcSettings();
+          text += " Texture Pack: " + r.name + ".";
+        } else {
+          text += " Texture packs need the Plume renderer.";
+        }
+      }
+      rex::kernel::xam::netplay::ShowNotice(text);
+    }
+  }
+
+  // Each frame: starts loading at start when the saved choice is on, and turns
+  // it off (for this run) with a notice if the ROM turns out unusable.
+  static void TickN64Textures() {
+    using pd::n64tex::Status;
+    static auto first = std::chrono::steady_clock::now();
+    static Status last = Status::kIdle;
+    // D-pad Down in play (FilterGamepad, on the input thread) switches here.
+    if (pad_switch_requested_.exchange(false)) ToggleN64Textures();
+    // Switched on (saved, or set by the test pipe) and nothing loaded yet.
+    if (pd::n64tex::GetStatus() == Status::kIdle && pd::n64tex::Enabled() && PlumeRunning()) pd::n64tex::BeginLoad();
+    const Status s = pd::n64tex::GetStatus();
+    if (s == last) return;
+    // Notices only once the window is up (8 s, as the Vulkan one).
+    if (std::chrono::steady_clock::now() - first < std::chrono::seconds(8)) return;
+    last = s;
+    if (!pd::n64tex::Enabled()) return;
+    if (s == Status::kReady) {
+      rex::kernel::xam::netplay::ShowNotice("Textures: N64");
+    } else if (s != Status::kLoading && s != Status::kIdle) {
+      pd::n64tex::SetEnabled(false);  // saved off: no notice at every start
+      SavePcSettings();
+      REXLOG_INFO("[n64] textures switched back to remastered: the ROM can't be used");
+      ShowN64Problem(s);
+    }
   }
 
   static void ApplyApiIndex(int index) {
@@ -9102,6 +9998,9 @@ inline void PerfectDarkInputTracker::OnDraw(ImGuiIO& /*io*/) {
   PerfectDarkApp::EnsureGamepadFilter();
   PerfectDarkApp::TraceStickLook();
   PerfectDarkApp::TickVulkanNotice();
+  PerfectDarkApp::TickExplosionDurations();
+  PerfectDarkApp::TickN64Textures();
+  PerfectDarkApp::TickExperimental();
   if (app_) app_->TickMatchPicker();
   if (app_) app_->TickUpdateDialog();
 
@@ -9116,6 +10015,18 @@ inline void PerfectDarkInputTracker::OnDraw(ImGuiIO& /*io*/) {
     const bool f12_shot = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
     if (f12_shot && !f12_shot_was_down_) PerfectDarkApp::TakeScreenshot();
     f12_shot_was_down_ = f12_shot;
+
+    // The Switch Graphics key (pd_n64_textures_key, G) switches between the
+    // N64 and the remastered graphics; not while text is being typed (the
+    // player name / address box, any ImGui text field). D-pad Down on a pad
+    // asks through FilterGamepad.
+    bool n64_down = false;
+    if (!PerfectDarkApp::TypingText()) {
+      for (const int vk : PerfectDarkApp::N64TexturesKeys())
+        if (GetAsyncKeyState(vk) & 0x8000) n64_down = true;
+    }
+    if (n64_down && !n64_key_was_down_) PerfectDarkApp::ToggleN64Textures();
+    n64_key_was_down_ = n64_down;
 
     // Lighting capture (pd_light_capture): F9 or Insert logs the next frame's
     // draws - under Plume each draw's shaders and constants

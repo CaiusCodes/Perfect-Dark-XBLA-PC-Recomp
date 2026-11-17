@@ -38,6 +38,12 @@ set(PERFECTDARK_SOURCES
     src/pd_native_probe.cpp
     src/pd_native_gpu.cpp
     src/pd_native_shaders.cpp
+    src/pd_n64_decode.cpp
+    src/pd_n64_textures.cpp
+    src/pd_n64_models.cpp
+    src/pd_n64_rooms.cpp
+    src/pd_assets_import.cpp
+    src/pd_texture_packs.cpp
 )
 
 # The release version: VERSION is the single source of truth. The game shows
@@ -94,6 +100,8 @@ if(WIN32)
     target_link_libraries(perfect_dark PRIVATE Xinput9_1_0.lib)
     # Help & Options > Check for Updates asks GitHub over HTTPS (src/pd_update.h).
     target_link_libraries(perfect_dark PRIVATE winhttp.lib)
+    # The N64 ROM's MD5 (src/pd_n64_textures.cpp).
+    target_link_libraries(perfect_dark PRIVATE bcrypt.lib)
 endif()
 
 # The Plume renderer (gpu_native, src/pd_native_gpu.cpp; the default since

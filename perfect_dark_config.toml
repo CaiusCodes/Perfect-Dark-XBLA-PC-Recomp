@@ -294,3 +294,99 @@ address = 0x8226CA54
 name = "PdHookTextLookup"
 registers = ["r3"]
 after_instruction = true
+
+# ---- Advanced Control (Rare's 2010 title update, re-created; HANDOVER 4co) ----------
+
+# The smoke pool, doubled with N64 explosion durations (pd_n64_explosions), as the
+# title update did (30 / 60 smokes -> 60 / 120): sub_82160E30 stores the count at
+# 0x8262E2C8 and allocates count * 1612 bytes from the stage pool after it.
+[[midasm_hook]]
+address = 0x82160E60
+name = "PdHookSmokePool"
+registers = ["r11"]
+
+# Secondary Fire Reset (pd_secondary_fire_reset, default true = the game as it was):
+# the four places the game sets weapons back to their primary function (each clears
+# the player's per-weapon function bits at player config +199: the whole 6-byte
+# array in three of them, the current weapon's bit in the fourth). The title update
+# skipped them when its "Secondary Fire Reset" option was off; so does this.
+[[midasm_hook]]
+address = 0x820FDAF4
+name = "PdHookKeepGunFunctions"
+jump_address_on_true = 0x820FDB00
+
+[[midasm_hook]]
+address = 0x82107024
+name = "PdHookKeepGunFunctions"
+jump_address_on_true = 0x8210706C
+
+[[midasm_hook]]
+address = 0x82172BFC
+name = "PdHookKeepGunFunctions"
+jump_address_on_true = 0x82172C08
+
+[[midasm_hook]]
+address = 0x821817C4
+name = "PdHookKeepGunFunctions"
+jump_address_on_true = 0x821817D0
+
+# ---- N64 models (Experimental) --------------------------------------------------------
+
+# The model renderer (sub_82194778) draws a DL / GUNDL node's remastered companion
+# mesh (sub_82193840) when the node's link (u16 at +2) isn't -1; with N64 models on
+# (pd_n64_models, with the N64 textures) the link reads as -1 there, so the N64
+# display list is drawn (sub_82193998 / sub_82193B68). Hit tests (sub_8220AFC8)
+# still read the real link: drawing only.
+[[midasm_hook]]
+address = 0x82194950
+name = "PdHookN64ModelLink"
+registers = ["r11", "r30"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82194998
+name = "PdHookN64ModelLink"
+registers = ["r11", "r30"]
+after_instruction = true
+
+# N64 sky: sub_8223B0C8 (the N64's sky_render) tests the texture bank's +2916 flag
+# (0 = the remaster's skybox); in N64 mode the sky takes the N64 path.
+[[midasm_hook]]
+address = 0x8223B0E8
+name = "PdHookN64Sky"
+registers = ["r9"]
+after_instruction = true
+
+# Which model file a node belongs to (r30 = the model, +8 = its modeldef = the loaded
+# file): every file load goes through sub_822549C0 (r4 = file id, r5 = destination).
+[[midasm_hook]]
+address = 0x822549C0
+name = "PdHookFileLoad"
+registers = ["r4", "r5"]
+
+# The N64 DL node renderer (sub_82193B68) after `lwz r11,4(r3)` (rwdata->gdl): nodes the
+# remaster gave a remastered mesh have empty rwdata, so N64 mode fills it in as the N64
+# does (vertices, opagdl, colours) before the `cmplwi r11,0` that would skip the node.
+[[midasm_hook]]
+address = 0x82193BCC
+name = "PdHookN64ModelRwData"
+registers = ["r3", "r11", "r28", "r29"]
+after_instruction = true
+
+# The same renderer's translucent pass, after its own `lwz r11,4(r3)`: a ROM model copy's
+# node (pd_n64_models.cpp) gets its own rwdata there too.
+[[midasm_hook]]
+address = 0x82193D14
+name = "PdHookN64ModelRwDataXlu"
+registers = ["r3", "r11"]
+after_instruction = true
+
+# The display-list interpreter's texture command (sub_822653B8) binds a texture only when
+# the game loaded it (index entry +50 = 1 or 3); the N64 models' textures never are. In
+# N64 mode the ids Plume draws from the ROM count as loaded (after `extsh r9,r8`; r10 =
+# id * 52).
+[[midasm_hook]]
+address = 0x82266224
+name = "PdHookN64TextureLoaded"
+registers = ["r9", "r10"]
+after_instruction = true

@@ -33,6 +33,13 @@ uint32_t PdRoomBrightnessFloor(uint32_t brightness);
 bool PdAspect43();
 float PdDarkRoomObjectVisibility();
 void PdViewBobHold(uint8_t* base, uint32_t sp);
+bool PdN64ModelLink(uint8_t* base, uint32_t link, uint32_t model);
+void PdNoteFileLoad(uint32_t fileid, uint32_t dst);
+// pd_native_gpu.cpp
+bool PdN64TextureDrawable(int id);
+uint32_t PdN64ModelRwData(uint8_t* base, uint32_t rwdata, uint32_t gdl, uint32_t rodata, uint32_t node);
+uint32_t PdN64RomRwData();  // pd_n64_models.cpp
+namespace pd::n64tex { bool SkyActive(); }  // pd_n64_textures.cpp
 int64_t PdMpUpdateRate();
 int64_t PdMpUpdateRateMin();
 int64_t PdMpFacingDelayMs();
@@ -42,6 +49,8 @@ void PdNetLookSend(uint32_t input, uint32_t frame);
 void PdNetLookApply(uint32_t pad);
 void PdMpChooseTrack(PPCContext& ctx, uint8_t* base);
 uint32_t PdTextForDisplay(uint32_t text);
+bool PdKeepGunFunctions();
+uint32_t PdSmokePoolSize(uint32_t count);
 
 namespace {
 // The calling guest thread's full context and guest memory, for a hook that needs
@@ -270,4 +279,69 @@ void PdHookChooseTrack() {
 // string): with no gamepad, a copy with the button icons written as keys.
 void PdHookTextLookup(PPCRegister& r3) {
   r3.u64 = PdTextForDisplay(r3.u32);
+}
+
+// ---- Advanced Control ----------------------------------------------------------
+
+// Secondary Fire Reset off: the reset of the weapons' functions is skipped.
+bool PdHookKeepGunFunctions() {
+  return PdKeepGunFunctions();
+}
+
+// sub_82160E30 (smoke reset) before `stw r11,-7480(r10)`: r11 = the smoke count (30 / 60).
+void PdHookSmokePool(PPCRegister& r11) {
+  r11.u64 = PdSmokePoolSize(r11.u32);
+}
+
+// ---- N64 models ---------------------------------------------------------------------
+
+// The model renderer (sub_82194778), DL and GUNDL nodes: after `lhz r11,2(r31); extsh`
+// r11 is the node's link to its remastered companion mesh, -1 for none (then the
+// N64 display list is drawn). With N64 models on, every node takes the N64 path.
+void PdHookN64ModelLink(PPCRegister& r11, PPCRegister& r30) {
+  if (PdN64ModelLink(HookBase(), r11.u32, r30.u32)) r11.s64 = -1;
+}
+
+// The sky (sub_8223B0C8, the N64's sky_render kept by the remaster): after
+// `lbz r9,2916(r10)` (texture bank 0x82655BE0 + 2916, a flag the game leaves at 0),
+// r9 = 0 draws the remaster's skybox and distant backdrop (sub_82238A68 /
+// sub_822390E0), anything else the N64 sky (fill colour, clouds and water planes from
+// the stage's environment). N64 mode takes the N64 path for the sky only; the flag
+// itself is left alone (the texture bank and the display-list interpreter read it too).
+void PdHookN64Sky(PPCRegister& r9) {
+  if (pd::n64tex::SkyActive()) r9.u64 = 1;
+}
+
+// sub_822549C0 (the PackedSegFile loader all file loads go through), at entry:
+// r4 = the file id, r5 = where it is loaded.
+void PdHookFileLoad(PPCRegister& r4, PPCRegister& r5) {
+  PdNoteFileLoad(r4.u32, r5.u32);
+}
+
+// sub_82193B68 (DL node) after `lwz r11,4(r3)`: r3 = the node's rwdata, r11 = its display
+// list, r29 = rodata, r28 = the node. N64 mode sets up rwdata the remaster left empty.
+// A node of a ROM model copy (pd_n64_models.cpp) gets its own rwdata block instead of
+// the instance's.
+void PdHookN64ModelRwData(PPCRegister& r3, PPCRegister& r11, PPCRegister& r28, PPCRegister& r29) {
+  if (const uint32_t rom = PdN64RomRwData()) {
+    r3.u64 = rom;
+    r11.u64 = _byteswap_ulong(*reinterpret_cast<const uint32_t*>(HookBase() + rom + 4));
+    return;
+  }
+  r11.u64 = PdN64ModelRwData(HookBase(), r3.u32, r11.u32, r29.u32, r28.u32);
+}
+
+// The same renderer's translucent pass (0x82193D14, after the second `lwz r11,4(r3)`).
+void PdHookN64ModelRwDataXlu(PPCRegister& r3, PPCRegister& r11) {
+  if (const uint32_t rom = PdN64RomRwData()) {
+    r3.u64 = rom;
+    r11.u64 = _byteswap_ulong(*reinterpret_cast<const uint32_t*>(HookBase() + rom + 4));
+  }
+}
+
+// The display-list interpreter's texture command (sub_822653B8, 0x82266224) after
+// `extsh r9,r8`: r9 = the texture's index entry +50 (1 or 3 = loaded: bound), r10 =
+// id * 52. In N64 mode an id Plume draws from the ROM counts as loaded.
+void PdHookN64TextureLoaded(PPCRegister& r9, PPCRegister& r10) {
+  if (r9.s32 != 1 && r9.s32 != 3 && PdN64TextureDrawable(int(r10.u32 / 52))) r9.s64 = 1;
 }

@@ -8,13 +8,19 @@
 // For automated tests (no window):
 //   --setup --unattended [--package <file or folder>] [--extras fullscreen,shortcut,cheats,story,multiplayer,autoaim]
 //           [--language en|fr|de|it|es] [--shortcut-folder <dir>] [--saves-folder <dir>]
+//           [--n64-rom <file>] [--texture-pack <.zip or folder>]
 //   (--saves-folder: saves and settings in that folder instead of resources\userdata)
+//   (--n64-rom / --texture-pack, experimental: the player's own N64 Perfect Dark
+//   ROM for N64 textures, a texture pack; both switched on. On an installed copy
+//   without --package only these are done.)
 //   Exit code 0 imported, 1 failed, 2 several packages found (pass --package), 3 none found.
 //
 // Any other arguments are passed on to the game.
 //
 // A GUI-subsystem program, so starting it never flashes a console.
 #include "launcher.h"
+
+#include "../../src/pd_assets_import.h"
 
 #include <objbase.h>
 #include <shellapi.h>
@@ -75,6 +81,38 @@ int RunUnattended(Paths& p, const SetupOptions& options, const std::wstring& ext
   return 0;
 }
 
+// Experimental extras (Settings > Graphics > Experimental in the game): the
+// player's N64 ROM into resources\n64 and N64 textures on; a texture pack into
+// resources\texture-packs and chosen. Same code as the game's Import rows.
+bool ImportExperimental(const Paths& p, const fs::path& rom, const fs::path& pack) {
+  bool ok = true;
+  if (!rom.empty()) {
+    std::string version, message;
+    const bool done = pd::assets::ImportN64Rom(rom, p.resources / L"n64", &version, &message);
+    Log(L"N64 ROM " + rom.wstring() + L": " + Widen(message));
+    if (done) {
+      EnsureSettings(p);
+      WriteConfig(p, "pd_n64_textures", "true");
+    }
+    ok = ok && done;
+  }
+  if (!pack.empty()) {
+    std::string name, message;
+    int pictures = 0;
+    fs::path src = pack;
+    std::error_code ec;
+    if (!fs::is_directory(src, ec) && pd::assets::PackFileId(src) >= 0) src = src.parent_path();
+    const bool done = pd::assets::ImportTexturePack(src, p.resources / L"texture-packs", &name, &pictures, &message);
+    Log(L"Texture pack " + pack.wstring() + L": " + Widen(message));
+    if (done) {
+      EnsureSettings(p);
+      WriteConfig(p, "pd_texture_pack", "\"" + name + "\"");
+    }
+    ok = ok && done;
+  }
+  return ok;
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
@@ -82,7 +120,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   bool setup = false, unattended = false, update = false;
   std::wstring extras, language;
-  fs::path saves_folder;
+  fs::path saves_folder, n64_rom, texture_pack;
   SetupOptions options;
   for (int i = 1; i < argc; ++i) {
     const std::wstring arg = argv[i];
@@ -102,6 +140,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
       saves_folder = argv[++i];
     } else if (arg == L"--shortcut-folder" && i + 1 < argc) {
       options.shortcut_folder = argv[++i];
+    } else if (arg == L"--n64-rom" && i + 1 < argc) {
+      n64_rom = argv[++i];
+    } else if (arg == L"--texture-pack" && i + 1 < argc) {
+      texture_pack = argv[++i];
     } else {
       options.game_args += (options.game_args.empty() ? L"" : L" ") + Quote(arg);
     }
@@ -191,7 +233,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   LogTo(p.logs);
   options.forced = installed;
   options.reason = installed ? L"--setup" : L"missing " + missing;
-  const int code = unattended ? RunUnattended(p, options, extras, language, saves_folder) : RunSetupWindow(instance, p, options);
+  int code = 0;
+  const bool experimental = !n64_rom.empty() || !texture_pack.empty();
+  if (unattended && experimental && installed && options.package.empty()) {
+    code = ImportExperimental(p, n64_rom, texture_pack) ? 0 : 1;
+  } else {
+    code = unattended ? RunUnattended(p, options, extras, language, saves_folder) : RunSetupWindow(instance, p, options);
+    if (unattended && code == 0 && experimental && !ImportExperimental(p, n64_rom, texture_pack)) code = 1;
+  }
   if (mutex) {
     ReleaseMutex(mutex);
     CloseHandle(mutex);

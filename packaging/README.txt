@@ -145,7 +145,16 @@ KEYBOARD AND MOUSE
                         W / S and E still work.
   Title screen          Any key or a left click starts.
 
-An Xbox controller works too.
+An Xbox controller works too. Settings > Gamepad Controls > Control Options has
+two pages of PC options for it:
+  Stick Settings        Right / Left Stick Dead Zone (how far a stick moves before
+                        it counts) and Right / Left Stick Response (higher is
+                        slower near the centre for precise aiming; full tilt is
+                        unchanged). "Original" plays as the game always did.
+  Advanced Control      from Rare's 2010 Xbox 360 update: Legacy (left stick moves
+                        and turns, right stick strafes and looks up and down),
+                        Southpaw (sticks swapped), Swap Triggers, and Secondary
+                        Fire Reset. One setting for every controller.
 
 Diagonals: holding two movement keys (W+A, W+D) moves as fast as the fastest an
 Xbox controller's thumbstick can go on a diagonal, so keyboard and controller
@@ -230,6 +239,37 @@ DISPLAY
   in resources\userdata\perfect_dark.toml: frames are then shown exactly
   evenly spaced, at the cost of about half a frame more lag. It is off by
   default.
+
+EXPERIMENTAL: N64 TEXTURES AND TEXTURE PACKS
+  Settings > Graphics > Experimental. Work in progress; Plume only.
+
+  N64 textures: Import N64 ROM and choose your own N64 Perfect Dark ROM
+  (.z64, .n64 or .v64; the NTSC and PAL versions). It is checked and copied
+  to resources\n64, and Textures switches between N64 and Remastered. The G
+  key switches too, anywhere (change it under Settings > Keyboard & Mouse >
+  Switch Graphics), and so does D-pad Down on a controller during play. N64
+  mode draws the N64's textures, characters, guns, props, level rooms, skies
+  and water from your ROM; the HUD, crosshair, fonts and menus keep their
+  remastered look. It only changes what you see: in a network match each
+  player can use either look. This download contains no N64 data: only your
+  ROM is read.
+
+  Texture packs: Import Texture Pack and choose a pack's .zip, or any
+  picture inside the pack's folder. Packs go to resources\texture-packs (Open
+  Texture Packs Folder shows it; a folder copied there by hand works too),
+  and Texture Pack picks one or None. A pack is drawn over the N64 or the
+  remastered textures, so both can be on at once.
+
+  Making a pack: turn on Dump Textures and play. Every texture drawn is saved
+  as resources\userdata\texture-dump\remastered\<number>.png (and ...\n64\
+  while N64 textures are on). Edit them at any size up to 4096 x 4096 and put
+  them in a folder named after your pack, keeping the number at the start of
+  each file name ("0123.png" or "0123 wall.png"). PNG only. Pictures a pack
+  leaves out keep the game's own. A picture the game can't use (not a PNG,
+  too large) is skipped and named in the log.
+
+  Without the menus: Perfect Dark.exe --setup --unattended --n64-rom <file>
+  and --texture-pack <.zip or folder> do the same imports.
 
 LEADERBOARDS
   Leaderboards on the main menu shows your own times and scores: an overall
