@@ -139,6 +139,7 @@ KEYBOARD AND MOUSE
   Crouch                Ctrl
   Objectives            Tab
   Pause                 Esc
+  Switch graphics       G (N64 / remastered, once an N64 ROM is imported)
   Mouse sensitivity     1.5, invert look off
   In menus              Point with the mouse to highlight, left button selects,
                         right button goes back, wheel moves a row at a time.
@@ -248,12 +249,12 @@ EXPERIMENTAL: N64 TEXTURES AND TEXTURE PACKS
 
   N64 textures: Import N64 ROM and choose your own N64 Perfect Dark ROM
   (.z64, .n64 or .v64; the NTSC and PAL versions). It is checked and copied
-  to resources\n64, and Textures switches between N64 and Remastered. The G
-  key switches too, anywhere (change it under Settings > Keyboard & Mouse >
+  to resources\n64, and Textures switches between N64 and Remastered on the
+  fly, with no restart. The G key switches too, anywhere (change it under Settings > Keyboard & Mouse >
   Switch Graphics), and so does D-pad Down on a controller during play. N64
   mode draws the N64's textures, characters, guns, props, level rooms, skies
-  and water from your ROM; the HUD, crosshair, fonts and menus keep their
-  remastered look. It only changes what you see: in a network match each
+  (with the N64's star field where it had one) and water from your ROM; the
+  HUD, crosshair, fonts and menus keep their remastered look. It only changes what you see: in a network match each
   player can use either look. This download contains no N64 data: only your
   ROM is read.
 

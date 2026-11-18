@@ -39,7 +39,7 @@ void PdNoteFileLoad(uint32_t fileid, uint32_t dst);
 bool PdN64TextureDrawable(int id);
 uint32_t PdN64ModelRwData(uint8_t* base, uint32_t rwdata, uint32_t gdl, uint32_t rodata, uint32_t node);
 uint32_t PdN64RomRwData();  // pd_n64_models.cpp
-namespace pd::n64tex { bool SkyActive(); }  // pd_n64_textures.cpp
+namespace pd::n64tex { bool SkyActive(); bool StarsActive(); }  // pd_n64_textures.cpp
 int64_t PdMpUpdateRate();
 int64_t PdMpUpdateRateMin();
 int64_t PdMpFacingDelayMs();
@@ -326,6 +326,14 @@ void PdHookN64ModelLink(PPCRegister& r11, PPCRegister& r30) {
 // itself is left alone (the texture bank and the display-list interpreter read it too).
 void PdHookN64Sky(PPCRegister& r9) {
   if (pd::n64tex::SkyActive()) r9.u64 = 1;
+}
+
+// The room renderer at 0x820DA288, right after stars_render's empty stub (r3 = the
+// display list): N64 mode draws the N64 star field there (pd_n64_stars.cpp).
+uint32_t PdN64DrawStars(uint8_t* base, PPCContext& live, uint32_t gdl);
+void PdHookN64Stars(PPCRegister& r3) {
+  if (!pd::n64tex::StarsActive()) return;
+  r3.u64 = PdN64DrawStars(HookBase(), HookContext(), r3.u32);
 }
 
 // sub_822549C0 (the PackedSegFile loader all file loads go through), at entry:

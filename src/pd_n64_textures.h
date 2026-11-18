@@ -75,6 +75,8 @@ bool RoomsDrawing();
 // True while Active() and pd_n64_sky: the sky function (sub_8223B0C8) takes the game's
 // own N64 sky path (sky_render) instead of the remaster's skybox (PdHookN64Sky).
 bool SkyActive();
+// True while Active() and pd_n64_stars: the N64 star field is drawn (pd_n64_stars.cpp).
+bool StarsActive();
 // Model files (N64 file ids) kept remastered in N64 mode: ones the remaster reused
 // for something else (the start-up logos). -1 (an unknown file) is not kept.
 bool RemasterOnlyModel(int file);

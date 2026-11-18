@@ -40,6 +40,9 @@ REXCVAR_DEFINE_BOOL(pd_n64_models, true, "PerfectDark",
 REXCVAR_DEFINE_BOOL(pd_n64_sky, true, "PerfectDark",
                     "With N64 textures on: draw the N64 sky (the game's own N64 sky code: colour, clouds, "
                     "water) instead of the remaster's skybox and distant backdrop");
+REXCVAR_DEFINE_BOOL(pd_n64_stars, true, "PerfectDark",
+                    "With N64 textures on: draw the N64's star field in the stages that have one (Defection, "
+                    "Extraction, Infiltration, Escape, Attack Ship); the remaster compiled it out");
 REXCVAR_DEFINE_DOUBLE(pd_n64_texture_level, 0.98, "PerfectDark",
                       "N64 textures: brightness scale after the gamma (0.98 = as the remaster; 1 = none)");
 
@@ -406,6 +409,7 @@ bool Active() { return REXCVAR_GET(pd_n64_textures) && g_status.load(std::memory
 bool ModelsActive() { return Active() && REXCVAR_GET(pd_n64_models); }
 
 bool SkyActive() { return Active() && REXCVAR_GET(pd_n64_sky); }
+bool StarsActive() { return Active() && REXCVAR_GET(pd_n64_stars); }
 
 bool RemasterOnlyModel(int file) {
   switch (file) {

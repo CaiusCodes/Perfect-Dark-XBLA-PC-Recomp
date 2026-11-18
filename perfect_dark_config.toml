@@ -377,6 +377,14 @@ name = "PdHookN64Sky"
 registers = ["r9"]
 after_instruction = true
 
+# N64 star field (pd_n64_stars.cpp): the room renderer's star call at 0x820DA284 goes to
+# the shared empty stub sub_82303F50 (stars_render was compiled out). Before the next
+# call (text_end, 0x820DA288), r3 = the display list: N64 mode writes the stars there.
+[[midasm_hook]]
+address = 0x820DA288
+name = "PdHookN64Stars"
+registers = ["r3"]
+
 # Which model file a node belongs to (r30 = the model, +8 = its modeldef = the loaded
 # file): every file load goes through sub_822549C0 (r4 = file id, r5 = destination).
 [[midasm_hook]]

@@ -1,6 +1,6 @@
 # Perfect Dark XBLA PC Recomp
 
-A native Windows PC port of **Perfect Dark (2010)**, the Xbox 360 remaster by Rare and 4J Studios, built using [ReXGlue](https://github.com/rexglue/rexglue-sdk) static recompilation. Play at **up to 4K and 60 FPS**, with keyboard and mouse support, enhanced graphics, and LAN / Virtual LAN multiplayer. No emulator required.
+A native Windows PC port of **Perfect Dark (2010)**, the Xbox 360 remaster by Rare and 4J Studios, built using [ReXGlue](https://github.com/rexglue/rexglue-sdk) static recompilation. Play at **up to 4K and 60 FPS**, with keyboard and mouse support, enhanced graphics, and LAN / Virtual LAN multiplayer. Import your own N64 ROM and you can **switch between the remastered and the original N64 graphics on the fly** with a single key. No emulator required.
 
 **Free and open-source**.
 
@@ -49,6 +49,7 @@ Supported packages begin with `4287CC74` (original release) or `8292DB97` (re-re
 - **AMD FSR 1** upscaling and adjustable sharpness
 - **V-Sync**, Vivid Colours, Black Level and Camera Bob settings
 - **F12 screenshots** and an optional FPS counter
+- **Switch graphics on the fly** between the remaster and the original N64 look with **G** or D-pad Down (Experimental, with your own N64 ROM; see below)
 
 Most graphics settings apply instantly; Render Scale and Graphics API restart the game.
 
@@ -71,7 +72,7 @@ Most graphics settings apply instantly; Render Scale and Graphics API restart th
 
 ### Experimental: N64 Mode & Texture Packs
 
-- **N64 mode**: import your own N64 Perfect Dark ROM under **Settings → Graphics → Experimental → Import N64 ROM**, then press **G** (or D-pad Down on a controller) to switch live between the N64 and remastered looks. N64 mode draws the N64's textures, characters, guns, props, level rooms, skies and water from your ROM; the HUD, fonts and menus keep their current look.
+- **N64 mode**: import your own N64 Perfect Dark ROM under **Settings → Graphics → Experimental → Import N64 ROM**, then press **G** (or D-pad Down on a controller during play) to switch between the N64 and remastered looks on the fly, at any time, with no restart. **G** can be rebound under **Settings → Keyboard & Mouse → Switch Graphics**, and the **Textures** row on the Experimental page switches too. N64 mode draws the N64's textures, characters, guns, props, level rooms, skies, star fields and water from your ROM; the HUD, fonts and menus keep their current look. It only changes what you see, so in a network match each player can use either look.
 - **Texture packs**: import a pack's `.zip` under **Import Texture Pack** and choose it in **Texture Pack**; it works over either look. Pack makers can use **Dump All Textures** to save every texture of the game as a numbered PNG.
 - **N64 emulator HD packs** (Rice / GLideN64 hi-res naming) work too: import one the same way and it shows in N64 mode, matched through your N64 ROM.
 - Both need Plume (the default renderer). No N64 game data is included: N64 mode only reads the ROM you import.
