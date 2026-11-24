@@ -81,6 +81,14 @@ Everything is under **Settings → Graphics → Texture Packs**:
 - **Texture Tools → Dump Game Textures...** saves the textures of the game, the N64 look or any installed pack as numbered pictures, for making packs. Pack makers can also tune a pack for this port with a `pd-pack.txt` file, reflection masks and `-xbla` pictures (see the README in the download).
 - Both need Plume (the default renderer). No N64 game data is included: N64 mode only reads the ROM you import, and texture packs are their makers' work.
 
+**One key press apart.** The same moments with Texture Pack 1 on Remastered and Texture Pack 2 on N64, switched with **G**:
+
+| Remastered | N64 (from your own ROM) |
+| --- | --- |
+| ![Carrington Institute, remastered](docs/screenshots/switch-institute-remastered.webp) | ![Carrington Institute, N64 look](docs/screenshots/switch-institute-n64.webp) |
+| ![dataDyne rooftop in Defection, remastered](docs/screenshots/switch-defection-remastered.webp) | ![dataDyne rooftop in Defection, N64 look](docs/screenshots/switch-defection-n64.webp) |
+| ![Joanna in the Extraction lift, remastered](docs/screenshots/switch-joanna-remastered.webp) | ![Joanna in the Extraction lift, N64 look](docs/screenshots/switch-joanna-n64.webp) |
+
 ### Multiplayer
 
 - **Up to 8 players** in Combat Simulator (up to 12 with Simulants)
