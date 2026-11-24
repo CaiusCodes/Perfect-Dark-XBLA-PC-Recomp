@@ -48,7 +48,6 @@ Supported packages begin with `4287CC74` (original release) or `8292DB97` (re-re
 - **Render Scale:** 1x, 2x or 3x
 - **AMD FSR 1** upscaling and adjustable sharpness
 - **V-Sync**, Vivid Colours, Black Level and Camera Bob settings
-- **F12 screenshots** and an optional FPS counter
 - **Switch graphics on the fly** between two looks with **G** or D-pad Down: the remaster, the original N64 look (with your own N64 ROM) or an HD texture pack (see below)
 
 Most graphics settings apply instantly; Render Scale and Graphics API restart the game.
