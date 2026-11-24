@@ -249,6 +249,13 @@ This project's own code is released under The Unlicense (see
 ReXGlue, Plume, XenosRecomp and their third-party libraries keep their own
 licences; see [packaging/licenses](packaging/licenses).
 
+### Thanks
+
+- **[parabolee](https://github.com/parabolee)** of Retro Foundry for testing every
+  texture-pack build, the texture mapping between the N64 PC port and this version,
+  and the [Perfect Dark Plus HD](https://github.com/retro-foundry/Perfect-Dark-Plus-HD-Textures)
+  packs.
+
 ---
 
 *Perfect Dark is the property of its respective rights holders. This is an independent fan project and is not affiliated with or endorsed by Microsoft, Rare or 4J Studios.*
