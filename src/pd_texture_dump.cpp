@@ -28,8 +28,6 @@ namespace {
 
 namespace fs = std::filesystem;
 
-std::atomic<bool> g_running{false};
-
 uint32_t be32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
 
 // Xenos 2D tiled address of element (x, y) (in elements) for an aligned width (the
@@ -108,47 +106,46 @@ bool decode_base(const uint8_t* fc_words, const std::vector<uint8_t>& data, uint
   return false;
 }
 
-std::string name_of(int id) {
-  char name[16];
-  std::snprintf(name, sizeof(name), "%04d.png", id);
-  return name;
-}
+struct Counts {
+  int written = 0, kept = 0, failed = 0;
+};
 
-void dump_all(std::function<void(const std::string&)> notice) {
-  const auto t0 = std::chrono::steady_clock::now();
-  const fs::path out = pd::texpack::DumpFolder();
+// The remaster's textures (Textures.raw): ext_tex\xbla, as Dump All Textures always did.
+bool dump_remastered(Counts& c, std::string* error) {
   std::error_code ec;
-  fs::create_directories(out / "remastered", ec);
-  int written = 0, kept = 0, failed = 0, n64_written = 0;
-
+  fs::create_directories(pd::texpack::DumpSubfolder(false), ec);
   // Textures.raw: count, 52-byte index entries, 52-byte D3D headers, XMemCompress LZX data.
   const fs::path raw = pd_paths::DataRoot() / "assets" / "DataFiles" / "Textures.raw";
   std::ifstream in(raw, std::ios::binary);
   uint8_t head[4] = {};
   if (!in || !in.read(reinterpret_cast<char*>(head), 4)) {
-    notice("Dump All Textures: the game's Textures.raw could not be read.");
-    g_running = false;
-    return;
+    *error = "the game's Textures.raw could not be read";
+    return false;
   }
   const uint32_t count = be32(head);
+  if (count == 0 || count > 65536) {
+    *error = "the game's Textures.raw is damaged";
+    return false;
+  }
   std::vector<uint8_t> tables(size_t(count) * 104);
   in.read(reinterpret_cast<char*>(tables.data()), std::streamsize(tables.size()));
   const uint64_t database = 4 + uint64_t(count) * 104;
   std::vector<uint8_t> comp, stream, data, rgba;
   for (uint32_t id = 0; id < count && in; ++id) {
-    const fs::path png = out / "remastered" / name_of(int(id));
+    const fs::path png = pd::texpack::DumpSubfolder(false) / pd::texpack::DumpName(int(id));
     if (fs::exists(png, ec)) {
-      ++kept;
+      ++c.kept;
       continue;
     }
     const uint8_t* e = tables.data() + size_t(id) * 52;
     const uint32_t offset = be32(e), w = be32(e + 4), h = be32(e + 8), alloc = be32(e + 20), comp_size = be32(e + 24);
-    if (!alloc || !comp_size || !w || !h || w > 4096 || h > 4096) continue;
+    if (!alloc || !comp_size || !w || !h || w > 4096 || h > 4096 || alloc > (64u << 20) || comp_size > (64u << 20))
+      continue;
     comp.resize(comp_size);
     in.seekg(std::streamoff(database + offset));
     if (!in.read(reinterpret_cast<char*>(comp.data()), comp_size)) {
       in.clear();
-      ++failed;
+      ++c.failed;
       continue;
     }
     // Chunks: [u16 length] or [0xFF, u16 uncompressed, u16 length], then the data; 0 ends.
@@ -170,47 +167,229 @@ void dump_all(std::function<void(const std::string&)> notice) {
     data.assign(alloc, 0);
     if (stream.empty() || lzx_decompress(stream.data(), stream.size(), data.data(), data.size(), 0x20000, nullptr, 0) != 0 ||
         !decode_base(tables.data() + size_t(count) * 52 + size_t(id) * 52 + 28, data, w, h, rgba) ||
-        !pd::texpack::WritePng(png, rgba.data(), w, h)) {
-      ++failed;
+        !pd::texpack::WriteDumpPng(png, rgba.data(), w, h)) {
+      ++c.failed;
       continue;
     }
-    ++written;
+    ++c.written;
   }
+  return true;
+}
 
-  // The N64 pictures, when a ROM is imported and loaded.
-  if (pd::n64tex::GetStatus() == pd::n64tex::Status::kReady) {
-    fs::create_directories(out / "n64", ec);
-    std::vector<int> ids;
-    for (int id = 0; id < pd::n64tex::kTextureCount; ++id) ids.push_back(id);
-    for (const int id : pd::n64tex::ModelTextureIds()) ids.push_back(id);
-    for (const int id : ids) {
-      const fs::path png = out / "n64" / name_of(id);
-      if (fs::exists(png, ec)) {
-        ++kept;
-        continue;
-      }
-      const pd::n64dec::Image* im = pd::n64tex::Get(id);
-      if (!im || im->rgba.empty()) continue;
-      if (pd::texpack::WritePng(png, im->rgba.data(), im->w, im->h)) ++n64_written;
-      else ++failed;
+// The N64 pictures (ids 0-3502 and the N64 model files' own): ext_tex, as before. The ROM
+// is loaded first when it isn't (up to two minutes).
+bool dump_n64(Counts& c, bool load, std::string* error) {
+  using pd::n64tex::Status;
+  if (load && pd::n64tex::GetStatus() != Status::kReady) {
+    if (!pd::n64tex::RomPresent()) {
+      *error = "no N64 ROM is imported (Import Texture Pack... takes one)";
+      return false;
+    }
+    pd::n64tex::BeginLoad();
+    for (int i = 0; i < 1200; ++i) {
+      const Status s = pd::n64tex::GetStatus();
+      if (s != Status::kLoading && s != Status::kIdle) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
+  if (pd::n64tex::GetStatus() != Status::kReady) {
+    *error = "the N64 ROM couldn't be loaded (" + pd::n64tex::StatusDetail() + ")";
+    return false;
+  }
+  std::error_code ec;
+  fs::create_directories(pd::texpack::DumpSubfolder(true), ec);
+  std::vector<int> ids;
+  for (int id = 0; id < pd::n64tex::kTextureCount; ++id) ids.push_back(id);
+  for (const int id : pd::n64tex::ModelTextureIds()) ids.push_back(id);
+  for (const int id : ids) {
+    const fs::path png = pd::texpack::DumpSubfolder(true) / pd::texpack::DumpName(id);
+    if (fs::exists(png, ec)) {
+      ++c.kept;
+      continue;
+    }
+    const pd::n64dec::Image* im = pd::n64tex::Get(id);
+    if (!im || im->rgba.empty()) continue;
+    if (pd::texpack::WriteDumpPng(png, im->rgba.data(), im->w, im->h)) ++c.written;
+    else ++c.failed;
+  }
+  return true;
+}
+
+fs::path PathOf(const std::string& utf8) { return fs::path(std::u8string(utf8.begin(), utf8.end())); }
+
+// A folder name for a pack's dump: the pack's own folder name (it is one already) with
+// anything a folder name can't hold replaced.
+std::string DumpFolderName(const std::string& name) {
+  std::string out;
+  for (const unsigned char ch : name) out += (ch < 32 || std::strchr("<>:\"/\\|?*", ch)) ? '_' : char(ch);
+  while (!out.empty() && (out.back() == ' ' || out.back() == '.')) out.pop_back();
+  return out.empty() ? std::string("pack") : out;
+}
+
+// An installed pack: what the game takes from it, each picture as the game turns it, written
+// in the dump's naming and orientation (so the folder is a PC-port pack itself).
+bool dump_pack(const std::string& name, Counts& c, std::string* summary_path, std::string* error) {
+  const auto packs = pd::texpack::ListPacks(true);
+  if (std::find(packs.begin(), packs.end(), name) == packs.end()) {
+    *error = "\"" + name + "\" isn't an installed texture pack";
+    return false;
+  }
+  const std::shared_ptr<const pd::texpack::Index> index = pd::texpack::IndexFor(name);
+  if (!index) {
+    *error = "\"" + name + "\" couldn't be read";
+    return false;
+  }
+  const fs::path folder = SourceFolder(name);
+  std::error_code ec;
+  fs::create_directories(folder, ec);
+  if (ec) {
+    *error = "can't write to " + folder.string();
+    return false;
+  }
+  std::vector<std::string> problems;
+  int top = 0, xbla = 0, own = 0;
+  std::vector<uint8_t> rgba;
+  for (int source = 0; source < 3; ++source) {
+    const auto& list = source == 0 ? index->by_id : source == 1 ? index->xbla_by_id : index->remastered_by_id;
+    for (size_t i = 0; i < list.size(); ++i) {
+      const int id = int(i);
+      const fs::path* path = index->Picture(source, id);
+      if (!path) continue;
+      // An <id>-xbla picture (this game's own version, the remastered look's) keeps its suffix,
+      // in the folder it came from.
+      const bool in_xbla = source == 1 || (source == 2 && _wcsicmp(path->parent_path().filename().c_str(), L"xbla") == 0);
+      const fs::path out_dir = in_xbla ? folder / "xbla" : folder;
+      fs::path png = out_dir / pd::texpack::DumpName(id);
+      if (source == 2) png = out_dir / (png.stem().wstring() + L"-xbla" + png.extension().wstring());
+      if (fs::exists(png, ec)) {
+        ++c.kept;
+        continue;
+      }
+      if (in_xbla) fs::create_directories(out_dir, ec);
+      // As the renderer reads it (pd_native_gpu.cpp): a PC-port picture is turned over unless
+      // it is an N64 emulator redraw or one of the two font atlases stored as the game has them.
+      const bool flip = index->pc_port && !index->N64Only(id) && !pd::texpack::FontAtlas(id);
+      uint32_t w = 0, h = 0;
+      std::string why;
+      if (!pd::texpack::LoadPicture(*path, rgba, w, h, &why, flip)) {
+        ++c.failed;
+        if (problems.size() < 200) problems.push_back(path->filename().string() + ": " + why);
+        continue;
+      }
+      if (!pd::texpack::WriteDumpPng(png, rgba.data(), w, h)) {
+        ++c.failed;
+        if (problems.size() < 200) problems.push_back(png.filename().string() + ": can't be written");
+        continue;
+      }
+      ++c.written;
+      ++(source == 0 ? top : source == 1 ? xbla : own);
+    }
+  }
+  // What was left out, and why.
+  const fs::path summary = folder / "dump-summary.txt";
+  std::ofstream s(summary, std::ios::binary | std::ios::trunc);
+  if (s) {
+    s << "Dump Game Textures: \"" << name << "\"\r\n";
+    s << "Naming: " << (index->pc_port ? "PC-port (four hex digits; top folder = N64 numbers, xbla = the remaster's)"
+                                       : "decimal (0.9.2's dump)")
+      << "\r\n";
+    s << "Written now: " << c.written << " (" << top << " top folder, " << xbla << " xbla";
+    if (own) s << ", " << own << " -xbla (this game's own, the remastered look's)";
+    s << ")";
+    if (c.kept) s << "; " << c.kept << " already here (left alone)";
+    s << "\r\n";
+    s << "These are the pack's pictures as the game reads them, in the dump's naming and orientation\r\n"
+         "(four hex digits, right way up): this folder is a texture pack itself.\r\n";
+    if (index->reflect_n)
+      s << "Not dumped: " << index->reflect_n << " reflection mask(s) (-reflect pictures; settings, not textures).\r\n";
+    if (index->keep_original_n)
+      s << "Left out: " << index->keep_original_n << " texture(s) pd-pack.txt keeps as the game's own (keep_original).\r\n";
+    if (index->ignored)
+      s << "Left out: " << index->ignored << " picture(s) in other folders (the PC port's N64 font glyphs).\r\n";
+    if (index->waiting_for_rom)
+      s << "Left out: " << (index->hires_files + index->model_files)
+        << " N64 emulator / per-model picture(s): they are matched through the N64 ROM, which isn't loaded.\r\n";
+    else if (index->hires_files || index->model_files)
+      s << "N64 emulator / per-model pictures matched through the ROM: " << index->hires_matched + index->model_matched
+        << " of " << index->hires_files + index->model_files << ".\r\n";
+    s << "In play, a picture whose shape doesn't fit the texture it would replace isn't drawn (logged);\r\n"
+         "in the remastered look, a PC-port pack's top-folder pictures for the 44 numbers the remaster\r\n"
+         "reused for other surfaces aren't drawn either.\r\n";
+    if (!problems.empty()) {
+      s << "Not readable (" << c.failed << "):\r\n";
+      for (const std::string& p : problems) s << "  " << p << "\r\n";
+    }
+  }
+  if (summary_path) *summary_path = summary.string();
+  return true;
+}
+
+std::atomic<bool> g_any_running{false};
+
+void run(const std::string& source, std::function<void(const std::string&)> notice) {
+  const auto t0 = std::chrono::steady_clock::now();
+  Counts c;
+  std::string error, summary;
+  bool ok;
+  std::string what;
+  if (source == "Remastered") {
+    what = "remastered";
+    ok = dump_remastered(c, &error);
+  } else if (source == "N64") {
+    what = "N64";
+    ok = dump_n64(c, true, &error);
+  } else {
+    what = "\"" + source + "\"";
+    ok = dump_pack(source, c, &summary, &error);
+  }
   const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  REXLOG_INFO("[texdump] all: {} remastered + {} N64 written, {} already there, {} failed, {:.1f} s", written,
-              n64_written, kept, failed, seconds);
+  REXLOG_INFO("[texdump] {}: {} written, {} already there, {} failed, {:.1f} s{}{}", source, c.written, c.kept,
+              c.failed, seconds, ok ? "" : ": ", error);
+  if (!ok) {
+    notice("Dump Game Textures: " + error + ".");
+  } else {
+    char text[512];
+    std::snprintf(text, sizeof(text), "Dumped %d %s textures in %.0f s%s%s.", c.written, what.c_str(), seconds,
+                  c.kept ? (" (" + std::to_string(c.kept) + " already there)").c_str() : "",
+                  c.failed ? (", " + std::to_string(c.failed) + " couldn't be read").c_str() : "");
+    notice(text);
+  }
+  g_any_running = false;
+}
+
+void dump_all(std::function<void(const std::string&)> notice) {
+  const auto t0 = std::chrono::steady_clock::now();
+  Counts c, n;
+  std::string error;
+  if (!dump_remastered(c, &error)) {
+    notice("Dump All Textures: " + error + ".");
+    g_any_running = false;
+    return;
+  }
+  std::string ignored;
+  if (pd::n64tex::GetStatus() == pd::n64tex::Status::kReady) dump_n64(n, false, &ignored);
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  REXLOG_INFO("[texdump] all: {} remastered + {} N64 written, {} already there, {} failed, {:.1f} s", c.written,
+              n.written, c.kept + n.kept, c.failed + n.failed, seconds);
   char text[256];
-  std::snprintf(text, sizeof(text), "Dumped %d remastered%s textures in %.0f s%s%s.", written,
-                n64_written ? (" and " + std::to_string(n64_written) + " N64").c_str() : "", seconds,
-                kept ? (" (" + std::to_string(kept) + " already there)").c_str() : "",
-                failed ? (", " + std::to_string(failed) + " failed").c_str() : "");
+  std::snprintf(text, sizeof(text), "Dumped %d remastered%s textures in %.0f s%s%s.", c.written,
+                n.written ? (" and " + std::to_string(n.written) + " N64").c_str() : "", seconds,
+                c.kept + n.kept ? (" (" + std::to_string(c.kept + n.kept) + " already there)").c_str() : "",
+                c.failed + n.failed ? (", " + std::to_string(c.failed + n.failed) + " failed").c_str() : "");
   notice(text);
-  g_running = false;
+  g_any_running = false;
 }
 
 }  // namespace
 
+fs::path SourceFolder(const std::string& source) {
+  if (source == "Remastered") return pd::texpack::DumpSubfolder(false);
+  if (source == "N64") return pd::texpack::DumpSubfolder(true);
+  return pd::texpack::DumpFolder() / "packs" / PathOf(DumpFolderName(source));
+}
+
 bool StartDumpAll(std::function<void(const std::string&)> notice) {
-  if (g_running.exchange(true)) return false;
+  if (g_any_running.exchange(true)) return false;
   REXLOG_INFO("[texdump] all: to {}", pd::texpack::DumpFolder().string());
   notice(pd::n64tex::GetStatus() == pd::n64tex::Status::kReady
              ? "Dumping all remastered and N64 textures to resources\\userdata\\texture-dump..."
@@ -219,6 +398,18 @@ bool StartDumpAll(std::function<void(const std::string&)> notice) {
   return true;
 }
 
-bool Running() { return g_running.load(); }
+bool StartDump(const std::string& source, std::function<void(const std::string&)> notice) {
+  if (source.empty() || g_any_running.exchange(true)) return false;
+  const fs::path to = SourceFolder(source);
+  REXLOG_INFO("[texdump] {}: to {}", source, to.string());
+  const std::string shown = source == "Remastered" || source == "N64" ? source + " textures" : "\"" + source + "\"";
+  // (resources\userdata\texture-dump\...: the folder as the player finds it)
+  notice("Dumping " + shown + " to resources\\" +
+         to.lexically_relative(pd::texpack::DumpFolder().parent_path().parent_path()).string() + "...");
+  std::thread([source, notice]() { run(source, notice); }).detach();
+  return true;
+}
+
+bool Running() { return g_any_running.load(); }
 
 }  // namespace pd::texdump

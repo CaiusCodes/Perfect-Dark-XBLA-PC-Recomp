@@ -721,6 +721,43 @@ bool PdAimSensitivityFactor(uint32_t weapon, double* factor) {
   return true;
 }
 
+// Legacy's look input (Advanced Control, issue #30; HANDOVER 4dh). The stick swap
+// (FilterGamepad) is only half of the title update's Legacy: its main control function
+// also picks which of the controller slot's processed sticks drive the look (turn /
+// pitch, and the crosshair while aiming), where 1.3 always takes the right stick's
+// (slot +36 / +38). Slot n at 0x826540E0 + 68 n, filled by sub_8225D9F8 from the
+// (swapped) raw state: s16 +36 right X, +38 right Y, +40 left X, +42 left Y. The update:
+//   Legacy:            X +36, Y +38 - or Y +42 while aiming (the left stick aims, as the
+//                      N64's one-stick styles did)
+//   Legacy + Southpaw: X +40, Y +38 - or X +36, Y +42 while aiming
+//   otherwise:         unchanged
+// Aiming = the current player's +296. Called at 1.3 0x820F2C3C with the two values the
+// game just stored at r1+296 (X) and r1+300 (Y); r23 is the controller.
+void PdLegacyLook(uint8_t* base, uint32_t sp, uint32_t controller) {
+  const bool legacy = REXCVAR_GET(pd_legacy_controls);
+  if (!legacy || controller >= 4) return;
+  const bool southpaw = REXCVAR_GET(pd_southpaw);
+  const auto rd32 = [&](uint32_t a) { return _byteswap_ulong(*reinterpret_cast<const uint32_t*>(base + a)); };
+  const auto rd16 = [&](uint32_t a) {
+    return int16_t(_byteswap_ushort(*reinterpret_cast<const uint16_t*>(base + a)));
+  };
+  const auto wr32 = [&](uint32_t a, int32_t v) {
+    *reinterpret_cast<uint32_t*>(base + a) = _byteswap_ulong(uint32_t(v));
+  };
+  constexpr uint32_t kPadSlots = 0x826540E0, kPadSlotSize = 68;
+  constexpr uint32_t kGVars = 0x82648BF8, kCurrentPlayer = 1188, kPlayerAiming = 296;
+  const uint32_t slot = kPadSlots + controller * kPadSlotSize;
+  const uint32_t player = rd32(kGVars + kCurrentPlayer);
+  const bool aiming = player >= 0x40000000 && player < 0xA0000000 && rd32(player + kPlayerAiming) != 0;
+  if (aiming) {
+    wr32(sp + 296, rd16(slot + 36));
+    wr32(sp + 300, rd16(slot + 42));
+  } else if (southpaw) {
+    wr32(sp + 296, rd16(slot + 40));
+    wr32(sp + 300, rd16(slot + 38));
+  }
+}
+
 // The smoke pool (title update, HANDOVER / TU-NOTES "Smoke"): sub_82160E30 sizes it at
 // each stage load, 30 or 60 smokes of 1612 bytes from the stage memory pool. Explosions
 // that last as long as on the N64 (pd_n64_explosions) leave more smoke alive at once, so

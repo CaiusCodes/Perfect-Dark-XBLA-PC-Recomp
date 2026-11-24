@@ -24,12 +24,12 @@
 
 REXCVAR_DEFINE_BOOL(pd_n64_textures, false, "PerfectDark",
                     "Draw the N64 textures from your own N64 ROM (resources\\assets\\n64) instead of the remastered "
-                    "ones; Plume only. The N64 Textures key switches it");
+                    "ones; Plume only. Set at start from the Texture Pack slot shown (pd_texture_slot1/2)");
 REXCVAR_DEFINE_STRING(pd_n64_textures_key, "G", "PerfectDark",
-                      "The key(s) that switch between the N64 and the remastered graphics, comma-separated "
-                      "(empty = none); Settings > Keyboard & Mouse > Switch Graphics");
+                      "The key(s) that switch between Texture Pack 1 and Texture Pack 2 (Settings > Graphics > "
+                      "Texture Packs), comma-separated (empty = none); Settings > Keyboard & Mouse > Switch Graphics");
 REXCVAR_DEFINE_BOOL(pd_n64_textures_pad, true, "PerfectDark",
-                    "A controller's D-pad Down switches between the N64 and the remastered graphics during play "
+                    "A controller's D-pad Down switches between Texture Pack 1 and Texture Pack 2 during play "
                     "(no control style uses the D-pad)");
 REXCVAR_DEFINE_DOUBLE(pd_n64_texture_gamma, 1.17, "PerfectDark",
                       "N64 textures: gamma applied to their colours (1.17 = as the remaster converted the N64 art; "
@@ -108,6 +108,127 @@ std::filesystem::path find_rom() {
   return {};
 }
 
+
+// ---- A texture table with more entries than the XBLA numbers (the Japanese release) ----
+// The Japanese ROM has 3511 textures, 8 more than the 3503 the XBLA numbers. Where they sit
+// isn't documented, so the ROM's list is matched to the XBLA numbers by shape: the
+// remaster's textures (Textures.raw's index, no decoding) keep their N64 picture's aspect
+// ratio, mostly at a power-of-two multiple of its size. Dynamic programming over (ROM entry,
+// entries left out so far) finds the `extra` entries to leave out that give the most
+// matching shapes; map[xbla id] = ROM entry. HANDOVER 4du.
+using Size = std::pair<uint32_t, uint32_t>;
+
+int shape_score(const Size& n64, const Size& xbla) {
+  if (!n64.first || !n64.second || !xbla.first || !xbla.second) return 0;
+  if (uint64_t(n64.first) * xbla.second != uint64_t(n64.second) * xbla.first) return 0;
+  const uint32_t k = xbla.first / n64.first;
+  return xbla.first % n64.first == 0 && k && (k & (k - 1)) == 0 ? 2 : 1;
+}
+
+int align_by_shape(const std::vector<Size>& rom, const std::vector<Size>& xbla, std::vector<int>& map) {
+  const int n = int(rom.size()), m = int(xbla.size()), k = n - m;
+  map.assign(size_t(std::max(m, 0)), -1);
+  if (k < 0 || k > 64 || m == 0) return -1;
+  // dp[i][j]: the best score with i ROM entries seen, j of them left out (XBLA id i - j).
+  const int W = k + 1;
+  std::vector<int> dp(size_t(n + 1) * W, -1);
+  std::vector<uint8_t> took(size_t(n + 1) * W, 0);  // 1: entry i-1 matched, 2: left out
+  dp[0] = 0;
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j <= k; ++j) {
+      const int here = dp[size_t(i) * W + j];
+      if (here < 0) continue;
+      const int x = i - j;
+      if (x < m) {  // match ROM entry i with XBLA id x
+        const int s = here + shape_score(rom[size_t(i)], xbla[size_t(x)]);
+        int& to = dp[size_t(i + 1) * W + j];
+        if (s > to) {
+          to = s;
+          took[size_t(i + 1) * W + j] = 1;
+        }
+      }
+      if (j < k) {  // leave ROM entry i out
+        int& to = dp[size_t(i + 1) * W + j + 1];
+        if (here > to) {
+          to = here;
+          took[size_t(i + 1) * W + j + 1] = 2;
+        }
+      }
+    }
+  const int best = dp[size_t(n) * W + k];
+  if (best < 0) return -1;
+  for (int i = n, j = k; i > 0;) {
+    const uint8_t t = took[size_t(i) * W + j];
+    if (t == 1) map[size_t(i - 1 - j)] = i - 1;
+    else if (t == 2) --j;
+    else return -1;
+    --i;
+  }
+  int matched = 0;
+  for (int x = 0; x < m; ++x)
+    if (map[size_t(x)] >= 0 && shape_score(rom[size_t(map[size_t(x)])], xbla[size_t(x)]) > 0) ++matched;
+  return matched;
+}
+
+// Textures.raw's index: the remaster's size of each texture (ids 0..count-1).
+bool xbla_sizes(std::vector<Size>& out) {
+  const std::filesystem::path raw = pd_paths::DataRoot() / "assets" / "DataFiles" / "Textures.raw";
+  std::ifstream in(raw, std::ios::binary);
+  uint8_t head[4] = {};
+  if (!in || !in.read(reinterpret_cast<char*>(head), 4)) return false;
+  const uint32_t count = (uint32_t(head[0]) << 24) | (uint32_t(head[1]) << 16) | (uint32_t(head[2]) << 8) | head[3];
+  if (!count || count > 65536) return false;
+  std::vector<uint8_t> index(size_t(count) * 52);
+  if (!in.read(reinterpret_cast<char*>(index.data()), std::streamsize(index.size()))) return false;
+  auto be32 = [](const uint8_t* p) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+  };
+  out.resize(count);
+  for (uint32_t id = 0; id < count; ++id) out[id] = {be32(&index[size_t(id) * 52 + 4]), be32(&index[size_t(id) * 52 + 8])};
+  return true;
+}
+
+// Brings a decoded table with more entries than kTextureCount to the XBLA numbers. False
+// (with `why`) when the shapes don't match well enough to trust the result.
+bool align_images(std::vector<n64dec::Image>& images, std::string* why) {
+  std::vector<Size> xbla;
+  if (!xbla_sizes(xbla) || xbla.size() < size_t(kTextureCount)) {
+    *why = "the game's Textures.raw couldn't be read to match the textures";
+    return false;
+  }
+  xbla.resize(size_t(kTextureCount));
+  std::vector<Size> rom;
+  for (const auto& im : images) rom.push_back({im.w, im.h});
+  std::vector<int> map;
+  const int matched = align_by_shape(rom, xbla, map);
+  int comparable = 0;
+  for (int x = 0; x < kTextureCount; ++x)
+    if (map[size_t(x)] >= 0 && images[size_t(map[size_t(x)])].w && xbla[size_t(x)].first) ++comparable;
+  // The PAL ROM's own table, as it is, has 3202 of its 3503 shapes matching the remaster's
+  // (91%: the remaster redrew some textures in other shapes, and reused 44 numbers); with 8
+  // made-up entries put in, the matching put 3500-3503 of the 3503 numbers right (HANDOVER
+  // 4du, n64aligntest). Under 85% the result is not trusted.
+  if (matched < 0 || comparable == 0 || matched * 100 < comparable * 85) {
+    *why = "its textures couldn't be matched to the remaster's numbers (" + std::to_string(std::max(matched, 0)) +
+           " of " + std::to_string(comparable) + " shapes)";
+    return false;
+  }
+  std::vector<int> left_out;
+  std::vector<uint8_t> used(images.size(), 0);
+  for (int x = 0; x < kTextureCount; ++x) used[size_t(map[size_t(x)])] = 1;
+  for (size_t i = 0; i < used.size(); ++i)
+    if (!used[i]) left_out.push_back(int(i));
+  std::vector<n64dec::Image> out;
+  out.resize(static_cast<size_t>(kTextureCount));
+  for (int x = 0; x < kTextureCount; ++x) out[size_t(x)] = std::move(images[size_t(map[size_t(x)])]);
+  images = std::move(out);
+  std::string list;
+  for (const int i : left_out) list += (list.empty() ? "" : ", ") + std::to_string(i);
+  REXLOG_INFO("[n64] texture table matched to the XBLA numbers by shape: {} of {} shapes agree; ROM entries left "
+              "out: {}", matched, comparable, list);
+  return true;
+}
+
 void load() {
   const auto t0 = std::chrono::steady_clock::now();
   const std::filesystem::path path = find_rom();
@@ -154,7 +275,17 @@ void load() {
   }
   std::vector<n64dec::Image> images;
   std::string error;
-  const size_t count = n64dec::DecodeAll(rom, *version, images, &error);
+  size_t count = n64dec::DecodeAll(rom, *version, images, &error);
+  if (count > size_t(kTextureCount) && error.empty()) {
+    // The Japanese release's longer table: matched to the XBLA numbers (align_images).
+    std::string why;
+    if (!align_images(images, &why)) {
+      REXLOG_WARN("[n64] {} ({}): {}", path.filename().string(), version->name, why);
+      set_status(Status::kUnsupported, version->name);
+      return;
+    }
+    count = images.size();
+  }
   if (count != size_t(kTextureCount) || !error.empty()) {
     REXLOG_WARN("[n64] {} ({}): texture table not usable: {} textures{}{}", path.filename().string(), version->name,
                 count, error.empty() ? "" : ", ", error);
@@ -176,6 +307,47 @@ void load() {
 }
 
 }  // namespace
+
+std::string AlignSelfTest() {
+  if (g_status.load(std::memory_order_acquire) != Status::kReady) return "no N64 ROM loaded";
+  std::vector<Size> xbla;
+  if (!xbla_sizes(xbla) || xbla.size() < size_t(kTextureCount)) return "Textures.raw not readable";
+  xbla.resize(size_t(kTextureCount));
+  std::vector<Size> real;
+  for (const auto& im : g_images) real.push_back({im.w, im.h});
+  std::string out;
+  {  // as it is: how many shapes agree
+    std::vector<int> map;
+    const int m = align_by_shape(real, xbla, map);
+    int same = 0;
+    for (int x = 0; x < kTextureCount; ++x) same += map[size_t(x)] == x;
+    out += "as is: " + std::to_string(m) + " shapes agree, " + std::to_string(same) + " ids kept";
+  }
+  // 8 made-up entries put in, twice: odd sizes, then copies of the entry before (the worst
+  // case: nothing tells them apart from their neighbour).
+  const int at[8] = {120, 707, 1500, 2203, 2890, 3100, 3333, 3500};
+  for (int pass = 0; pass < 2; ++pass) {
+    std::vector<Size> rom;
+    std::vector<int> truth;  // ROM entry -> XBLA id (-1: made up)
+    int next = 0;
+    for (int x = 0; x < kTextureCount; ++x) {
+      if (next < 8 && x == at[next]) {
+        rom.push_back(pass == 0 ? Size{24, 40} : real[size_t(x - 1)]);
+        truth.push_back(-1);
+        ++next;
+      }
+      rom.push_back(real[size_t(x)]);
+      truth.push_back(x);
+    }
+    std::vector<int> map;
+    const int m = align_by_shape(rom, xbla, map);
+    int right = 0;
+    for (int x = 0; x < kTextureCount; ++x) right += map[size_t(x)] >= 0 && truth[size_t(map[size_t(x)])] == x;
+    out += std::string(pass == 0 ? "; 8 odd entries put in: " : "; 8 copies put in: ") + std::to_string(m) +
+           " shapes agree, " + std::to_string(right) + " of " + std::to_string(kTextureCount) + " ids right";
+  }
+  return out;
+}
 
 std::filesystem::path RomFolder() { return pd_paths::DataRoot() / "n64"; }
 
@@ -315,6 +487,50 @@ std::vector<int> ModelTextureIds() {
   for (const auto& [id, source] : model_texture_sources()) ids.push_back(id);
   std::sort(ids.begin(), ids.end());
   return ids;
+}
+
+int ModelTextureAt(int file, uint32_t offset) {
+  for (const EmbeddedTexture& e : kEmbedded)
+    if (e.file == file && (e.number & 0x1FFFF) == offset) return int(e.number >> 17);
+  return -1;
+}
+
+int RomFileByName(const std::string& name) {
+  if (g_status.load(std::memory_order_acquire) != Status::kReady) return -1;
+  // The ROM's own file name table (read from the player's ROM, nothing kept in the
+  // game): u32 offsets from the table's start, one per file number (0 unused), then
+  // the names. Found from its first name, which every version has; the entry for
+  // file 1 is the offset that leads back to it.
+  static const std::unordered_map<std::string, int> names = [] {
+    std::unordered_map<std::string, int> m;
+    const std::vector<uint8_t>& rom = g_rom;
+    static const char kFirst[] = "bgdata/bg_sev.seg";
+    auto be32 = [&](size_t a) {
+      return (uint32_t(rom[a]) << 24) | (uint32_t(rom[a + 1]) << 16) | (uint32_t(rom[a + 2]) << 8) | rom[a + 3];
+    };
+    const auto it = std::search(rom.begin(), rom.end(), kFirst, kFirst + sizeof(kFirst) - 1);
+    if (it == rom.end()) return m;
+    const size_t first = size_t(it - rom.begin());
+    size_t base = SIZE_MAX;
+    for (size_t p = first & ~size_t(3); p >= 8 && first - p < 0x10000; p -= 4)
+      if (be32(p) == first - (p - 4)) {
+        base = p - 4;
+        break;
+      }
+    if (base == SIZE_MAX) return m;
+    for (int i = 1; i < 8192; ++i) {
+      const size_t entry = base + size_t(i) * 4;
+      if (entry + 4 > first) break;
+      const size_t at = base + be32(entry);
+      if (at < first || at >= rom.size()) break;
+      size_t end = at;
+      while (end < rom.size() && end - at < 64 && rom[end]) ++end;
+      m.emplace(std::string(reinterpret_cast<const char*>(&rom[at]), end - at), i);
+    }
+    return m;
+  }();
+  const auto found = names.find(name);
+  return found == names.end() ? -1 : found->second;
 }
 
 namespace {

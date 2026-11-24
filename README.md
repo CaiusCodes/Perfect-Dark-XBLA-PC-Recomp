@@ -49,7 +49,7 @@ Supported packages begin with `4287CC74` (original release) or `8292DB97` (re-re
 - **AMD FSR 1** upscaling and adjustable sharpness
 - **V-Sync**, Vivid Colours, Black Level and Camera Bob settings
 - **F12 screenshots** and an optional FPS counter
-- **Switch graphics on the fly** between the remaster and the original N64 look with **G** or D-pad Down (Experimental, with your own N64 ROM; see below)
+- **Switch graphics on the fly** between two looks with **G** or D-pad Down: the remaster, the original N64 look (with your own N64 ROM) or an HD texture pack (see below)
 
 Most graphics settings apply instantly; Render Scale and Graphics API restart the game.
 
@@ -70,12 +70,16 @@ Most graphics settings apply instantly; Render Scale and Graphics API restart th
 - Portable installation with local saves and settings
 - Built-in update checker
 
-### Experimental: N64 Mode & Texture Packs
+### Texture Packs & N64 Mode
 
-- **N64 mode**: import your own N64 Perfect Dark ROM under **Settings → Graphics → Experimental → Import N64 ROM**, then press **G** (or D-pad Down on a controller during play) to switch between the N64 and remastered looks on the fly, at any time, with no restart. **G** can be rebound under **Settings → Keyboard & Mouse → Switch Graphics**, and the **Textures** row on the Experimental page switches too. N64 mode draws the N64's textures, characters, guns, props, level rooms, skies, star fields and water from your ROM; the HUD, fonts and menus keep their current look. It only changes what you see, so in a network match each player can use either look.
-- **Texture packs**: import a pack's `.zip` under **Import Texture Pack** and choose it in **Texture Pack**; it works over either look. Pack makers can use **Dump All Textures** to save every texture of the game as a numbered PNG.
-- **N64 emulator HD packs** (Rice / GLideN64 hi-res naming) work too: import one the same way and it shows in N64 mode, matched through your N64 ROM.
-- Both need Plume (the default renderer). No N64 game data is included: N64 mode only reads the ROM you import.
+Everything is under **Settings → Graphics → Texture Packs**:
+
+- **Texture Pack 1 / Texture Pack 2**: each can be Remastered, N64 or any texture pack you have installed. Press **G** (or D-pad Down on a controller during play) to switch between the two on the fly, at any time, with no restart. **G** can be rebound under **Settings → Keyboard & Mouse → Switch Graphics**.
+- **Import Texture Pack...**: one file picker for your own N64 Perfect Dark ROM (PAL or NTSC-U, any byte order), a texture pack's `.zip` or folder, or pictures named by texture number. Imports are checked for safety, and a pack is never installed twice.
+- **N64 mode** draws the N64's textures, characters, guns, props, level rooms, skies, star fields and water from your ROM; the HUD, fonts and menus keep their current look. It only changes what you see, so in a network match each player can use either look.
+- **HD texture packs** made for the N64 PC port load as they are, including the [Perfect Dark Plus HD](https://github.com/retro-foundry/Perfect-Dark-Plus-HD-Textures) packs (download one there and import its `.zip`). N64 emulator HD packs (Rice / GLideN64 hi-res naming) work too.
+- **Texture Tools → Dump Game Textures...** saves the textures of the game, the N64 look or any installed pack as numbered pictures, for making packs. Pack makers can also tune a pack for this port with a `pd-pack.txt` file, reflection masks and `-xbla` pictures (see the README in the download).
+- Both need Plume (the default renderer). No N64 game data is included: N64 mode only reads the ROM you import, and texture packs are their makers' work.
 
 ### Multiplayer
 
@@ -105,7 +109,7 @@ Most graphics settings apply instantly; Render Scale and Graphics API restart th
 | Mouse Wheel | Switch weapons |
 | Ctrl | Crouch |
 | Tab | Objectives |
-| G | Switch Graphics (N64 / remastered, with an imported N64 ROM) |
+| G | Switch Graphics (between Texture Pack 1 and Texture Pack 2) |
 | Esc | Pause / Back |
 
 All key bindings can be customised under **Help & Options → Settings → Keyboard & Mouse**.
@@ -127,7 +131,7 @@ For detailed changes and bug fixes, see the [release notes](https://github.com/C
 - Windows only.
 - Some multiplayer configurations.
 - Vulkan has not been fully tested on AMD and Intel GPUs.
-- N64 mode and texture packs are experimental. N64 mode is tested with the PAL ROM; the NTSC versions are accepted but untested.
+- N64 mode is tested with the PAL and NTSC-U (1.0 and 1.1) ROMs; the Japanese ROM is accepted but untested, and with it only the N64 textures are drawn.
 - Windows SmartScreen may warn about the unsigned executable. Download only from the official release page.
 - Windows Firewall may request permission for network multiplayer.
 - Displays running at 144 or 165 Hz without variable refresh may exhibit uneven 60 FPS pacing. Use G-Sync / FreeSync or a 120 Hz refresh rate if available.

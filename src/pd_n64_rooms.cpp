@@ -331,6 +331,7 @@ void load_copy(PPCContext& ctx, uint8_t* base, int room) {
 
 namespace pd::n64tex {
 bool RoomsActive() { return Active() && REXCVAR_GET(pd_n64_rooms); }
+bool RoomsWanted() { return REXCVAR_GET(pd_n64_rooms); }
 bool RoomsDrawing() { return RoomsActive() && g_drawing.load(std::memory_order_relaxed); }
 }  // namespace pd::n64tex
 

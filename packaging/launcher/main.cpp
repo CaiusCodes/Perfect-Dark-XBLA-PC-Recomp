@@ -82,18 +82,16 @@ int RunUnattended(Paths& p, const SetupOptions& options, const std::wstring& ext
 }
 
 // Experimental extras (Settings > Graphics > Experimental in the game): the
-// player's N64 ROM into resources\n64 and N64 textures on; a texture pack into
-// resources\texture-packs and chosen. Same code as the game's Import rows.
+// player's N64 ROM into resources\n64 (the look left as it is: Texture Pack 1 / 2
+// stay the player's choice, HANDOVER 4dn); a texture pack into
+// resources\texture-packs and put in Texture Pack 1, shown. Same code as the game's
+// Import rows.
 bool ImportExperimental(const Paths& p, const fs::path& rom, const fs::path& pack) {
   bool ok = true;
   if (!rom.empty()) {
     std::string version, message;
     const bool done = pd::assets::ImportN64Rom(rom, p.resources / L"n64", &version, &message);
     Log(L"N64 ROM " + rom.wstring() + L": " + Widen(message));
-    if (done) {
-      EnsureSettings(p);
-      WriteConfig(p, "pd_n64_textures", "true");
-    }
     ok = ok && done;
   }
   if (!pack.empty()) {
@@ -101,12 +99,14 @@ bool ImportExperimental(const Paths& p, const fs::path& rom, const fs::path& pac
     int pictures = 0;
     fs::path src = pack;
     std::error_code ec;
-    if (!fs::is_directory(src, ec) && pd::assets::PackFileId(src) >= 0) src = src.parent_path();
+    if (!fs::is_directory(src, ec) && pd::assets::IsIdPicture(src)) src = pd::assets::PackFolderOf(src);
     const bool done = pd::assets::ImportTexturePack(src, p.resources / L"texture-packs", &name, &pictures, &message);
     Log(L"Texture pack " + pack.wstring() + L": " + Widen(message));
     if (done) {
       EnsureSettings(p);
       WriteConfig(p, "pd_texture_pack", "\"" + name + "\"");
+      WriteConfig(p, "pd_texture_slot1", "\"" + name + "\"");
+      WriteConfig(p, "pd_texture_slot_active", "1");
     }
     ok = ok && done;
   }

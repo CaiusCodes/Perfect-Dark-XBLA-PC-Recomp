@@ -343,6 +343,13 @@ address = 0x820F4A20
 name = "PdHookAimSensitivity"
 registers = ["r3", "f0"]
 
+# Legacy's look input (pd_legacy_controls, issue #30): which processed stick drives the
+# look and, while aiming, the crosshair (left stick Y while aiming, as the title update).
+[[midasm_hook]]
+address = 0x820F2C3C
+name = "PdHookLegacyLook"
+registers = ["r1", "r23"]
+
 # Lock Sight (pd_lock_sight, Advanced Control): not aiming, the crosshair takes the
 # target / lock-on path (centred with no target) instead of swinging with the turn.
 [[midasm_hook]]

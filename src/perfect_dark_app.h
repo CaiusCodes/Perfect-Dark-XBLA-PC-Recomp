@@ -54,8 +54,8 @@
 #include "pd_update.h"         // Check for Updates
 #include "pd_paths.h"          // the saves folder (userdata-location.txt)
 #include "pd_n64_textures.h"   // N64 textures from the player's N64 ROM
-#include "pd_texture_packs.h"  // texture packs (Settings > Graphics > Experimental)
-#include "pd_texture_dump.h"   // Dump All Textures (same page)
+#include "pd_texture_packs.h"  // texture packs (Settings > Graphics > Texture Packs)
+#include "pd_texture_dump.h"   // Dump Game Textures (same page, Texture Tools)
 #include "pd_assets_import.h"  // importing the N64 ROM and texture packs
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/cvar.h>
@@ -3756,7 +3756,15 @@ class PerfectDarkApp : public rex::ReXApp {
         break;
       }
     }
-    return ReadGuestU32(mem, kMenusBase + player * kMenuSize + kMenuOpenDialog) != 0;
+    if (ReadGuestU32(mem, kMenusBase + player * kMenuSize + kMenuOpenDialog) != 0) return true;
+    // The Quick Menu (the weapon menu on LB / RB: the N64's active menu) reads the
+    // controller slot's stick values itself, so with the sticks swapped it saw one
+    // stick's X and the other's Y and only moved up and down (issue #30). It is open
+    // while the player's activemenumode (player +0x258; the N64's +0x250) is set:
+    // the sticks stay as they are then, as in menus.
+    constexpr uint32_t kGVarsPlayers = 0x82648BF8 + 100, kActiveMenuMode = 0x258;
+    const uint32_t pl = ReadGuestU32(mem, kGVarsPlayers + player * 4);
+    return pl >= 0x40000000 && pl < 0xA0000000 && ReadGuestU8(mem, pl + kActiveMenuMode) != 0;
   }
 
   // The Advanced Control page (Settings > Gamepad Controls > Advanced Control), built
@@ -4110,7 +4118,7 @@ class PerfectDarkApp : public rex::ReXApp {
         {"Move Back", "keybind_lstick_down", "S"},
         {"Strafe Left", "keybind_lstick_left", "A"},
         {"Strafe Right", "keybind_lstick_right", "D"},
-        // Not a pad button: the N64 / remastered graphics switch (Experimental).
+        // Not a pad button: the Texture Pack 1 / 2 switch (Settings > Graphics > Texture Packs).
         {"Switch Graphics", "pd_n64_textures_key", "G"},
     };
     return kRows;
@@ -6466,6 +6474,19 @@ class PerfectDarkApp : public rex::ReXApp {
   //   paint                     the presenter rereads present_effect and the like
   //   res <w> <h>               resize the window; winmin / winrestore (never activates it)
   //   full <on|off>             fullscreen, as Alt+Enter does it (not saved)
+  //   texpack <name|->          a texture pack into Texture Pack 1, shown (- = Remastered)
+  //   texslot <1|2> <value>     Texture Pack 1 / 2 = Remastered, N64, None (2 only) or a pack's name
+  //   slotlist                  log both rows' choices
+  //   slotpair                  Texture Pack 2 None -> the other base look (old scenarios' G)
+  //   n64key                    as the Switch Graphics key (G): the other Texture Pack slot
+  //   importpack <folder|.zip>  import a texture pack folder or .zip directly: installed only
+  //   import <path>[|<path>...] Import Texture Pack... with these picked (as the picker returns them:
+  //                             files, or one folder): identified by content and imported (HANDOVER 4du)
+  //   dumpall                   the remastered and (with a ROM) N64 dumps, as Dump All Textures did
+  //   dumpsource <source>       Dump Game Textures...: Remastered, N64 or an installed pack's name
+  //   dumpsources               log the Dump Game Textures list
+  //   n64aligntest              the Japanese ROM's id matching tried on the loaded ROM with 8 made-up
+  //                             textures put in (pd_n64_textures.cpp AlignToXbla)
   struct TestCmd {
     std::string verb;
     std::vector<std::string> args;
@@ -6507,6 +6528,8 @@ class PerfectDarkApp : public rex::ReXApp {
       if (test_queue_.front().verb == "waitstage" && !test_queue_.front().args.empty() &&
           ReadGuestU32(mem, kStageNum) != uint32_t(atoi(test_queue_.front().args[0].c_str())))
         break;
+      // waitlook: until no pack is being applied (4do; then "[test] waitlook" in the log).
+      if (test_queue_.front().verb == "waitlook" && !ApplyingPack().empty()) break;
       const TestCmd c = std::move(test_queue_.front());
       test_queue_.pop_front();
       auto arg = [&](size_t i) { return i < c.args.size() ? c.args[i] : std::string(); };
@@ -6549,6 +6572,10 @@ class PerfectDarkApp : public rex::ReXApp {
         test_next_ = now + std::chrono::milliseconds(ms);
       } else if (c.verb == "rstickhold") {  // rstickhold <x> <y> <ms>: the right stick held, no wait
         pd::TestInputDriver::RightStick(int16_t(num(0, 0)), int16_t(num(1, 0)), num(2, 100));
+      } else if (c.verb == "stickhold") {  // stickhold <x> <y> <ms>: the left stick held, no wait
+        pd::TestInputDriver::Stick(int16_t(num(0, 0)), int16_t(num(1, 0)), num(2, 100));
+      } else if (c.verb == "btnhold") {  // btnhold <0xmask> <ms>: pad buttons held (XINPUT bits), no wait
+        pd::TestInputDriver::Buttons(uint16_t(std::strtoul(arg(0).c_str(), nullptr, 0)), num(1, 100));
       } else if (c.verb == "trig") {  // trig <left 0-255> <right 0-255> <ms>: held, no wait
         pd::TestInputDriver::Triggers(uint8_t(num(0, 0)), uint8_t(num(1, 0)), num(2, 100));
       } else if (c.verb == "wait") {
@@ -6676,12 +6703,106 @@ class PerfectDarkApp : public rex::ReXApp {
           if (app->window()) static_cast<rex::ui::WindowSDL*>(app->window())->SetLogicalSize(w, h);
         });
         REXLOG_INFO("[test] window {}x{}", w, h);
-      } else if (c.verb == "texpack") {  // texpack <name> | texpack -: as choosing it on the Experimental page
-        ChooseTexturePack(arg(0) == "-" ? std::string() : arg(0));
+      } else if (c.verb == "texpack") {  // texpack <name> | texpack -: into Texture Pack 1 (- = Remastered), shown
+        std::string name;  // (the whole rest of the line: names have spaces)
+        for (const std::string& a : c.args) name += (name.empty() ? "" : " ") + a;
+        PutPackInSlot1(name == "-" ? std::string() : name);
         REXLOG_INFO("[test] texpack: \"{}\"", pd::texpack::ChosenPack());
-      } else if (c.verb == "n64key") {  // as pressing the N64 Textures key
-        ToggleN64Textures();
-        REXLOG_INFO("[test] n64key: N64 textures {} ({})", pd::n64tex::Enabled() ? "on" : "off",
+      } else if (c.verb == "texslot") {  // texslot <1|2> <Remastered|N64|None|pack name>: as the Texture Pack 1/2 rows
+        const int slot = num(0, 1) == 2 ? 2 : 1;
+        std::string value;
+        for (size_t k = 1; k < c.args.size(); ++k) value += (value.empty() ? "" : " ") + c.args[k];
+        const bool ok = SetTextureSlot(slot, value);
+        REXLOG_INFO("[test] texslot {} \"{}\": {}; slots \"{}\" / \"{}\", {} shown, pack \"{}\", {} look", slot, value,
+                    ok ? "set" : "refused", SlotValue(1), SlotValue(2), pd::texpack::ActiveSlot(),
+                    pd::texpack::ChosenPack(), pd::n64tex::Enabled() ? "N64" : "remastered");
+      } else if (c.verb == "slotpair") {
+        // For scenarios from before the slots (Native-Scenario.ps1 adds it to one that presses
+        // n64key and sets no slot): Texture Pack 2 None becomes the other base look, so G
+        // switches Remastered <-> N64 as it did; nothing shown changes.
+        EnsureTextureSlots();
+        if (SlotValue(2) == pd::texpack::kSlotNone) {
+          pd::texpack::SetSlot(2, pd::n64tex::Enabled() ? pd::texpack::kSlotRemastered : pd::texpack::kSlotN64);
+          if (pd::texpack::ActiveSlot() != 1) pd::texpack::SetActiveSlot(1);
+        }
+        REXLOG_INFO("[test] slotpair: slots \"{}\" / \"{}\", {} shown", SlotValue(1), SlotValue(2),
+                    pd::texpack::ActiveSlot());
+      } else if (c.verb == "slotlist") {  // the Texture Pack 1 / 2 rows' choices, as the menu lists them
+        for (int slot = 1; slot <= 2; ++slot) {
+          std::string all;
+          for (const std::string& v : SlotChoices(slot)) all += (all.empty() ? "" : " | ") + v;
+          REXLOG_INFO("[test] slotlist {}: {}", slot, all);
+        }
+      } else if (c.verb == "importpack") {  // importpack <folder or .zip>: the Import Texture Pack row's import
+        std::string src;
+        for (const std::string& a : c.args) src += (src.empty() ? "" : " ") + a;
+        std::string name, message;
+        int pictures = 0;
+        const bool ok = pd::assets::ImportTexturePack(std::filesystem::path(pd::update::Widen(src)),
+                                                      pd::texpack::PacksFolder(), &name, &pictures, &message);
+        REXLOG_INFO("[test] importpack: {}", message);
+        if (ok) PackInstalledNow(name);
+      } else if (c.verb == "import") {  // import <path>[|<path>...]: as picked in Import Texture Pack...
+        std::string all;
+        for (const std::string& a : c.args) all += (all.empty() ? "" : " ") + a;
+        std::vector<std::filesystem::path> picked;
+        for (size_t start = 0; start <= all.size();) {
+          const size_t bar = all.find('|', start);
+          const std::string one = all.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+          if (!one.empty()) picked.push_back(std::filesystem::path(pd::update::Widen(one)));
+          if (bar == std::string::npos) break;
+          start = bar + 1;
+        }
+        RunImport(picked, true);
+      } else if (c.verb == "dumpsource" || c.verb == "dumpsources") {
+        if (c.verb == "dumpsources") {
+          std::string all;
+          for (const std::string& v : DumpSources()) all += (all.empty() ? "" : " | ") + v;
+          REXLOG_INFO("[test] dumpsources: {}", all);
+        } else {
+          std::string source;
+          for (const std::string& a : c.args) source += (source.empty() ? "" : " ") + a;
+          StartDumpSource(source, true);
+        }
+      } else if (c.verb == "n64aligntest") {
+        REXLOG_INFO("[test] n64aligntest: {}", pd::n64tex::AlignSelfTest());
+      } else if (c.verb == "detailbake") {  // detailbake <id> <pack name...>: the remastered look's picture
+        // for texture <id> with its N64 detail texture drawn in, as screenshots\detail-<id>.png
+        // (and the pack's picture alone as detail-<id>-plain.png), right way up (HANDOVER 4ds)
+        const int id = num(0, -1);
+        std::string name;
+        for (size_t k = 1; k < c.args.size(); ++k) name += (name.empty() ? "" : " ") + c.args[k];
+        const auto index = pd::texpack::IndexFor(name);
+        const pd::texpack::DetailLayer* d = pd::texpack::DetailLayerFor(id);
+        const std::filesystem::path* base = index ? index->Picture(0, id) : nullptr;
+        const std::filesystem::path* det = index && d ? index->Picture(0, d->detail) : nullptr;
+        std::vector<uint8_t> rgba, drgba;
+        uint32_t w = 0, h = 0, dw = 0, dh = 0;
+        std::string error;
+        if (!base || !det || !pd::texpack::LoadPicture(*base, rgba, w, h, &error) ||
+            !pd::texpack::LoadPicture(*det, drgba, dw, dh, &error)) {
+          REXLOG_INFO("[test] detailbake {} \"{}\": no ({}{}{})", id, name, d ? "" : "no detail layer ",
+                      base ? "" : "no picture ", error);
+        } else {
+          const std::filesystem::path folder = std::filesystem::path(app->config_path()).parent_path() / "screenshots";
+          std::error_code ec;
+          std::filesystem::create_directories(folder, ec);
+          pd::texpack::WritePng(folder / fmt::format("detail-{}-plain.png", id), rgba.data(), w, h);
+          pd::texpack::BakeDetail(rgba, w, h, drgba, dw, dh, *d);
+          pd::texpack::WritePng(folder / fmt::format("detail-{}.png", id), rgba.data(), w, h);
+          REXLOG_INFO("[test] detailbake {} \"{}\": {}x{} with {} ({}x{})", id, name, w, h, d->detail, dw, dh);
+        }
+      } else if (c.verb == "dumpall") {  // as the Dump All Textures row
+        const bool started = pd::texdump::StartDumpAll(
+            [](const std::string& text) { REXLOG_INFO("[test] dumpall: {}", text); });
+        if (!started) REXLOG_INFO("[test] dumpall: already running");
+      } else if (c.verb == "waitlook") {
+        REXLOG_INFO("[test] waitlook: Texture Pack {} shown, pack \"{}\", {} look", pd::texpack::ActiveSlot(),
+                    pd::texpack::ChosenPack(), pd::n64tex::Enabled() ? "N64" : "remastered");
+      } else if (c.verb == "n64key") {  // as pressing the Switch Graphics key (G)
+        ToggleTextureSlot();
+        REXLOG_INFO("[test] n64key: Texture Pack {} shown, pack \"{}\", N64 textures {} ({})",
+                    pd::texpack::ActiveSlot(), pd::texpack::ChosenPack(), pd::n64tex::Enabled() ? "on" : "off",
                     pd::n64tex::StatusDetail());
       } else if (c.verb == "winmin" || c.verb == "winrestore") {  // never activates the window
         HWND hwnd = app->window() ? static_cast<HWND>(app->window()->GetNativeWindowHandle()) : nullptr;
@@ -6875,7 +6996,8 @@ class PerfectDarkApp : public rex::ReXApp {
       shown_at = std::chrono::steady_clock::now();
     }
     if (text.empty()) return;
-    constexpr float kShowSeconds = 4.0f;
+    // Long notices (a texture pack's description) stay longer: about 25 characters a second.
+    const float kShowSeconds = std::max(4.0f, float(text.size()) / 25.0f);
     constexpr float kFadeSeconds = 0.6f;
     const float age =
         std::chrono::duration<float>(std::chrono::steady_clock::now() - shown_at).count();
@@ -6888,7 +7010,9 @@ class PerfectDarkApp : public rex::ReXApp {
     const float scale = io.DisplaySize.y / 720.0f;
     ImFont* font = ImGui::GetFont();
     const float size = 22.0f * scale;
-    const ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
+    // Wrapped to the screen (a long notice used to run off both sides).
+    const float wrap = std::max(200.0f, io.DisplaySize.x - 160.0f * scale);
+    const ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, wrap, text.c_str());
     const ImVec2 pad(18.0f * scale, 10.0f * scale);
     const ImVec2 min((io.DisplaySize.x - extent.x) * 0.5f - pad.x, 40.0f * scale);
     const ImVec2 max(min.x + extent.x + pad.x * 2.0f, min.y + extent.y + pad.y * 2.0f);
@@ -6897,7 +7021,7 @@ class PerfectDarkApp : public rex::ReXApp {
     draw->AddRect(min, max, IM_COL32(63, 208, 232, int(255 * alpha)), 6.0f * scale, 0,
                   1.5f * scale);
     draw->AddText(font, size, ImVec2(min.x + pad.x, min.y + pad.y),
-                  IM_COL32(230, 245, 255, int(255 * alpha)), text.c_str());
+                  IM_COL32(230, 245, 255, int(255 * alpha)), text.c_str(), nullptr, wrap);
   }
 
   // ---- Combat Simulator player pages --------------------------------------
@@ -7470,7 +7594,7 @@ class PerfectDarkApp : public rex::ReXApp {
         WriteGuestU32(mem, ni + 16, r.handler_addr);
         ++added;
       }
-      // Experimental (a page of its own; BuildExperimentalPage), last of ours.
+      // Texture Packs (a page of its own; BuildExperimentalPage; "Experimental" until 4du), last of ours.
       if (exp_dialog_) {
         static uint32_t exp_label = 0;
         if (!exp_label) exp_label = fd->AllocateThunk(&PdExpLabel<kExpTitle>, 0);
@@ -8842,7 +8966,7 @@ class PerfectDarkApp : public rex::ReXApp {
 
   // N64 textures (pd_n64_textures.h): the player's own N64 ROM in
   // resources\n64, switched live by a key (pd_n64_textures_key, G; D-pad Down on a pad) or by
-  // Settings > Graphics > Experimental > Textures, Plume only. The choice is
+  // Settings > Graphics > Texture Packs > Texture Pack 1 / 2, Plume only. The choice is
   // saved; the ROM loads at start when it is on, or at the first switch. A
   // problem with the ROM switches it back off with a notice.
   static bool PlumeRunning() { return rex::cvar::GetFlagByName("gpu_native") == "true"; }
@@ -8852,7 +8976,7 @@ class PerfectDarkApp : public rex::ReXApp {
     std::string text;
     switch (s) {
       case Status::kNoRom:
-        text = "For N64 textures, import your N64 Perfect Dark ROM: Settings > Graphics > Experimental.";
+        text = "For N64 textures, import your N64 Perfect Dark ROM: Settings > Graphics > Texture Packs > Import Texture Pack...";
         break;
       case Status::kBadRom:
         text = "The N64 ROM isn't a Perfect Dark ROM this game knows (NTSC or PAL): import yours again.";
@@ -8913,49 +9037,422 @@ class PerfectDarkApp : public rex::ReXApp {
   static inline std::atomic<bool> pad_switch_in_play_{false};
   static inline std::atomic<bool> pad_switch_requested_{false};
 
-  // N64 (on) or remastered textures, with a notice; refused with a notice
-  // (and the choice left as it was) without Plume or a usable ROM.
-  static void SetN64Textures(bool on) {
+  // Whether the N64 look can be drawn now: Plume, and a usable ROM (loading starts
+  // here). `notice`: says why not (the Classic renderer, no ROM, an unusable ROM).
+  static bool N64Usable(bool notice) {
     using pd::n64tex::Status;
-    if (on == pd::n64tex::Enabled()) return;
-    if (on) {
-      if (!PlumeRunning()) {
-        rex::kernel::xam::netplay::ShowNotice("N64 textures need the Plume renderer.");
-        return;
-      }
-      Status s = pd::n64tex::GetStatus();
-      if ((s == Status::kIdle || s == Status::kNoRom) && !pd::n64tex::RomPresent()) {
-        ShowN64Problem(Status::kNoRom);
-        return;
-      }
-      pd::n64tex::BeginLoad();  // (once; retried while there was no ROM)
-      s = pd::n64tex::GetStatus();
-      if (s != Status::kLoading && s != Status::kReady) {
-        ShowN64Problem(s);
-        return;
-      }
+    if (!PlumeRunning()) {
+      if (notice) rex::kernel::xam::netplay::ShowNotice("N64 textures need the Plume renderer.");
+      return false;
     }
-    pd::n64tex::SetEnabled(on);
-    SavePcSettings();
-    // No notice: the picture itself shows the switch (user, 2026-11-17). Only
-    // problems (no ROM, Classic renderer, an unusable ROM) are announced.
-    REXLOG_INFO("[n64] textures switched to {}", on ? "N64" : "remastered");
+    Status s = pd::n64tex::GetStatus();
+    if (s == Status::kReady || s == Status::kLoading) return true;
+    if ((s == Status::kIdle || s == Status::kNoRom) && !pd::n64tex::RomPresent()) {
+      if (notice) ShowN64Problem(Status::kNoRom);
+      return false;
+    }
+    pd::n64tex::BeginLoad();  // (once; retried while there was no ROM)
+    s = pd::n64tex::GetStatus();
+    if (s != Status::kLoading && s != Status::kReady) {
+      if (notice) ShowN64Problem(s);
+      return false;
+    }
+    return true;
   }
 
-  static void ToggleN64Textures() { SetN64Textures(!pd::n64tex::Enabled()); }
+  // ---- Texture slots (pd_texture_packs.h; HANDOVER 4dn) ----------------------
+  // Texture Pack 1 and 2 on the Texture Packs page, each Remastered, N64 or an
+  // installed pack (drawn over the look it was made for); 2 may be None. The Switch
+  // Graphics key (G, D-pad Down) shows the other one. Choosing a slot's value shows
+  // that slot at once. Defaults: 1 Remastered, 2 None (most players have no N64 ROM;
+  // the user, 4dn). No notice when the look changes: the picture shows it (the user,
+  // 2026-11-17); only problems are announced.
+  // (The folder itself: the lists stop at kMaxListed packs.)
+  static bool PackInstalled(const std::string& name) {
+    if (name.empty() || pd::assets::SafePackName(name) != name) return false;
+    std::error_code ec;
+    return std::filesystem::is_directory(pd::texpack::PacksFolder() / pd::update::Widen(name), ec);
+  }
 
-  // ---- Settings > Graphics > Experimental -----------------------------------
-  // A page of its own (built like Stick Settings): the base textures
-  // (Remastered / N64), a texture pack over them, importing the N64 ROM and
-  // texture packs with the Windows file picker, the packs folder, and the
-  // texture dump for pack makers. HANDOVER 4cn.
+  static bool IsPackValue(const std::string& v) {
+    return v != pd::texpack::kSlotRemastered && v != pd::texpack::kSlotN64 && v != pd::texpack::kSlotNone;
+  }
+
+  // ---- Applying a pack (HANDOVER 4do) ----------------------------------------
+  // A pack is never drawn over one look and then switched to the other, and doesn't come
+  // in picture by picture: showing it is (1) its look measured if it isn't known yet
+  // (pd_texture_packs.h StartMeasure: a few seconds the first time; with a ROM there,
+  // once it is loaded), then (2) Plume decodes and uploads its pictures for what is on
+  // screen while the old look stays (RequestPrepare), then (3) the look is set and Plume
+  // switches in one frame. Meanwhile the slot's row on Texture Packs says "(applying)", and at start (a pack chosen whose
+  // look isn't known) a notice if it is still applying once the window is up. Choosing
+  // another look (G, a row) meanwhile replaces it. Any thread (the menus' handlers run on
+  // the game's); TickApply moves it on each frame.
+  struct ApplyJob {
+    int slot = 0;  // 0: nothing being applied
+    std::string pack;
+    uint32_t serial = 0;  // the prepare request; 0: not asked yet (the look being measured)
+    bool n64 = false;
+    std::shared_ptr<const pd::texpack::Index> index;
+    std::chrono::steady_clock::time_point started{}, last_try{};
+    bool at_start = false;
+  };
+  static inline std::recursive_mutex apply_mutex_;
+  static ApplyJob& Applying() {  // (a function: the struct's member initializers)
+    static ApplyJob job;
+    return job;
+  }
+
+  // The pack being applied ("" if none) and its slot.
+  static std::string ApplyingPack(int* slot = nullptr) {
+    std::lock_guard<std::recursive_mutex> lock(apply_mutex_);
+    if (slot) *slot = Applying().slot;
+    return Applying().slot ? Applying().pack : std::string();
+  }
+
+  static void CancelApply() {
+    std::lock_guard<std::recursive_mutex> lock(apply_mutex_);
+    if (!Applying().slot) return;
+    if (Applying().serial) pd::texpack::CancelPrepare();
+    REXLOG_INFO("[texslot] applying \"{}\" stopped (another look chosen)", Applying().pack);
+    Applying() = {};
+  }
+
+  static void AdvanceApply() {
+    using pd::n64tex::Status;
+    std::lock_guard<std::recursive_mutex> lock(apply_mutex_);
+    if (!Applying().slot) return;
+    const std::string v = Applying().pack;
+    const auto now = std::chrono::steady_clock::now();
+    const auto ms = [&]() { return std::chrono::duration_cast<std::chrono::milliseconds>(now - Applying().started).count(); };
+    if (!Applying().serial) {
+      // (1) Its look known.
+      const pd::texpack::LookState st = pd::texpack::GetLookState(v);
+      if (st == pd::texpack::LookState::kMeasuring) return;
+      if (st == pd::texpack::LookState::kUnknown) {
+        if (now - Applying().last_try < std::chrono::milliseconds(250)) return;
+        Applying().last_try = now;
+        // (a ROM there: loaded first, so its side is counted)
+        if (!pd::texpack::StartMeasure(v) && pd::n64tex::GetStatus() == Status::kIdle && pd::n64tex::RomPresent())
+          pd::n64tex::BeginLoad();
+        return;
+      }
+      // (2) The ROM loaded if the look needs it (or it is loading anyway: the pack's
+      // per-model pictures are matched through it), then its pictures prepared.
+      const bool wants_n64 = pd::texpack::PackPrefersN64(v);
+      if (pd::n64tex::GetStatus() == Status::kLoading) return;
+      const bool n64 = wants_n64 && N64Usable(false);
+      if (n64 && pd::n64tex::GetStatus() != Status::kReady) return;  // (N64Usable started loading it)
+      if (wants_n64 && !n64)
+        REXLOG_INFO("[texslot] \"{}\" is made for the N64 look; no usable N64 ROM, so over the remastered", v);
+      std::shared_ptr<const pd::texpack::Index> index = pd::texpack::IndexFor(v);
+      const pd::texpack::Look cur = pd::texpack::CurrentLook();
+      if (cur.index && cur.index->name == v && cur.index->version == index->version && cur.n64 == n64) {
+        REXLOG_INFO("[texslot] \"{}\" shown already ({} look)", v, n64 ? "N64" : "remastered");
+        Applying() = {};
+        return;
+      }
+      Applying().index = std::move(index);
+      Applying().n64 = n64;
+      Applying().serial = pd::texpack::RequestPrepare(Applying().index, n64);
+      REXLOG_INFO("[texslot] \"{}\": look known after {} ms ({}); preparing its pictures", v, ms(),
+                  n64 ? "N64" : "remastered");
+      return;
+    }
+    // (3) Prepared: shown in one go (the other slot, the look shown until now, is the
+    // standby already: UpdateStandby, so Plume keeps its pictures).
+    if (pd::texpack::PreparedSerial() != Applying().serial) return;
+    pd::texpack::SetLook(Applying().index, Applying().n64);
+    REXLOG_INFO("[texslot] Texture Pack {} shown: {} ({} look), {} ms after it was chosen", Applying().slot, v,
+                Applying().n64 ? "N64" : "remastered", ms());
+    Applying() = {};
+    SavePcSettings();
+  }
+
+  static void StartApply(int slot, const std::string& pack, bool at_start = false) {
+    std::lock_guard<std::recursive_mutex> lock(apply_mutex_);
+    if (Applying().slot == slot && Applying().pack == pack) return;  // (being applied)
+    if (Applying().serial) pd::texpack::CancelPrepare();
+    Applying() = {};
+    Applying().slot = slot;
+    Applying().pack = pack;
+    Applying().started = std::chrono::steady_clock::now();
+    Applying().at_start = at_start;
+    REXLOG_INFO("[texslot] applying \"{}\" (Texture Pack {})", pack, slot);
+    AdvanceApply();
+  }
+
+  // Each frame (UI thread): moves the pack being applied on; at start, a notice if it is
+  // still applying once the window is up (8 s).
+  static void TickApply() {
+    AdvanceApply();
+    UpdateStandby();
+    static const auto first = std::chrono::steady_clock::now();
+    static bool noticed = false;
+    if (noticed || std::chrono::steady_clock::now() - first < std::chrono::seconds(8)) return;
+    std::lock_guard<std::recursive_mutex> lock(apply_mutex_);
+    if (Applying().slot && Applying().at_start) {
+      noticed = true;
+      rex::kernel::xam::netplay::ShowNotice("Applying textures...");
+    } else if (!Applying().slot) {
+      noticed = true;  // (nothing at start: no notice later)
+    }
+  }
+
+  // Every 2 s: a slot's pack whose look isn't known is measured in the background (so
+  // choosing it later, G included, doesn't wait for that).
+  static void TickPackLooks() {
+    static auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(2) || !PlumeRunning()) return;
+    last = now;
+    const std::string applying = ApplyingPack();
+    for (int slot = 1; slot <= 2; ++slot) {
+      const std::string v = SlotValue(slot);
+      if (IsPackValue(v) && v != applying && pd::texpack::GetLookState(v) == pd::texpack::LookState::kUnknown)
+        pd::texpack::StartMeasure(v);
+    }
+  }
+
+  // A slot's value as used: an empty or missing one is slot 1's Remastered, slot 2's None.
+  static std::string SlotValue(int slot) {
+    const std::string v = pd::texpack::Slot(slot);
+    const char* fallback = slot == 1 ? pd::texpack::kSlotRemastered : pd::texpack::kSlotNone;
+    if (v.empty()) return fallback;
+    if (v == pd::texpack::kSlotRemastered || v == pd::texpack::kSlotN64) return v;
+    if (v == pd::texpack::kSlotNone) return slot == 1 ? pd::texpack::kSlotRemastered : v;
+    return PackInstalled(v) ? v : fallback;
+  }
+
+  // Draws `pack` ("" none) over the base look `n64` now, the two set together. (A pack
+  // whose look is known and that needs no preparing: at start; Remastered and N64.)
+  static void DrawLook(const std::string& pack, bool n64) {
+    const bool was_n64 = pd::n64tex::Enabled();
+    pd::texpack::SetLook(pd::texpack::IndexFor(pack), n64);
+    if (n64 != was_n64) REXLOG_INFO("[n64] textures switched to {}", n64 ? "N64" : "remastered");
+  }
+
+  // ---- The other slot kept ready (HANDOVER 4dp) -------------------------------
+  // The look Texture Pack `slot` draws, if it can be drawn now without measuring or loading
+  // anything: a pack whose look is known (over the N64 look once the ROM is loaded), N64 with
+  // the ROM loaded, Remastered. False for None, a pack not measured yet, the ROM loading.
+  static bool SlotLookNow(int slot, std::shared_ptr<const pd::texpack::Index>* index, bool* n64) {
+    using pd::n64tex::Status;
+    const std::string v = SlotValue(slot);
+    if (v == pd::texpack::kSlotNone || !PlumeRunning()) return false;
+    const Status rs = pd::n64tex::GetStatus();
+    const bool rom_ready = rs == Status::kReady;
+    const bool rom_coming = rs == Status::kLoading || (rs == Status::kIdle && pd::n64tex::RomPresent());
+    if (v == pd::texpack::kSlotRemastered || v == pd::texpack::kSlotN64) {
+      if (v == pd::texpack::kSlotN64 && !rom_ready) return false;
+      *index = pd::texpack::IndexFor("");
+      *n64 = v == pd::texpack::kSlotN64;
+      return true;
+    }
+    if (pd::texpack::GetLookState(v) != pd::texpack::LookState::kKnown) return false;
+    const bool wants_n64 = pd::texpack::PackPrefersN64(v);
+    if (wants_n64 && !rom_ready && rom_coming) return false;
+    *index = pd::texpack::IndexFor(v);
+    *n64 = wants_n64 && rom_ready;
+    return true;
+  }
+
+  // Each frame: the slot not shown is the standby (pd_texture_packs.h), which Plume keeps
+  // ready so G shows it in the next frame. None: nothing kept (no memory for it). A slot
+  // wanting the N64 look starts the ROM's load if it is there and not loaded.
+  static void UpdateStandby() {
+    // (every 100 ms: a slot's value is checked against the packs folder)
+    static auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::milliseconds(100)) return;
+    last = now;
+    const int other = pd::texpack::ActiveSlot() == 1 ? 2 : 1;
+    std::shared_ptr<const pd::texpack::Index> index;
+    bool n64 = false;
+    const bool ok = SlotLookNow(other, &index, &n64);
+    if (!ok && PlumeRunning()) {
+      const std::string v = SlotValue(other);
+      const bool wants_n64 = v == pd::texpack::kSlotN64 ||
+                             (IsPackValue(v) && pd::texpack::GetLookState(v) == pd::texpack::LookState::kKnown &&
+                              pd::texpack::PackPrefersN64(v));
+      if (wants_n64 && pd::n64tex::GetStatus() == pd::n64tex::Status::kIdle && pd::n64tex::RomPresent())
+        pd::n64tex::BeginLoad();
+    }
+    pd::texpack::SetStandby(std::move(index), n64, ok);
+  }
+
+  // Shows slot `slot`: false (nothing changed) when it is None or can't be drawn
+  // (N64 without a usable ROM or Plume; a pack without Plume), with a notice if asked.
+  // Kept ready (the standby, above): shown in the next frame, and the look shown until
+  // then becomes the standby. Otherwise Remastered and N64 are shown at once; a pack is
+  // applied (above), the look shown until then staying.
+  static bool ApplyTextureSlot(int slot, bool notice) {
+    const std::string v = SlotValue(slot);
+    if (v == pd::texpack::kSlotNone) return false;
+    {
+      std::shared_ptr<const pd::texpack::Index> index;
+      bool n64 = false;
+      if (SlotLookNow(slot, &index, &n64) && pd::texpack::SwapToStandby(index, n64)) {
+        CancelApply();
+        pd::texpack::SetActiveSlot(slot);
+        SavePcSettings();
+        REXLOG_INFO("[texslot] Texture Pack {} shown at once (kept ready): {} ({} look)", slot, v,
+                    n64 ? "N64" : "remastered");
+        return true;
+      }
+    }
+    if (v == pd::texpack::kSlotRemastered) {
+      CancelApply();
+      DrawLook("", false);
+    } else if (v == pd::texpack::kSlotN64) {
+      if (!N64Usable(notice)) return false;
+      CancelApply();
+      DrawLook("", true);
+    } else {
+      if (!PlumeRunning()) {
+        if (notice) rex::kernel::xam::netplay::ShowNotice("Texture packs need the Plume renderer.");
+        return false;
+      }
+      StartApply(slot, v);
+    }
+    pd::texpack::SetActiveSlot(slot);
+    SavePcSettings();
+    REXLOG_INFO("[texslot] Texture Pack {} chosen: {}{}", slot, v,
+                IsPackValue(v) ? std::string() : fmt::format(" ({} look)", pd::n64tex::Enabled() ? "N64" : "remastered"));
+    return true;
+  }
+
+  // The Switch Graphics key / D-pad Down: the other slot, unless it is None.
+  static void ToggleTextureSlot() {
+    const int other = pd::texpack::ActiveSlot() == 1 ? 2 : 1;
+    if (SlotValue(other) == pd::texpack::kSlotNone) {
+      REXLOG_INFO("[texslot] switch: Texture Pack {} is None, nothing to switch to", other);
+      return;
+    }
+    ApplyTextureSlot(other, true);
+  }
+
+  // A slot's new value (the Texture Packs rows, the test pipe): refused (with a notice)
+  // if it can't be drawn; otherwise saved and shown at once, or for slot 2's None,
+  // slot 1 shown if 2 was.
+  static bool SetTextureSlot(int slot, const std::string& value) {
+    const std::string before = pd::texpack::Slot(slot);
+    pd::texpack::SetSlot(slot, value);
+    if (value == pd::texpack::kSlotNone) {
+      if (pd::texpack::ActiveSlot() == slot) ApplyTextureSlot(1, true);
+      SavePcSettings();
+      REXLOG_INFO("[texslot] Texture Pack {} = None", slot);
+      return true;
+    }
+    if (!ApplyTextureSlot(slot, true)) {
+      pd::texpack::SetSlot(slot, before);
+      return false;
+    }
+    return true;
+  }
+
+  // The test pipe's texpack: Texture Pack 1, shown.
+  static bool PutPackInSlot1(const std::string& name) {
+    return SetTextureSlot(1, name.empty() ? std::string(pd::texpack::kSlotRemastered) : name);
+  }
+
+  // A pack just imported or downloaded: installed only (the user, 4dr). It is in both
+  // Texture Pack rows' lists from now, and nothing switches on by itself: the player
+  // chooses it in Texture Pack 1 or 2. Its look is measured now, in the background, so
+  // choosing it later is quick.
+  // A pack installed again over itself is indexed and measured again; if the slot shown
+  // holds it, it is applied again (the other slot's standby follows by itself).
+  static inline std::vector<std::string> packs_to_measure_;
+  static void PackInstalledNow(const std::string& name) {
+    pd::texpack::ListPacks(true);
+    pd::texpack::ForgetLook(name);
+    if (!PlumeRunning()) return;
+    const int shown = pd::texpack::ActiveSlot();
+    if (pd::texpack::Slot(shown) == name) ApplyTextureSlot(shown, false);
+    else if (!pd::texpack::StartMeasure(name) &&
+             std::find(packs_to_measure_.begin(), packs_to_measure_.end(), name) == packs_to_measure_.end())
+      packs_to_measure_.push_back(name);  // (the bank not loaded yet: tried again each frame)
+    REXLOG_INFO("[texslot] \"{}\" installed: in both Texture Pack lists, not switched on", name);
+  }
+  static void TickPacksToMeasure() {
+    for (size_t i = 0; i < packs_to_measure_.size();) {
+      if (pd::texpack::GetLookState(packs_to_measure_[i]) != pd::texpack::LookState::kUnknown ||
+          pd::texpack::StartMeasure(packs_to_measure_[i]))
+        packs_to_measure_.erase(packs_to_measure_.begin() + std::ptrdiff_t(i));
+      else
+        ++i;
+    }
+  }
+
+  // Once, at start (before the N64 ROM's load is started): fills empty slots from a
+  // settings file from before them (the look and pack in use become Texture Pack 1;
+  // Texture Pack 2 None), then draws the shown slot. Problems are left to
+  // TickN64Textures as before (its notice once the window is up).
+  static void EnsureTextureSlots() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const bool n64_before = pd::n64tex::Enabled();
+    const std::string pack_before = pd::texpack::ChosenPack();
+    bool changed = false;
+    if (pd::texpack::Slot(1).empty()) {
+      changed = true;
+      const std::string pack = pd::texpack::ChosenPack();
+      const std::string value = !pack.empty() && PackInstalled(pack) ? pack
+                                : pd::n64tex::Enabled()               ? pd::texpack::kSlotN64
+                                                                      : pd::texpack::kSlotRemastered;
+      pd::texpack::SetSlot(1, value);
+      REXLOG_INFO("[texslot] Texture Pack 1 set from the settings before slots: {}", value);
+    }
+    if (pd::texpack::Slot(2).empty()) {
+      pd::texpack::SetSlot(2, pd::texpack::kSlotNone);
+      changed = true;
+    }
+    // The game always starts on Texture Pack 1 (the user, 4dv): G's choice lasts a session.
+    const int slot = 1;
+    changed = changed || slot != pd::texpack::ActiveSlot();
+    const std::string v = SlotValue(slot);
+    bool apply = false;
+    if (v == pd::texpack::kSlotRemastered) {
+      DrawLook("", false);
+    } else if (v == pd::texpack::kSlotN64) {
+      DrawLook("", true);
+    } else if (pd::texpack::GetLookState(v) == pd::texpack::LookState::kKnown) {
+      // Its look known (pd-look.txt): drawn from the first frame (nothing on screen yet to
+      // prepare; over the N64 look, Plume holds the pack back until the ROM is loaded).
+      DrawLook(v, pd::texpack::PackPrefersN64(v) && pd::n64tex::RomPresent());
+    } else {
+      // Not known yet (copied in by hand, or measured before the ROM was imported): the
+      // remastered look without it until it is measured and prepared (TickApply).
+      DrawLook("", false);
+      apply = PlumeRunning();
+    }
+    pd::texpack::SetActiveSlot(slot);
+    if (changed || n64_before != pd::n64tex::Enabled() || pack_before != pd::texpack::ChosenPack()) SavePcSettings();
+    REXLOG_INFO("[texslot] at start: Texture Pack 1 = {}, Texture Pack 2 = {}; {} shown ({}{} look)", SlotValue(1),
+                SlotValue(2), slot, apply ? "being applied; meanwhile the " : "",
+                pd::n64tex::Enabled() ? "N64" : "remastered");
+    if (apply) StartApply(slot, v, true);
+  }
+
+  // ---- Settings > Graphics > Texture Packs -----------------------------------
+  // A page of its own (built like Stick Settings; "Experimental" until 4du): the two looks G
+  // switches between (Texture Pack 1 / 2), Import Texture Pack... (the one way in for an N64
+  // ROM, a texture pack's folder or .zip, and loose pictures named by texture number), and
+  // Texture Tools, a page of its own: the packs folder, the dump folder, and Dump Game
+  // Textures... (a list of the texture sources: Remastered, N64 with a ROM, each installed
+  // pack). HANDOVER 4cn, 4dm, 4du. The GitHub downloader (Get Texture Packs, 4dl-4dt) and the
+  // Import N64 ROM row are gone (the user, 4du); packs the downloader installed are ordinary
+  // installed packs.
   //
-  // exp_strings_ (guest, 32 bytes each): labels 0-7 (kExpTitle..kExpOpenDump), the
-  // values from +256 (Remastered, N64, Off, On, None, 16 each), the listed
-  // packs' names from +384.
-  enum : int { kExpTitle, kExpTextures, kExpPack, kExpImportRom, kExpImportPack, kExpOpenFolder, kExpDump, kExpOpenDump };
-  static constexpr uint32_t kExpValues = 256, kExpPackNames = 384;
-  static constexpr uint32_t kExpStringsSize = kExpPackNames + uint32_t(pd::texpack::kMaxListed) * 32;
+  // exp_strings_ (guest): labels 0-7 (kExpTitle..kExpDump, 32 bytes each), the values from
+  // +384 (Remastered, N64, Off, On, None, 16 each), the listed packs' names from +512 (48 each).
+  enum : int {
+    kExpTitle, kExpSlot1, kExpSlot2, kExpImport, kExpTools, kExpOpenFolder, kExpOpenDump, kExpDump, kExpLabelCount
+  };
+  static_assert(kExpLabelCount * 32 <= 384, "Texture Packs labels overlap the values");
+  static constexpr uint32_t kExpValues = 384, kExpPackNames = 512, kExpNameSize = 48;
+  static constexpr uint32_t kExpStringsSize = kExpPackNames + uint32_t(pd::texpack::kMaxListed) * kExpNameSize;
   static inline uint32_t exp_strings_ = 0;
   static inline uint32_t exp_dialog_ = 0;
   static uint32_t ExpValue(int i) { return exp_strings_ + kExpValues + uint32_t(i) * 16; }  // 0 Remastered .. 4 None
@@ -8963,97 +9460,89 @@ class PerfectDarkApp : public rex::ReXApp {
   template <int N>
   static void PdExpLabel(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = exp_strings_ + uint32_t(N) * 32; }
 
+  // Texture Pack 1 / 2's label: "(applying)" after it while its pack is being applied (4do).
+  template <int Slot>
+  static void PdExpSlotLabel(PPCContext& ctx, uint8_t*) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t addr = exp_strings_ + uint32_t(Slot == 2 ? kExpSlot2 : kExpSlot1) * 32;
+    int slot = 0;
+    const bool applying = !ApplyingPack(&slot).empty() && slot == Slot;
+    const std::string text = std::string("Texture Pack ") + char('0' + Slot) + (applying ? " (applying)" : "") + "\n";
+    if (mem && exp_strings_) WriteGuestBytes(mem, addr, text.c_str(), text.size() + 1);
+    ctx.r3.u64 = addr;
+  }
+
   static void WriteExpStrings(rex::memory::Memory* mem) {
     if (!exp_strings_) exp_strings_ = mem->SystemHeapAlloc(kExpStringsSize);
     if (!exp_strings_) return;
-    static const char* const kLabels[] = {"Experimental\n",        "Textures\n",
-                                          "Texture Pack\n",        "Import N64 ROM\n",
-                                          "Import Texture Pack\n", "Open Texture Packs Folder\n",
-                                          "Dump All Textures\n",   "Open Texture Dump Folder\n"};
-    for (int i = 0; i < 8; ++i)
+    // (our own rows: the same English text in every language, like the game's other PC rows)
+    static const char* const kLabels[] = {"Texture Packs\n",          "Texture Pack 1\n",
+                                          "Texture Pack 2\n",         "Import Texture Pack...\n",
+                                          "Texture Tools\n",          "Open Texture Packs Folder\n",
+                                          "Open Texture Dump Folder\n", "Dump Game Textures...\n"};
+    static_assert(std::size(kLabels) == kExpLabelCount);
+    for (int i = 0; i < kExpLabelCount; ++i)
       WriteGuestBytes(mem, exp_strings_ + uint32_t(i) * 32, kLabels[i], strlen(kLabels[i]) + 1);
     static const char* const kValues[] = {"Remastered", "N64", "Off", "On", "None"};
     for (int i = 0; i < 5; ++i) WriteGuestBytes(mem, ExpValue(i), kValues[i], strlen(kValues[i]) + 1);
   }
 
-  // Textures: Remastered / N64 (same op protocol as PdResolutionMenuHandler).
-  static void PdExpTexturesHandler(PPCContext& ctx, uint8_t*) {
-    PerfectDarkApp* app = current_instance_;
-    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
-    const uint32_t op = ctx.r3.u32, data = ctx.r5.u32;
-    uint32_t ret = 0;
-    switch (op) {
-      case 1:
-        if (mem) WriteGuestU32(mem, data, 2);
-        break;
-      case 3:
-        ret = ExpValue(mem && ReadGuestU32(mem, data) == 1 ? 1 : 0);
-        break;
-      case 6:
-        if (mem) SetN64Textures(ReadGuestU32(mem, data) == 1);
-        break;
-      case 7:
-        if (mem) WriteGuestU32(mem, data, pd::n64tex::Enabled() ? 1u : 0u);
-        break;
-      default:
-        break;
-    }
-    ctx.r3.u64 = ret;
-  }
-
-  static void ChooseTexturePack(const std::string& name) {
-    if (!name.empty() && !PlumeRunning()) {
-      rex::kernel::xam::netplay::ShowNotice("Texture packs need the Plume renderer.");
-      return;
-    }
-    const int pictures = pd::texpack::ChoosePack(name);
-    SavePcSettings();
-    std::string text = name.empty() ? std::string("Texture Pack: None")
-                                    : "Texture Pack: " + name + " (" + std::to_string(pictures) + " pictures)";
-    // An N64 emulator pack: its pictures are redraws of the N64 textures.
-    if (const auto index = pd::texpack::CurrentIndex(); index && index->hires_files > 0) {
-      if (index->waiting_for_rom)
-        text += pd::n64tex::RomPresent() ? "\nIts N64 pictures show with Textures: N64."
-                                         : "\nIts N64 pictures need your N64 ROM: Import N64 ROM.";
-      else
-        text += "\nIts N64 pictures show with Textures: N64.";
-    }
-    rex::kernel::xam::netplay::ShowNotice(text);
-  }
-
-  // Texture Pack: None, then each installed pack by name.
-  static void PdExpPackHandler(PPCContext& ctx, uint8_t*) {
-    PerfectDarkApp* app = current_instance_;
-    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
-    const uint32_t op = ctx.r3.u32, data = ctx.r5.u32;
-    uint32_t ret = 0;
+  // A list row's value text (the dropdowns: Texture Pack 1 / 2, Dump Game Textures...):
+  // Remastered / N64 / None from the fixed values, an installed pack by name from its buffer
+  // (one per place in the pack list, as every list shows the packs alike).
+  static uint32_t ExpChoiceText(rex::memory::Memory* mem, const std::string& v) {
+    if (v == pd::texpack::kSlotNone) return ExpValue(4);
+    if (v == pd::texpack::kSlotRemastered) return ExpValue(0);
+    if (v == pd::texpack::kSlotN64) return ExpValue(1);
     const std::vector<std::string> packs = pd::texpack::ListPacks();
+    const auto it = std::find(packs.begin(), packs.end(), v);
+    if (it == packs.end() || !mem) return ExpValue(0);
+    const uint32_t k = uint32_t(it - packs.begin());
+    const std::string shown = v.substr(0, kExpNameSize - 1);
+    const uint32_t addr = exp_strings_ + kExpPackNames + k * kExpNameSize;
+    WriteGuestBytes(mem, addr, shown.c_str(), shown.size() + 1);
+    return addr;
+  }
+
+  // Texture Pack 1 / 2 (same op protocol as PdResolutionMenuHandler): slot 1 lists
+  // Remastered, N64, then each installed pack by name; slot 2 None first. The list is
+  // read again each time (a pack just imported is in both at once).
+  static std::vector<std::string> SlotChoices(int slot) {
+    std::vector<std::string> v;
+    if (slot == 2) v.push_back(pd::texpack::kSlotNone);
+    v.push_back(pd::texpack::kSlotRemastered);
+    v.push_back(pd::texpack::kSlotN64);
+    for (const std::string& p : pd::texpack::ListPacks()) v.push_back(p);
+    return v;
+  }
+
+  template <int Slot>
+  static void PdExpSlotHandler(PPCContext& ctx, uint8_t*) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t op = ctx.r3.u32, data = ctx.r5.u32;
+    uint32_t ret = 0;
+    const std::vector<std::string> choices = SlotChoices(Slot);
     switch (op) {
       case 1:
-        if (mem) {
-          for (size_t i = 0; i < packs.size(); ++i) {
-            std::string shown = packs[i].substr(0, 31);
-            WriteGuestBytes(mem, exp_strings_ + kExpPackNames + uint32_t(i) * 32, shown.c_str(), shown.size() + 1);
-          }
-          WriteGuestU32(mem, data, uint32_t(packs.size() + 1));
-        }
+        if (mem) WriteGuestU32(mem, data, uint32_t(choices.size()));
         break;
       case 3: {
         const uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
-        ret = i >= 1 && i <= packs.size() ? exp_strings_ + kExpPackNames + (i - 1) * 32 : ExpValue(4);
+        ret = i < choices.size() ? ExpChoiceText(mem, choices[i]) : ExpValue(Slot == 2 ? 4 : 0);
         break;
       }
       case 6: {
         const uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
-        const std::string name = i >= 1 && i <= packs.size() ? packs[i - 1] : std::string();
-        if (name != pd::texpack::ChosenPack()) ChooseTexturePack(name);
+        if (i < choices.size() && choices[i] != SlotValue(Slot)) SetTextureSlot(Slot, choices[i]);
         break;
       }
       case 7: {
+        const std::string now = SlotValue(Slot);
         uint32_t i = 0;
-        const std::string chosen = pd::texpack::ChosenPack();
-        for (size_t k = 0; k < packs.size(); ++k)
-          if (packs[k] == chosen) i = uint32_t(k + 1);
+        for (size_t k = 0; k < choices.size(); ++k)
+          if (choices[k] == now) i = uint32_t(k);
         if (mem) WriteGuestU32(mem, data, i);
         break;
       }
@@ -9063,103 +9552,226 @@ class PerfectDarkApp : public rex::ReXApp {
     ctx.r3.u64 = ret;
   }
 
-  // Importing: the Windows file picker on a thread of its own (owned by the
-  // game window, so it stays in front of it, fullscreen included), the import
-  // on that thread too; the result is applied on the UI thread
-  // (TickExperimental). pd_test_pick: a path used instead of the picker.
-  enum class PickKind { kRom, kPack };
+  // ---- Import Texture Pack... -------------------------------------------------
+  // One Windows file picker (owned by the game window, so it stays in front of it, fullscreen
+  // included; on a thread of its own) for files: an N64 ROM, a texture pack's .zip, or
+  // pictures named by texture number (several at once). Its "Import a folder instead..."
+  // button closes it and opens the folder picker, for a pack's folder. What was picked is
+  // identified by its content (pd_assets_import.h Identify), not its extension, and imported
+  // on that thread (RunImport); the results are applied on the UI thread
+  // (TickExperimental). pd_test_pick: a path (several separated by '|') used instead of the
+  // picker. HANDOVER 4du.
   struct PickResult {
-    PickKind kind;
-    bool ok;
+    bool ok, rom;
     std::string message, name;
+    bool info = false;  // "Installing ..." while it works (HANDOVER 4dv): shown, nothing else
   };
+  // Shows `text` at once from the import's thread (the next UI tick).
+  static void ImportProgress(std::string text) {
+    std::lock_guard<std::mutex> lock(pick_mutex_);
+    pick_results_.push_back(PickResult{false, false, std::move(text), {}, true});
+  }
   static inline std::atomic<bool> picker_busy_{false};
   static inline std::mutex pick_mutex_;
   static inline std::vector<PickResult> pick_results_;
 
-  static std::wstring PickFile(HWND owner, PickKind kind) {
-    std::wstring out;
+  // The picker's "Import a folder instead..." button: closes the file picker and asks for the
+  // folder picker next.
+  class PickEvents final : public IFileDialogEvents, public IFileDialogControlEvents {
+   public:
+    bool folder_wanted = false;
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** out) override {
+      if (riid == __uuidof(IUnknown) || riid == __uuidof(IFileDialogEvents)) {
+        *out = static_cast<IFileDialogEvents*>(this);
+      } else if (riid == __uuidof(IFileDialogControlEvents)) {
+        *out = static_cast<IFileDialogControlEvents*>(this);
+      } else {
+        *out = nullptr;
+        return E_NOINTERFACE;
+      }
+      AddRef();
+      return S_OK;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return ULONG(++refs_); }
+    IFACEMETHODIMP_(ULONG) Release() override { return ULONG(--refs_); }  // (on the stack)
+    IFACEMETHODIMP OnFileOk(IFileDialog*) override { return S_OK; }
+    IFACEMETHODIMP OnFolderChanging(IFileDialog*, IShellItem*) override { return S_OK; }
+    IFACEMETHODIMP OnFolderChange(IFileDialog*) override { return S_OK; }
+    IFACEMETHODIMP OnSelectionChange(IFileDialog*) override { return S_OK; }
+    IFACEMETHODIMP OnShareViolation(IFileDialog*, IShellItem*, FDE_SHAREVIOLATION_RESPONSE*) override { return S_OK; }
+    IFACEMETHODIMP OnTypeChange(IFileDialog*) override { return S_OK; }
+    IFACEMETHODIMP OnOverwrite(IFileDialog*, IShellItem*, FDE_OVERWRITE_RESPONSE*) override { return S_OK; }
+    IFACEMETHODIMP OnItemSelected(IFileDialogCustomize*, DWORD, DWORD) override { return S_OK; }
+    IFACEMETHODIMP OnButtonClicked(IFileDialogCustomize* customize, DWORD id) override {
+      if (id != kFolderButton) return S_OK;
+      folder_wanted = true;
+      IFileDialog* dialog = nullptr;
+      if (SUCCEEDED(customize->QueryInterface(IID_PPV_ARGS(&dialog)))) {
+        dialog->Close(HRESULT_FROM_WIN32(ERROR_CANCELLED));
+        dialog->Release();
+      }
+      return S_OK;
+    }
+    IFACEMETHODIMP OnCheckButtonToggled(IFileDialogCustomize*, DWORD, BOOL) override { return S_OK; }
+    IFACEMETHODIMP OnControlActivating(IFileDialogCustomize*, DWORD) override { return S_OK; }
+    static constexpr DWORD kFolderButton = 1;
+
+   private:
+    long refs_ = 1;
+  };
+
+  static std::vector<std::filesystem::path> PickForImport(HWND owner) {
+    std::vector<std::filesystem::path> out;
     const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    IFileOpenDialog* dialog = nullptr;
-    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
-      DWORD options = 0;
-      dialog->GetOptions(&options);
-      dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
-      const COMDLG_FILTERSPEC rom[] = {{L"N64 ROM (*.z64, *.n64, *.v64)", L"*.z64;*.n64;*.v64"},
-                                       {L"All files", L"*.*"}};
-      const COMDLG_FILTERSPEC pack[] = {{L"Texture pack (its .zip, or any picture in its folder)", L"*.zip;*.png"},
-                                        {L"All files", L"*.*"}};
-      dialog->SetFileTypes(2, kind == PickKind::kRom ? rom : pack);
-      dialog->SetTitle(kind == PickKind::kRom ? L"Import your N64 Perfect Dark ROM"
-                                              : L"Import a texture pack: its .zip, or any picture in its folder");
-      IShellItem* item = nullptr;
-      if (SUCCEEDED(dialog->Show(owner)) && SUCCEEDED(dialog->GetResult(&item))) {
+    auto paths_of = [&out](IShellItemArray* items) {
+      DWORD n = 0;
+      if (!items || FAILED(items->GetCount(&n))) return;
+      for (DWORD i = 0; i < n; ++i) {
+        IShellItem* item = nullptr;
+        if (FAILED(items->GetItemAt(i, &item))) continue;
         PWSTR path = nullptr;
         if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-          out = path;
+          out.emplace_back(path);
           CoTaskMemFree(path);
         }
         item->Release();
       }
+    };
+    PickEvents events;
+    IFileOpenDialog* dialog = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+      DWORD options = 0;
+      dialog->GetOptions(&options);
+      dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_ALLOWMULTISELECT);
+      const COMDLG_FILTERSPEC types[] = {
+          {L"Texture packs, pictures and N64 ROMs (*.zip, *.png, *.jpg, *.z64, *.n64, *.v64)",
+           L"*.zip;*.png;*.jpg;*.jpeg;*.z64;*.n64;*.v64"},
+          {L"All files", L"*.*"}};
+      dialog->SetFileTypes(2, types);
+      dialog->SetTitle(L"Import: an N64 ROM, a texture pack's .zip, or pictures named by texture number");
+      dialog->SetOkButtonLabel(L"Import");
+      IFileDialogCustomize* customize = nullptr;
+      if (SUCCEEDED(dialog->QueryInterface(IID_PPV_ARGS(&customize)))) {
+        customize->AddPushButton(PickEvents::kFolderButton, L"Import a folder instead...");
+        customize->Release();
+      }
+      DWORD cookie = 0;
+      const bool advised = SUCCEEDED(dialog->Advise(&events, &cookie));
+      if (SUCCEEDED(dialog->Show(owner))) {
+        IShellItemArray* items = nullptr;
+        if (SUCCEEDED(dialog->GetResults(&items))) {
+          paths_of(items);
+          items->Release();
+        }
+      }
+      if (advised) dialog->Unadvise(cookie);
       dialog->Release();
+    }
+    if (events.folder_wanted && out.empty()) {
+      IFileOpenDialog* folders = nullptr;
+      if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&folders)))) {
+        DWORD options = 0;
+        folders->GetOptions(&options);
+        folders->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_PICKFOLDERS);
+        folders->SetTitle(L"Import a texture pack's folder");
+        folders->SetOkButtonLabel(L"Import");
+        if (SUCCEEDED(folders->Show(owner))) {
+          IShellItemArray* items = nullptr;
+          if (SUCCEEDED(folders->GetResults(&items))) {
+            paths_of(items);
+            items->Release();
+          }
+        }
+        folders->Release();
+      }
     }
     if (SUCCEEDED(co)) CoUninitialize();
     return out;
   }
 
-  static void StartImport(PickKind kind) {
+  // Imports what was picked: each folder or .zip as a texture pack, each N64 ROM as the ROM,
+  // and the pictures together as one new pack; anything else is named and refused. On the
+  // picker's thread (or the test pipe's); the results go to TickExperimental.
+  static void RunImport(const std::vector<std::filesystem::path>& picked, bool test) {
+    std::vector<PickResult> results;
+    std::vector<std::filesystem::path> pictures;
+    for (const std::filesystem::path& src : picked) {
+      std::string detail;
+      const pd::assets::InputKind kind = pd::assets::Identify(src, &detail);
+      REXLOG_INFO("[import] {}: {}", pd::update::Narrow(src.wstring()),
+                  kind == pd::assets::InputKind::kFolder  ? "a folder"
+                  : kind == pd::assets::InputKind::kZip   ? "a .zip"
+                  : kind == pd::assets::InputKind::kRom   ? "an N64 ROM"
+                  : kind == pd::assets::InputKind::kPicture ? "a picture"
+                                                            : "not usable");
+      PickResult r{false, false, {}, {}};
+      switch (kind) {
+        case pd::assets::InputKind::kFolder:
+        case pd::assets::InputKind::kZip: {
+          int count = 0;
+          ImportProgress("Installing texture pack \"" +
+                         pd::assets::ReadablePackName(pd::update::Narrow(
+                             (kind == pd::assets::InputKind::kZip ? src.stem() : src.filename()).wstring())) +
+                         "\"...");
+          r.ok = pd::assets::ImportTexturePack(src, pd::texpack::PacksFolder(), &r.name, &count, &r.message);
+          break;
+        }
+        case pd::assets::InputKind::kRom:
+          r.rom = true;
+          ImportProgress("Reading the N64 ROM " + pd::update::Narrow(src.filename().wstring()) + "...");
+          r.ok = pd::assets::ImportN64Rom(src, pd::n64tex::RomFolder(), &r.name, &r.message);
+          break;
+        case pd::assets::InputKind::kPicture:
+          pictures.push_back(src);
+          continue;
+        default:
+          r.message = "Not imported: " + pd::update::Narrow(src.filename().wstring()) + " - " + detail + ".";
+          break;
+      }
+      results.push_back(std::move(r));
+    }
+    if (!pictures.empty()) {
+      PickResult r{false, false, {}, {}};
+      int count = 0;
+      ImportProgress("Adding " + std::to_string(pictures.size()) +
+                     (pictures.size() == 1 ? " picture" : " pictures") + " as a texture pack...");
+      r.ok = pd::assets::ImportPictures(pictures, pd::texpack::PacksFolder(), &r.name, &count, &r.message);
+      results.push_back(std::move(r));
+    }
+    for (const PickResult& r : results) REXLOG_INFO("[import] {}{}", test ? "(test) " : "", r.message);
+    std::lock_guard<std::mutex> lock(pick_mutex_);
+    for (PickResult& r : results) pick_results_.push_back(std::move(r));
+  }
+
+  static void StartImport() {
     PerfectDarkApp* app = current_instance_;
     if (!app || picker_busy_.exchange(true)) return;
     HWND owner = app->window() ? static_cast<HWND>(app->window()->GetNativeWindowHandle()) : nullptr;
     const std::string test_pick = rex::cvar::GetFlagByName("pd_test_pick");
-    std::thread([owner, kind, test_pick]() {
-      std::filesystem::path src = test_pick.empty() ? std::filesystem::path(PickFile(owner, kind))
-                                                    : std::filesystem::path(std::u8string(test_pick.begin(), test_pick.end()));
-      PickResult r{kind, false, {}, {}};
-      if (!src.empty()) {
-        REXLOG_INFO("[experimental] import {}: {}", kind == PickKind::kRom ? "N64 ROM" : "texture pack",
-                    pd::update::Narrow(src.wstring()));
-        if (kind == PickKind::kRom) {
-          r.ok = pd::assets::ImportN64Rom(src, pd::n64tex::RomFolder(), &r.name, &r.message);
-        } else {
-          // A picture inside a pack's folder stands for the folder. An N64 emulator
-          // pack ("Perfect Dark#<crc>#..." pictures in level sub-folders) is the
-          // folder named like the game, above the picture.
-          std::error_code ec;
-          if (!std::filesystem::is_directory(src, ec)) {
-            if (pd::assets::PackFileId(src) >= 0) {
-              src = src.parent_path();
-            } else if (pd::assets::IsPackFile(src)) {
-              const std::wstring stem = src.stem().wstring();
-              const std::wstring game = stem.substr(0, stem.find(L'#'));
-              std::filesystem::path root = src.parent_path();
-              for (std::filesystem::path p = root; !p.empty() && p != p.parent_path(); p = p.parent_path())
-                if (_wcsicmp(p.filename().c_str(), game.c_str()) == 0) {
-                  root = p;
-                  break;
-                }
-              src = root;
-            }
-          }
-          int pictures = 0;
-          r.ok = pd::assets::ImportTexturePack(src, pd::texpack::PacksFolder(), &r.name, &pictures, &r.message);
+    std::thread([owner, test_pick]() {
+      std::vector<std::filesystem::path> picked;
+      if (test_pick.empty()) {
+        picked = PickForImport(owner);
+      } else {
+        for (size_t start = 0; start <= test_pick.size();) {
+          const size_t bar = test_pick.find('|', start);
+          const std::string one = test_pick.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+          if (!one.empty()) picked.push_back(std::filesystem::path(std::u8string(one.begin(), one.end())));
+          if (bar == std::string::npos) break;
+          start = bar + 1;
         }
-        REXLOG_INFO("[experimental] {}", r.message);
-        std::lock_guard<std::mutex> lock(pick_mutex_);
-        pick_results_.push_back(std::move(r));
       }
+      if (!picked.empty()) RunImport(picked, false);
       picker_busy_ = false;
     }).detach();
   }
 
-  static void PdExpImportRomHandler(PPCContext& ctx, uint8_t*) {
-    if (ctx.r3.u32 == 6) StartImport(PickKind::kRom);
+  static void PdExpImportHandler(PPCContext& ctx, uint8_t*) {
+    if (ctx.r3.u32 == 6) StartImport();
     ctx.r3.u64 = 0;
   }
-  static void PdExpImportPackHandler(PPCContext& ctx, uint8_t*) {
-    if (ctx.r3.u32 == 6) StartImport(PickKind::kPack);
-    ctx.r3.u64 = 0;
-  }
+
+  // ---- Texture Tools ------------------------------------------------------------
   static void PdExpOpenFolderHandler(PPCContext& ctx, uint8_t*) {
     if (ctx.r3.u32 == 6) {
       const std::filesystem::path folder = pd::texpack::PacksFolder();
@@ -9167,16 +9779,6 @@ class PerfectDarkApp : public rex::ReXApp {
       std::filesystem::create_directories(folder, ec);
       ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
-    ctx.r3.u64 = 0;
-  }
-  // Dump All Textures: every Textures.raw texture, and every N64 picture with a ROM
-  // imported, into resources\userdata\texture-dump (pd_texture_dump.h), in the
-  // background. The as-drawn dump (only what a scene draws) stays as the cvar
-  // pd_texture_dump.
-  static void PdExpDumpHandler(PPCContext& ctx, uint8_t*) {
-    if (ctx.r3.u32 == 6 &&
-        !pd::texdump::StartDumpAll([](const std::string& text) { rex::kernel::xam::netplay::ShowNotice(text); }))
-      rex::kernel::xam::netplay::ShowNotice("Dump All Textures is already running.");
     ctx.r3.u64 = 0;
   }
   static void PdExpOpenDumpHandler(PPCContext& ctx, uint8_t*) {
@@ -9189,51 +9791,145 @@ class PerfectDarkApp : public rex::ReXApp {
     ctx.r3.u64 = 0;
   }
 
-  // Builds the page (once; PatchVideoOptionsMenu, before its rows).
-  static void BuildExperimentalPage(rex::memory::Memory* mem, rex::runtime::FunctionDispatcher* fd) {
-    if (exp_dialog_ || !fd) return;
-    WriteExpStrings(mem);
-    if (!exp_strings_) return;
-    const uint32_t title = fd->AllocateThunk(&PdExpLabel<kExpTitle>, 0);
-    struct Row {
-      uint32_t type, flags;
-      PPCFunc* label;
-      PPCFunc* handler;
+  // Dump Game Textures...: a list (a dropdown, as the Texture Pack rows') of the texture
+  // sources - Remastered first, N64 when a ROM is imported, then every installed pack by
+  // name - read again each time it opens; choosing one dumps it in the background, into a
+  // folder of its own under resources\userdata\texture-dump (pd_texture_dump.h StartDump),
+  // with a notice when it starts and one when it is done or failed. The row shows the source
+  // dumped last. The as-drawn dump (only what a scene draws) stays as the cvar pd_texture_dump.
+  static inline std::string dump_shown_ = pd::texpack::kSlotRemastered;
+  static std::vector<std::string> DumpSources() {
+    std::vector<std::string> v{pd::texpack::kSlotRemastered};
+    if (pd::n64tex::RomPresent()) v.push_back(pd::texpack::kSlotN64);
+    for (const std::string& p : pd::texpack::ListPacks()) v.push_back(p);
+    return v;
+  }
+  static void StartDumpSource(const std::string& source, bool test) {
+    auto notice = [test](const std::string& text) {
+      if (test) REXLOG_INFO("[test] dump: {}", text);
+      rex::kernel::xam::netplay::ShowNotice(text);
     };
-    // Spinner rows (0x0C) as Settings > Graphics' own; press rows (0x04, no
-    // dialog flag) as Check for Updates.
-    const Row rows[] = {
-        {0x0C000000, 0, &PdExpLabel<kExpTextures>, &PdExpTexturesHandler},
-        {0x0C000000, 0, &PdExpLabel<kExpPack>, &PdExpPackHandler},
-        {0x04000000, 0, &PdExpLabel<kExpImportRom>, &PdExpImportRomHandler},
-        {0x04000000, 0, &PdExpLabel<kExpImportPack>, &PdExpImportPackHandler},
-        {0x04000000, 0, &PdExpLabel<kExpOpenFolder>, &PdExpOpenFolderHandler},
-        {0x04000000, 0, &PdExpLabel<kExpDump>, &PdExpDumpHandler},
-        {0x04000000, 0, &PdExpLabel<kExpOpenDump>, &PdExpOpenDumpHandler},
-    };
-    constexpr uint32_t kRows = sizeof(rows) / sizeof(rows[0]);
-    const uint32_t items = mem->SystemHeapAlloc((kRows + 1) * 20 + 24);
-    if (!title || !items) return;
-    for (uint32_t i = 0; i < kRows; ++i) {
-      const uint32_t label = fd->AllocateThunk(rows[i].label, 0), handler = fd->AllocateThunk(rows[i].handler, 0);
-      if (!label || !handler) return;
+    const std::vector<std::string> sources = DumpSources();
+    if (std::find(sources.begin(), sources.end(), source) == sources.end()) {
+      notice("Dump Game Textures: \"" + source + "\" isn't a texture source here.");
+      return;
+    }
+    dump_shown_ = source;
+    if (!pd::texdump::StartDump(source, notice)) notice("A texture dump is already running.");
+  }
+  static void PdExpDumpHandler(PPCContext& ctx, uint8_t*) {
+    PerfectDarkApp* app = current_instance_;
+    auto* mem = (app && app->runtime()) ? app->runtime()->memory() : nullptr;
+    const uint32_t op = ctx.r3.u32, data = ctx.r5.u32;
+    uint32_t ret = 0;
+    const std::vector<std::string> sources = DumpSources();
+    switch (op) {
+      case 1:
+        if (mem) WriteGuestU32(mem, data, uint32_t(sources.size()));
+        break;
+      case 3: {
+        const uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        ret = i < sources.size() ? ExpChoiceText(mem, sources[i]) : ExpValue(0);
+        break;
+      }
+      case 6: {
+        const uint32_t i = mem ? ReadGuestU32(mem, data) : 0;
+        // (op 6 comes when a choice is confirmed with A, not while moving through the list:
+        // checked with the test pipe, HANDOVER 4du)
+        if (i < sources.size()) StartDumpSource(sources[i], false);
+        break;
+      }
+      case 7: {
+        uint32_t i = 0;
+        for (size_t k = 0; k < sources.size(); ++k)
+          if (sources[k] == dump_shown_) i = uint32_t(k);
+        if (mem) WriteGuestU32(mem, data, i);
+        break;
+      }
+      default:
+        break;
+    }
+    ctx.r3.u64 = ret;
+  }
+
+  // A page of press / spinner rows (the game's dialog layout: 20-byte items ending in
+  // 0x1D, then the 24-byte dialog). Spinner rows (0x0C) as Settings > Graphics' own;
+  // press rows (0x04, no dialog flag) as Check for Updates; a row that opens a page
+  // (flag 0x04, the dialog in place of the handler) as Texture Packs itself is opened.
+  // Returns the dialog (0 if it couldn't be made).
+  struct ExpRow {
+    uint32_t type, flags;
+    PPCFunc* label;
+    PPCFunc* handler;     // or null with `opens`
+    uint32_t opens = 0;   // the dialog this row opens
+  };
+  static uint32_t BuildRowsPage(rex::memory::Memory* mem, rex::runtime::FunctionDispatcher* fd, PPCFunc* title_fn,
+                                const ExpRow* rows, uint32_t count, const char* what) {
+    const uint32_t title = fd->AllocateThunk(title_fn, 0);
+    const uint32_t items = mem->SystemHeapAlloc((count + 1) * 20 + 24);
+    if (!title || !items) return 0;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t label = fd->AllocateThunk(rows[i].label, 0);
+      const uint32_t handler = rows[i].handler ? fd->AllocateThunk(rows[i].handler, 0) : rows[i].opens;
+      if (!label || !handler) return 0;
       const uint32_t words[5] = {rows[i].type, rows[i].flags, label, 0, handler};
       for (int w = 0; w < 5; ++w) WriteGuestU32(mem, items + i * 20 + uint32_t(w) * 4, words[w]);
     }
-    const uint32_t term = items + kRows * 20;
+    const uint32_t term = items + count * 20;
     WriteGuestU32(mem, term, 0x1D000000);
     for (int w = 1; w < 5; ++w) WriteGuestU32(mem, term + uint32_t(w) * 4, 0);
     const uint32_t dialog = term + 20;
     const uint32_t dialog_words[6] = {0x01000000, title, items, 0, 0, 0};
     for (int w = 0; w < 6; ++w) WriteGuestU32(mem, dialog + uint32_t(w) * 4, dialog_words[w]);
-    exp_dialog_ = dialog;
-    REXLOG_INFO("[menu_patch] Experimental dialog at 0x{:08X} (items 0x{:08X})", dialog, items);
+    REXLOG_INFO("[menu_patch] {} dialog at 0x{:08X} (items 0x{:08X})", what, dialog, items);
+    return dialog;
+  }
+
+  // Builds the page (once; PatchVideoOptionsMenu, before its rows), in the order the user
+  // asked for (4du): Texture Pack 1, Texture Pack 2, Import Texture Pack..., Texture Tools;
+  // Texture Tools: Open Texture Packs Folder, Open Texture Dump Folder, Dump Game Textures....
+  static void BuildExperimentalPage(rex::memory::Memory* mem, rex::runtime::FunctionDispatcher* fd) {
+    if (exp_dialog_ || !fd) return;
+    WriteExpStrings(mem);
+    if (!exp_strings_) return;
+    const ExpRow tools[] = {
+        {0x04000000, 0, &PdExpLabel<kExpOpenFolder>, &PdExpOpenFolderHandler},
+        {0x04000000, 0, &PdExpLabel<kExpOpenDump>, &PdExpOpenDumpHandler},
+        {0x0C000000, 0, &PdExpLabel<kExpDump>, &PdExpDumpHandler},
+    };
+    const uint32_t tools_dialog =
+        BuildRowsPage(mem, fd, &PdExpLabel<kExpTools>, tools, uint32_t(std::size(tools)), "Texture Tools");
+    if (!tools_dialog) return;
+    const ExpRow rows[] = {
+        {0x0C000000, 0, &PdExpSlotLabel<1>, &PdExpSlotHandler<1>},
+        {0x0C000000, 0, &PdExpSlotLabel<2>, &PdExpSlotHandler<2>},
+        {0x04000000, 0, &PdExpLabel<kExpImport>, &PdExpImportHandler},
+        {0x04000000, 0x00000004, &PdExpLabel<kExpTools>, nullptr, tools_dialog},
+    };
+    exp_dialog_ = BuildRowsPage(mem, fd, &PdExpLabel<kExpTitle>, rows, uint32_t(std::size(rows)), "Texture Packs");
   }
 
   // Each frame (UI thread): applies finished imports.
   static void TickExperimental() {
-    pd::texpack::Init();
-    // An N64 emulator pack waits for the ROM's texture checksums: matched once loaded.
+    EnsureTextureSlots();
+    TickApply();
+    TickPackLooks();
+    TickPacksToMeasure();
+    // An N64 emulator pack waits for the ROM's texture checksums, a PC-port pack's
+    // per-model pictures for its file names: matched once loaded. The per-model
+    // pictures also replace the remaster's copies of those textures, so the ROM is
+    // loaded for them with the remastered look too (nothing else changes: N64
+    // drawing needs pd_n64_textures as well).
+    if (const auto index = pd::texpack::CurrentIndex();
+        index && index->waiting_for_rom && index->model_files > 0 && PlumeRunning() &&
+        pd::n64tex::GetStatus() == pd::n64tex::Status::kIdle) {
+      static auto last_look = std::chrono::steady_clock::time_point{};
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_look > std::chrono::seconds(5)) {  // (RomPresent lists a folder)
+        last_look = now;
+        if (pd::n64tex::RomPresent()) pd::n64tex::BeginLoad();
+      }
+    }
     pd::texpack::RebuildIfWaiting();
     std::vector<PickResult> results;
     {
@@ -9242,23 +9938,40 @@ class PerfectDarkApp : public rex::ReXApp {
     }
     for (const PickResult& r : results) {
       std::string text = r.message;
-      if (r.ok && r.kind == PickKind::kRom) {
+      if (r.info) {
+        REXLOG_INFO("[import] notice: {}", text);
+        rex::kernel::xam::netplay::ShowNotice(text);
+        continue;
+      }
+      if (r.ok && r.rom && pd::n64tex::GetStatus() == pd::n64tex::Status::kReady &&
+          pd::n64tex::StatusDetail() != r.name) {
+        // Another version than the one loaded: the renderer keeps drawing from the loaded ROM
+        // (its pictures, rooms and models), so the new one is used from the next start (4dv).
+        text += " Restart the game to use it (the " + pd::n64tex::StatusDetail() + " ROM stays in use until then).";
+      } else if (r.ok && r.rom) {
+        // The slots stay as they are (the user, 4dn): a slot that wants the N64 look
+        // (N64, or a pack made for it drawn over the remastered meanwhile) gets it now. A
+        // pack shown is applied again: its look measured without a ROM is measured again
+        // with it (nothing changes if it is still the remastered).
         pd::n64tex::Reload();
-        if (PlumeRunning() && !pd::n64tex::Enabled()) {
-          pd::n64tex::SetEnabled(true);
-          SavePcSettings();
-          text += " Textures: N64.";
-        }
-      } else if (r.ok && r.kind == PickKind::kPack) {
-        pd::texpack::ListPacks(true);
+        const int shown = pd::texpack::ActiveSlot();
+        const auto wants_n64 = [](const std::string& v) {
+          return v == pd::texpack::kSlotN64 || (IsPackValue(v) && pd::texpack::PackPrefersN64(v));
+        };
+        if (PlumeRunning() && ((SlotValue(shown) == pd::texpack::kSlotN64 && !pd::n64tex::Enabled()) ||
+                               IsPackValue(SlotValue(shown))))
+          ApplyTextureSlot(shown, true);
+        if (!wants_n64(SlotValue(1)) && !wants_n64(SlotValue(2)))
+          text += " Choose N64 in Texture Pack 1 or 2 to see it.";
+      } else if (r.ok) {
+        PackInstalledNow(r.name);  // installed only: chosen in the Texture Pack rows (4dr)
         if (PlumeRunning()) {
-          pd::texpack::ChoosePack(r.name);
-          SavePcSettings();
-          text += " Texture Pack: " + r.name + ".";
+          text += " Choose it in Texture Pack 1 or 2.";
         } else {
           text += " Texture packs need the Plume renderer.";
         }
       }
+      REXLOG_INFO("[import] notice: {}", text);
       rex::kernel::xam::netplay::ShowNotice(text);
     }
   }
@@ -9269,8 +9982,9 @@ class PerfectDarkApp : public rex::ReXApp {
     using pd::n64tex::Status;
     static auto first = std::chrono::steady_clock::now();
     static Status last = Status::kIdle;
+    EnsureTextureSlots();  // (first: it sets pd_n64_textures from the slot shown)
     // D-pad Down in play (FilterGamepad, on the input thread) switches here.
-    if (pad_switch_requested_.exchange(false)) ToggleN64Textures();
+    if (pad_switch_requested_.exchange(false)) ToggleTextureSlot();
     // Switched on (saved, or set by the test pipe) and nothing loaded yet.
     if (pd::n64tex::GetStatus() == Status::kIdle && pd::n64tex::Enabled() && PlumeRunning()) pd::n64tex::BeginLoad();
     const Status s = pd::n64tex::GetStatus();
@@ -10119,7 +10833,7 @@ inline void PerfectDarkInputTracker::OnDraw(ImGuiIO& /*io*/) {
       for (const int vk : PerfectDarkApp::N64TexturesKeys())
         if (GetAsyncKeyState(vk) & 0x8000) n64_down = true;
     }
-    if (n64_down && !n64_key_was_down_) PerfectDarkApp::ToggleN64Textures();
+    if (n64_down && !n64_key_was_down_) PerfectDarkApp::ToggleTextureSlot();
     n64_key_was_down_ = n64_down;
 
     // Lighting capture (pd_light_capture): F9 or Insert logs the next frame's

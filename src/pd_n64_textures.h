@@ -34,6 +34,9 @@ std::string StatusDetail();
 // Where the player's ROM goes: resources\n64 (the dev build: n64 beside the
 // exe); resources\assets\n64, the first test version's folder, is still read.
 std::filesystem::path RomFolder();
+// The test pipe's n64aligntest: the Japanese ROM's shape matching (pd_n64_textures.cpp) tried
+// on the loaded ROM's own table with 8 made-up entries put in; a line saying how it did.
+std::string AlignSelfTest();
 // True when RomFolder() holds a .z64 / .n64 / .v64 file (not checked further).
 bool RomPresent();
 
@@ -52,6 +55,12 @@ constexpr int kTextureCount = 3503;  // ids 0-3502 are the N64 ones
 bool IsModelTexture(int id);
 // Every such remaster id, ascending (Dump All Textures).
 std::vector<int> ModelTextureIds();
+// The remaster id of the texture N64 file `file` keeps at byte `offset`, or -1.
+int ModelTextureAt(int file, uint32_t offset);
+// The N64 file number of a file name ("PcaseZ"), from the loaded ROM's own name
+// table; -1 if it hasn't that name or the ROM isn't Ready. (The PC port's texture
+// packs name in-file textures "<file name>\<offset in hex>.png".)
+int RomFileByName(const std::string& name);
 
 // N64 emulator hi-res packs (Rice / GLideN64 naming, pd_texture_packs.cpp): every N64
 // texture id (0-3502 and the in-file ones) by its hi-res checksum (n64dec::HiresCrc).
@@ -72,6 +81,8 @@ bool ModelsActive();
 // files (pd_n64_rooms.cpp). RoomsDrawing(): and at least one room was this stage.
 bool RoomsActive();
 bool RoomsDrawing();
+// pd_n64_rooms alone (the rooms would be drawn from the ROM in the N64 look).
+bool RoomsWanted();
 // True while Active() and pd_n64_sky: the sky function (sub_8223B0C8) takes the game's
 // own N64 sky path (sky_render) instead of the remaster's skybox (PdHookN64Sky).
 bool SkyActive();

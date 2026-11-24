@@ -139,7 +139,8 @@ KEYBOARD AND MOUSE
   Crouch                Ctrl
   Objectives            Tab
   Pause                 Esc
-  Switch graphics       G (N64 / remastered, once an N64 ROM is imported)
+  Switch graphics       G (Texture Pack 1 / Texture Pack 2, Settings > Graphics >
+                        Texture Packs; nothing until Texture Pack 2 is set)
   Mouse sensitivity     1.5, invert look off
   In menus              Point with the mouse to highlight, left button selects,
                         right button goes back, wheel moves a row at a time.
@@ -153,7 +154,8 @@ two pages of PC options for it:
                         slower near the centre for precise aiming; full tilt is
                         unchanged). "Original" plays as the game always did.
   Advanced Control      from Rare's 2010 Xbox 360 update: Legacy (left stick moves
-                        and turns, right stick strafes and looks up and down),
+                        and turns, right stick strafes and looks up and down;
+                        holding Aim, the left stick aims),
                         Southpaw (sticks swapped), Swap Triggers, Secondary Fire
                         Reset, Lock Sight (the crosshair stays centred while you
                         turn), and Aim Sensitivity (how fast you aim while
@@ -244,43 +246,165 @@ DISPLAY
   evenly spaced, at the cost of about half a frame more lag. It is off by
   default.
 
-EXPERIMENTAL: N64 TEXTURES AND TEXTURE PACKS
-  Settings > Graphics > Experimental. Work in progress; Plume only.
+TEXTURE PACKS AND N64 TEXTURES
+  Settings > Graphics > Texture Packs. Work in progress; Plume only. The page
+  has four rows: Texture Pack 1, Texture Pack 2, Import Texture Pack... and
+  Texture Tools.
 
-  N64 textures: Import N64 ROM and choose your own N64 Perfect Dark ROM
-  (.z64, .n64 or .v64; the NTSC and PAL versions). It is checked and copied
-  to resources\n64, and Textures switches between N64 and Remastered on the
-  fly, with no restart. The G key switches too, anywhere (change it under Settings > Keyboard & Mouse >
-  Switch Graphics), and so does D-pad Down on a controller during play. N64
-  mode draws the N64's textures, characters, guns, props, level rooms, skies
-  (with the N64's star field where it had one) and water from your ROM; the
-  HUD, crosshair, fonts and menus keep their remastered look. It only changes what you see: in a network match each
+  Texture Pack 1 and Texture Pack 2 are the two looks the G key switches
+  between, anywhere, on the fly (change the key under Settings > Keyboard &
+  Mouse > Switch Graphics; D-pad Down on a controller during play does the
+  same). Each can be Remastered, N64 (with your N64 ROM imported) or any
+  texture pack you have; Texture Pack 2 can also be None, and then G does
+  nothing. Out of the box Texture Pack 1 is Remastered and Texture Pack 2 is
+  None. Choosing a value shows it at once. The game always starts on Texture
+  Pack 1 (G's choice lasts until you quit). A pack is drawn over the look it was
+  made for (the game works this out from the pack's pictures: PD Forever over
+  the N64 look, Ultimate and XBLA Plus over the remastered one; without an N64
+  ROM, over the remastered one). A pack you import shows up in both lists
+  straight away; nothing switches on by itself.
+
+  A pack is switched in one go: the first time it is used the game checks its
+  pictures (usually under a second, a few seconds from a slow disk), then loads
+  the ones on screen while the old look stays, then switches. Meanwhile its
+  row says "Texture Pack 1 (applying)". A pack chosen last time is ready
+  before the title screen. Once both Texture Packs are set, the one not shown
+  is kept ready in the background, so G switches in the next frame with
+  nothing loading. That uses some extra video memory while Texture Pack 2 is
+  set (about what the other look's pictures on screen take: with Ultimate and
+  Forever in the Carrington Institute, under 200 MB); with Texture Pack 2
+  None nothing extra is kept. When a level starts (and at a cutscene's cuts)
+  with a pack shown, the picture waits a moment, at most a couple of seconds,
+  until the pack's pictures for it are loaded, so they appear at once instead
+  of popping in.
+
+  Import Texture Pack... opens one Windows file picker for everything:
+    - your own N64 Perfect Dark ROM (.z64, .n64 or .v64, any byte order:
+      NTSC-U 1.0 and 1.1, PAL and NTSC-J, the last not tested yet; checked
+      by its content, not its name, so a modified or bad dump is refused with
+      the reason),
+    - a texture pack's .zip,
+    - pictures named by texture number (several at once): they become a new
+      pack named after their folder; pictures without such a name are left
+      out, as the game can't tell which texture they replace.
+  For a pack that is a folder, press "Import a folder instead..." in the
+  picker and choose the folder. The ROM is copied to resources\n64 and packs
+  to resources\texture-packs (Texture Tools > Open Texture Packs Folder shows
+  it; a folder copied there by hand works too). An installed pack is never
+  replaced: importing the same pack again (even under another name) says it is
+  already installed, and a different pack under a name that is taken is
+  installed as "Name (2)". A pack's name comes from its .zip or folder, made
+  readable (PD.Forever.Plus.HD.v0.10.zip becomes "PD Forever Plus HD v0.10").
+  A notice says when an import starts and how it ended. A different N64 ROM
+  imported while the game runs is used from the next start.
+  Only pictures (real PNG and JPEG files) and .txt / .md notes are copied
+  from what you import; anything else in a pack is ignored, and a .zip that
+  would write outside its own folder is refused. Nothing in a pack is ever
+  run.
+
+  N64 textures: once the ROM is imported, choose N64 for Texture Pack 1 or 2
+  (importing it doesn't change them). N64 mode draws the N64's textures,
+  characters, guns, props, level rooms, skies (with the N64's star field where
+  it had one) and water from your ROM; the HUD, crosshair, fonts and menus
+  keep their remastered look. With the Japanese (NTSC-J) ROM, only the N64
+  textures are drawn (its characters, guns, props and rooms stay remastered);
+  it is not tested yet. It only changes what you see: in a network match each
   player can use either look. This download contains no N64 data: only your
   ROM is read.
 
-  Texture packs: Import Texture Pack and choose a pack's .zip, or any
-  picture inside the pack's folder. Packs go to resources\texture-packs (Open
-  Texture Packs Folder shows it; a folder copied there by hand works too),
-  and Texture Pack picks one or None. A pack is drawn over the N64 or the
-  remastered textures, so both can be on at once.
+  To compare a pack with the game's own textures, set Texture Pack 2 to
+  Remastered (or N64) and press G.
+
+  Packs made for the N64 PC port and Dabs Mod (ext_tex packs, such as the
+  Perfect Dark Plus HD packs from github.com/retro-foundry/Perfect-Dark-Plus-
+  HD-Textures: download them there, then import the .zip) work as they are:
+  pictures named by texture number in hexadecimal ("00C6.png", "000f.jpg"),
+  PNG or JPEG. Pictures in the pack's own folder are drawn over the N64
+  textures and, where they fit, over the remastered ones; pictures in its
+  "xbla" folder are drawn over the remastered textures first, including HD
+  versions of the game's fonts. Folders named after N64 model files (such as
+  PcaseZ) are matched to those models' textures through your N64 ROM. The PC
+  port's own font folders (pictures of the N64 fonts, which this game doesn't
+  use) are left out. A picture made for a texture of another shape is
+  skipped, so a pack made for the N64 textures doesn't smear across the
+  remaster's reworked surfaces; those keep their remastered picture. The
+  packs are their makers' work and are not part of this download.
 
   N64 emulator HD packs (made for N64 emulators, pictures named like
   "Perfect Dark#1A2B3C4D#2#0#..._ciByRGBA.png", the Rice / GLideN64 hi-res
-  naming) work too: import the pack's .zip or any picture in it. They are
-  matched to the game's textures through your own N64 ROM, so they need it
-  imported, and they show in N64 mode.
+  naming) work too: import the pack's .zip or folder. They are matched to the
+  game's textures through your own N64 ROM, so they need it imported, and
+  they are drawn over the N64 look.
 
-  Making a pack: Dump All Textures saves every texture of the game as
-  resources\userdata\texture-dump\remastered\<number>.png and, with your N64
-  ROM imported, every N64 texture as ...\n64\<number>.png (it takes about a
-  minute; a notice says when it's done). Open Texture Dump Folder opens it.
-  Edit them at any size up to 4096 x 4096 and put them in a folder named
-  after your pack, keeping the number at the start of each file name
-  ("0123.png" or "0123 wall.png"). PNG only. Pictures a pack leaves out keep
-  the game's own. A picture the game can't use (not a PNG, too large) is
-  skipped and named in the log. To see which numbers a scene uses, set
-  pd_texture_dump = true in resources\userdata\perfect_dark.toml: then only
-  the textures the game draws are saved, as it draws them.
+  Making a pack: Texture Tools > Dump Game Textures... opens a list of the
+  texture sources: Remastered (always first), N64 (with your ROM imported)
+  and every pack you have. Choose one and its textures are saved in the same
+  layout as those packs, each source in a folder of its own under
+  resources\userdata\texture-dump:
+    - Remastered: every remastered texture as ext_tex\xbla\<number>.png,
+    - N64: every N64 texture as ext_tex\<number>.png,
+    - a pack: what the game takes from that pack, as packs\<pack>\<number>.png
+      (and its xbla folder), with dump-summary.txt saying what was left out.
+  Numbers are in hexadecimal, pictures the right way up; files already there
+  are left alone. A notice says when it starts and when it's done (the
+  remastered dump takes about a minute). Texture Tools > Open Texture Dump
+  Folder opens it. Edit them at any size up to 4096 x 4096 (PNG, or JPEG for
+  pictures without transparency) and put them in a folder named after your
+  pack, the same way: N64 textures at its top, remastered ones in its "xbla"
+  folder. Pictures a pack leaves out keep the game's own. A picture the game
+  can't use (damaged, too large, or the wrong shape) is skipped and named in
+  the log. To see which numbers a scene uses, set pd_texture_dump = true in
+  resources\userdata\perfect_dark.toml: then only the textures the game draws
+  are saved, as it draws them.
+
+  A pack's settings file: a text file named pd-pack.txt in the pack's folder
+  (beside its pictures; in a .zip, in the pack's folder or above it) can
+  switch off the remaster's reflections (the shine it adds to costumes,
+  guns and floors from its environment maps) on chosen textures, for a pack
+  that repaints them as something that shouldn't shine:
+      # Joanna's combat suit
+      no_reflection = 12A6
+  Numbers as the pack names its pictures (hexadecimal in a pack named that
+  way, decimal in a decimal one; "0x12A6" is always hexadecimal); several on
+  one line separated by commas or spaces. Lines starting with # are notes.
+  The log says how many textures it read ("drawn without reflections").
+  It can also keep the game's own picture for chosen textures, in both looks,
+  where the pack's picture doesn't suit the game:
+      # this texture keeps the game's own picture
+      keep_original = 0123
+  The log says how many it read ("keep the game's own picture").
+
+  Reflections by part: no_reflection switches the shine off on every part of
+  a model drawn with that texture. To keep it on some parts (say a costume's
+  metal guards) and off others (its cloth), add a reflection mask instead: a
+  picture named like the texture's with "-reflect" after the number, beside
+  it (for Joanna's suit, xbla\12A6-reflect.png), white where the game may
+  shine and black where it shouldn't, laid out like the texture's own picture
+  (any size: a small one is fine). Each part of the model is drawn without
+  reflections when most of it lies on black. The log names each part it
+  decides ("a part of 518 vertices (518 on black) drawn without
+  reflections").
+
+  Pictures for this game only: a picture named with "-xbla" after the number
+  (0046-xbla.png, xbla\12A6-xbla.png) is read by this game alone; in the
+  remastered look it replaces the plain picture for that number (the N64 look
+  keeps the plain one). So a pack can carry fixes for this game's remastered
+  look and still work unchanged in the N64 PC port and Dabs Mod, which don't
+  read it. The log counts them ("pictures with -xbla used").
+
+  Detail textures: a few N64 surfaces are drawn from two textures, the
+  surface's own and a fine "detail" texture blended in close up: the dataDyne
+  carpet (0046, with the carpet pile 0074) and three of Grid's floors and
+  walls (0DA6, 0DA8, 0DA9, also with 0074). The remaster drew them from one
+  texture with the detail built in, so in the remastered look the game draws
+  a pack's 0074 into its picture for the surface, as the N64 does. Leave
+  0074 out (or give 0046 the detail itself in the pack's "xbla" folder) to
+  draw the surface's picture alone.
+
+  Packs made from version 0.9.2's dump (decimal numbers like "0123.png" or
+  "0123 wall.png", in its remastered and n64 folders) still work as before. A
+  pack is read the new way when it has an "xbla" folder (an empty one will
+  do) or a picture whose number has a letter A-F in it.
 
   Without the menus: Perfect Dark.exe --setup --unattended --n64-rom <file>
   and --texture-pack <.zip or folder> do the same imports.

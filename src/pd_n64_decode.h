@@ -61,8 +61,10 @@ const std::vector<RomVersion>& KnownRomVersions();
 // place; false if it isn't an N64 ROM at all.
 bool NormaliseRomByteOrder(std::vector<uint8_t>& rom);
 
-// Raw deflate (RFC 1951) of `in` into `out` (appended); false on bad data.
-bool Inflate(const uint8_t* in, size_t in_size, std::vector<uint8_t>& out, size_t* consumed = nullptr);
+// Raw deflate (RFC 1951) of `in` into `out` (appended); false on bad data, or when it
+// would make more than `max_out` bytes (a .zip bomb: the importer passes the entry's size).
+bool Inflate(const uint8_t* in, size_t in_size, std::vector<uint8_t>& out, size_t* consumed = nullptr,
+             size_t max_out = SIZE_MAX);
 
 // Decodes texture data (header byte first) to its base level. False on bad data.
 bool DecodeTexture(const uint8_t* data, size_t size, Image& out, std::string* error = nullptr);

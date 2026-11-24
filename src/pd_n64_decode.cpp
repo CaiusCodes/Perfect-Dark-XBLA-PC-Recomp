@@ -15,11 +15,15 @@ namespace {
 const std::vector<RomVersion> kVersions = {
     // name          md5 of the .z64                     textures   data length  tested
     {"pal-final", "d9b5cd305d228424891ce38e71bc9213", 0x1D5CA20, 0x291D60, true, 0x39850, 0x28910},
-    {"ntsc-final", "e03b088b6ac9e0080440efed07c1e40f", 0x1D65F40, 0x291D60, false, 0x39850, 0x28080},
-    {"ntsc-1.0", "7f4171b0c8d17815be37913f535e4e93", 0x1D65F40, 0x291D60, false, 0x39850, 0x28080},
-    // The Japanese release has 3511 textures (8 more): its ids may not line up
-    // with the XBLA's, so it is named but not used.
-    {"jpn-final", "538d2b75945eae069b29c46193e74790", 0, 0, false},
+    // NTSC-U 1.1 and 1.0: tested on the user's own ROMs (HANDOVER 4dv): the N64 dump of all 3983
+    // textures byte-identical to the PAL ROM's, CI / Defection / Grid drawn the same.
+    {"ntsc-final", "e03b088b6ac9e0080440efed07c1e40f", 0x1D65F40, 0x291D60, true, 0x39850, 0x28080},
+    {"ntsc-1.0", "7f4171b0c8d17815be37913f535e4e93", 0x1D65F40, 0x291D60, true, 0x39850, 0x28080},
+    // The Japanese release has 3511 textures (8 more than the 3503 the XBLA numbers):
+    // decoded from the decomp's address and table length, then matched to the XBLA
+    // numbers by shape at load (pd_n64_textures.cpp align_images, HANDOVER 4du). Its file
+    // table isn't used (2 more model files: the N64 models / rooms stay remastered).
+    {"jpn-final", "538d2b75945eae069b29c46193e74790", 0x1D61F90, 0x294960, false, 0, 0},
 };
 
 // --- raw deflate (RFC 1951) -----------------------------------------------------
@@ -88,11 +92,13 @@ const uint16_t kDistBase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97,
                                 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
 const uint8_t kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
 
-bool inflate_codes(InBits& in, std::vector<uint8_t>& out, size_t start, const Huff& lit, const Huff& dist) {
+bool inflate_codes(InBits& in, std::vector<uint8_t>& out, size_t start, const Huff& lit, const Huff& dist,
+                   size_t max_out) {
   for (;;) {
     const int sym = decode_sym(in, lit);
     if (sym < 0) return false;
     if (sym < 256) {
+      if (out.size() - start >= max_out) return false;  // more than the caller allows (a .zip bomb)
       out.push_back(uint8_t(sym));
     } else if (sym == 256) {
       return true;
@@ -103,7 +109,7 @@ bool inflate_codes(InBits& in, std::vector<uint8_t>& out, size_t start, const Hu
       const int di = decode_sym(in, dist);
       if (di < 0 || di >= 30) return false;
       const uint32_t d = kDistBase[di] + in.bits(kDistExtra[di]);
-      if (in.bad || d > out.size() - start) return false;
+      if (in.bad || d > out.size() - start || len > max_out - (out.size() - start)) return false;
       const size_t from = out.size() - d;
       for (uint32_t k = 0; k < len; ++k) out.push_back(out[from + k]);
     }
@@ -554,7 +560,7 @@ bool NormaliseRomByteOrder(std::vector<uint8_t>& rom) {
   return false;
 }
 
-bool Inflate(const uint8_t* in, size_t in_size, std::vector<uint8_t>& out, size_t* consumed) {
+bool Inflate(const uint8_t* in, size_t in_size, std::vector<uint8_t>& out, size_t* consumed, size_t max_out) {
   InBits bs{in, in_size};
   const size_t start = out.size();
   Huff lit, dist;
@@ -566,7 +572,7 @@ bool Inflate(const uint8_t* in, size_t in_size, std::vector<uint8_t>& out, size_
       if (bs.pos + 4 > in_size) return false;
       const uint32_t len = in[bs.pos] | (in[bs.pos + 1] << 8), nlen = in[bs.pos + 2] | (in[bs.pos + 3] << 8);
       bs.pos += 4;
-      if ((len ^ 0xFFFF) != nlen || bs.pos + len > in_size) return false;
+      if ((len ^ 0xFFFF) != nlen || bs.pos + len > in_size || len > max_out - (out.size() - start)) return false;
       out.insert(out.end(), in + bs.pos, in + bs.pos + len);
       bs.pos += len;
     } else if (type == 1) {  // fixed codes
@@ -579,7 +585,7 @@ bool Inflate(const uint8_t* in, size_t in_size, std::vector<uint8_t>& out, size_
       build_huff(lit, lengths, 288);
       for (i = 0; i < 30; ++i) lengths[i] = 5;
       build_huff(dist, lengths, 30);
-      if (!inflate_codes(bs, out, start, lit, dist)) return false;
+      if (!inflate_codes(bs, out, start, lit, dist, max_out)) return false;
     } else if (type == 2) {  // dynamic codes
       const int nlen = int(bs.bits(5)) + 257, ndist = int(bs.bits(5)) + 1, ncode = int(bs.bits(4)) + 4;
       if (bs.bad || nlen > 286 || ndist > 30) return false;
@@ -613,7 +619,7 @@ bool Inflate(const uint8_t* in, size_t in_size, std::vector<uint8_t>& out, size_
       }
       if (all[256] == 0) return false;  // no end-of-block code
       if (!build_huff(lit, all, nlen) || !build_huff(dist, all + nlen, ndist)) return false;
-      if (!inflate_codes(bs, out, start, lit, dist)) return false;
+      if (!inflate_codes(bs, out, start, lit, dist, max_out)) return false;
     } else {
       return false;
     }

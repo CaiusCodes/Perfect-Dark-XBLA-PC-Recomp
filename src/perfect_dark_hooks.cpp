@@ -51,6 +51,7 @@ void PdMpChooseTrack(PPCContext& ctx, uint8_t* base);
 uint32_t PdTextForDisplay(uint32_t text);
 bool PdKeepGunFunctions();
 bool PdAimSensitivityFactor(uint32_t weapon, double* factor);
+void PdLegacyLook(uint8_t* base, uint32_t sp, uint32_t controller);
 bool PdLockSightOn();
 uint32_t PdSmokePoolSize(uint32_t count);
 
@@ -295,6 +296,12 @@ bool PdHookKeepGunFunctions() {
 void PdHookAimSensitivity(PPCRegister& r3, PPCRegister& f0) {
   double factor = 0.0;
   if (PdAimSensitivityFactor(r3.u32, &factor)) f0.f64 = factor;
+}
+
+// Legacy's look input: at 1.3 0x820F2C3C, after the control function stored the look
+// stick at r1+296 / r1+300 and before sub_820F1D20 uses them; r23 = the controller.
+void PdHookLegacyLook(PPCRegister& r1, PPCRegister& r23) {
+  PdLegacyLook(HookBase(), r1.u32, r23.u32);
 }
 
 // Lock Sight: at 1.3 0x820F4BA0 (`bne cr6,0x820f4c1c` after the CMP150 test, not

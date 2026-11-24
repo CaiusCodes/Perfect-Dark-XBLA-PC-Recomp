@@ -112,6 +112,9 @@ REXCVAR_DEFINE_STRING(gpu_native_hide_vs, "", "GPU",
                       "Native renderer test: hide draws whose vertex shader has this cache hash (16 hex digits)");
 REXCVAR_DEFINE_STRING(gpu_native_hide, "", "GPU",
                       "Native renderer test: hide draws ""a-b"" of each frame, or triangles ""d:a-b"" of draw d");
+REXCVAR_DEFINE_INT32(gpu_native_trace_uv_id, 0, "GPU",
+                     "Native renderer test: in a traced frame, draws sampling this bank texture id write their "
+                     "texture coordinates to logs\\uv-draw<N>.txt");
 REXCVAR_DEFINE_BOOL(gpu_native_debug_layer, false, "GPU",
                     "Native renderer test: enable the D3D12 debug layer and log its messages");
 REXCVAR_DEFINE_INT32(gpu_native_trace_frame, 0, "GPU",
@@ -164,6 +167,34 @@ REXCVAR_DEFINE_BOOL(gpu_native_stage_textures, true, "GPU",
                     "Native renderer: start the texture cache afresh on each new stage (level or front end)");
 REXCVAR_DEFINE_BOOL(gpu_native_async_textures, true, "GPU",
                     "Native renderer: prepare new textures past ~1 ms a frame on a worker thread (in level)");
+REXCVAR_DEFINE_BOOL(pd_texture_pack_trace, false, "PerfectDark",
+                    "Test: log each frame's GPU time and texture pack uploads for 120 frames after a pack is asked "
+                    "for and after it is shown");
+REXCVAR_DEFINE_INT32(pd_texture_pack_threads, 0, "PerfectDark",
+                     "Threads that decode texture pack pictures (0 = 2); read once");
+REXCVAR_DEFINE_INT32(pd_texture_pack_thread_priority, -2, "PerfectDark",
+                     "Their Windows thread priority (-1 below normal, -2 lowest, -15 idle); read once");
+REXCVAR_DEFINE_INT32(pd_texture_pack_upload_mb, 16, "PerfectDark",
+                     "Texture pack pictures uploaded a frame at most, in MB (at least one picture a frame)");
+REXCVAR_DEFINE_BOOL(pd_texture_pack_detail, true, "PerfectDark",
+                    "Texture packs made for the PC port: in the remastered look, the N64's detail texture (e.g. the "
+                    "dataDyne carpet's pile, 116) drawn into the pack's picture for the surface it belongs to "
+                    "(false: the pack's picture alone, for comparing)");
+REXCVAR_DEFINE_BOOL(pd_texture_pack_hold, true, "PerfectDark",
+                    "Texture packs: at a stage's start and at a cutscene's cuts, frames whose pack pictures aren't "
+                    "ready yet are held back (up to 2.5 s) so the pictures appear at once instead of popping in "
+                    "(false: drawn as they come, as before 0.9.2a-test10)");
+REXCVAR_DEFINE_BOOL(pd_texture_pack_async_upload, true, "PerfectDark",
+                    "Test: texture pack pictures created and uploaded on a queue of their own, off the frame "
+                    "(false: in the frame, as before 0.9.2a-test5)");
+REXCVAR_DEFINE_BOOL(pd_texture_pack_copy_queue, false, "PerfectDark",
+                    "Test: with Direct3D 12, texture pack uploads on a copy queue (false: a second direct queue)");
+REXCVAR_DEFINE_BOOL(pd_texture_pack_not_resident, true, "PerfectDark",
+                    "Test: with Direct3D 12, texture pack pictures created not resident and made resident for the "
+                    "uploads only (false: made resident as they are created)");
+REXCVAR_DEFINE_BOOL(pd_texture_standby, true, "PerfectDark",
+                    "Test: keep the other Texture Pack slot's pictures ready, so G switches at once "
+                    "(false: prepared when G is pressed, as before 0.9.2a-test5)");
 // Off by default here: Perfect Dark keeps the Xenos vblank, which already
 // reports every vblank to the presenter (GoldenEye had none to anchor to).
 REXCVAR_DEFINE_BOOL(gpu_native_pace, false, "GPU",
@@ -261,6 +292,8 @@ constexpr uint32_t kDevUserClipPlanes = 642 * 16;
 
 // Perfect Dark's stage number (perfect_dark_app.h kStageNum); 90 = the title.
 constexpr uint32_t kStageNum = 0x826492E0u;
+// g_Vars+1788, the N64's in_cutscene (perfect_dark_app.h kInCutscene).
+constexpr uint32_t kInCutsceneFlag = 0x82648BF8u + 1788u;
 
 constexpr uint32_t kTextureSlots = 1024;
 constexpr uint32_t kSamplerSlots = 64;  // sampler descriptors (set 3); 0 = the default sampler
@@ -331,6 +364,7 @@ struct ResolvedTexture {
   // a component to 0 or 1 (X8R8G8B8: alpha 1): a view with that mapping each.
   std::unordered_map<uint16_t, std::pair<std::unique_ptr<RenderTextureView>, uint32_t>> swizzled;
   uint32_t slot = 0;
+  uint64_t bytes = 0;               // its data uploaded (the memory report, HANDOVER 4dp)
   std::shared_ptr<TextureJob> job;  // being prepared on the texture worker
   // Textures outside the CAFF heap can be rewritten by the game (classic Dam's
   // 4x4 sky colour ramp): their bytes are re-hashed once a frame when used.
@@ -387,6 +421,9 @@ struct Native {
   std::vector<Retired> retired;  // returned to their pool 2 frames later
   struct RetiredTexture { uint64_t frame; std::unique_ptr<RenderTexture> texture; uint32_t slot; };
   std::vector<RetiredTexture> retired_textures;  // re-uploaded dynamic textures: freed kFrames frames later
+  // Textures no frame uses any more, handed to the reaper thread (HANDOVER 4dp: a texture pack's
+  // 50 pictures released at once cost the frame 7-16 ms); their slots are free already.
+  std::vector<std::unique_ptr<RenderTexture>> graveyard;
   std::vector<uint32_t> free_slots;
   BufferPool vertex_pool, index_pool;
   std::unique_ptr<RenderCommandSemaphore> acquire;
@@ -532,11 +569,55 @@ struct Native {
   // N64 textures (pd_n64_textures.h): Textures.raw id -> the N64 picture's upload
   // (`content` = the colour lookup's version it was made with).
   std::unordered_map<uint32_t, ResolvedTexture> classic;
-  // Texture packs (pd_texture_packs.h): Textures.raw id -> the pack picture's
+  // Texture packs (pd_texture_packs.h): pack_key (id, folder, base) -> the pack picture's
   // upload (its `job` while the worker decodes it); the chosen pack's index as
   // of this frame.
   std::unordered_map<uint32_t, ResolvedTexture> pack;
   std::shared_ptr<const pd::texpack::Index> pack_index;
+  // The look as of this frame (pd_texture_packs.h CurrentLook): N64 pictures drawn (the
+  // N64 look wanted and the ROM loaded), and pack_hold: the N64 look wanted but the ROM
+  // not loaded yet, so no pack pictures (they'd go over the remastered look meanwhile).
+  bool n64_on = false, pack_hold = false;
+  // A pack being prepared (pd_texture_packs.h RequestPrepare, HANDOVER 4do): its pictures
+  // for the textures drawn meanwhile, decoded and uploaded into pack_next while the old
+  // look is drawn; taken over as `pack` in the frame the app sets that look.
+  std::unordered_map<uint32_t, ResolvedTexture> pack_next;
+  pd::texpack::Prepare prep;
+  uint32_t prep_serial = 0;   // the request taken (a new serial starts again)
+  bool prep_done = false;
+  uint32_t prep_frames = 0, prep_new = 0;  // frames since asked; pictures started in this frame's draws
+  double prep_t0 = 0;
+  // The other Texture Pack slot kept ready (pd_texture_packs.h Standby, HANDOVER 4dp): as of
+  // this frame; its pack's pictures for the textures drawn in pack_alt (alt_index: whose they
+  // are), or in pack / pack_next when it is the pack shown or being prepared (sb_map). Its
+  // base pictures (N64 ones in `classic`, remastered ones in textures_by_fetch) made too.
+  pd::texpack::Standby sb;
+  bool sb_active = false;  // valid and not the look shown
+  std::unordered_map<uint32_t, ResolvedTexture> pack_alt;
+  std::shared_ptr<const pd::texpack::Index> alt_index;
+  uint32_t sb_frames = 0, sb_new = 0, sb_new_last = 0;  // frames since it changed; pictures started
+  uint32_t sb_classic_left = 0;                          // N64 pictures it may still make this frame
+  uint32_t sb_marked = 0;                                // the serial last marked ready (0: none)
+  uint32_t sb_logged = 0;                                // the serial whose readiness was logged
+  std::vector<uint64_t> sb_base_pending;                 // remastered textures started for it
+  std::unordered_set<uint32_t> sb_seen;                  // textures touched this frame
+  // Pack pictures uploaded this frame, and per frame slot (the frame being finished on the
+  // GPU): for the trace after a pack is asked for or shown (each frame's GPU time and
+  // uploads, 120 frames; pd_texture_pack_trace).
+  uint32_t pack_commit_n = 0;
+  uint64_t slot_pack_bytes[3] = {};
+  uint32_t slot_pack_n[3] = {};
+  uint32_t pack_trace = 0;
+  // Pack pictures held back at a stage's start or a cutscene's cut (HANDOVER 4dv): while
+  // the window is open, a frame drawing a shown pack's texture whose picture isn't ready
+  // yet isn't shown (the last frame stays on screen), so the pictures appear all at once
+  // instead of popping in one by one. pack_waiting / pack_started: this frame's count.
+  uint32_t pack_waiting = 0, pack_started = 0;
+  double hold_open_until = 0;  // the window (stage start / cutscene) is open until then
+  double hold_since = 0;       // frames held since then (0: none held)
+  uint32_t hold_frames = 0;
+  bool was_cutscene = false;
+  bool stage_window = false;  // a new stage's first frames: any picture not ready holds
   uint32_t textures_stage = 0;  // the stage textures_by_fetch was filled in (begin_frame)
   std::vector<std::unique_ptr<RenderSampler>> sampler_objects;
   std::unordered_map<uint64_t, uint32_t> sampler_slots;        // filter/clamp/mip key -> sampler slot
@@ -576,6 +657,7 @@ struct Native {
   uint32_t flushes = 0, last_flushes = 0;  // draw path: parse, indices, decode, state+submit, total
   uint32_t pipe_n = 0, tex_n = 0, last_pipe_n = 0, last_tex_n = 0;
   uint32_t tex_requests = 0;  // new textures asked for this frame (many = a level load)
+  uint64_t pack_commit_bytes = 0;  // texture pack pictures uploaded this frame (pack_slot's budget)
   // Present pacing and its statistics.
   double pace_period = 1000.0 / 60.0, pace_next = 0, pace_last_arrival = 0, pace_waited_ms = 0;
   double pace_last_present = 0, pace_wait_sum = 0;
@@ -657,6 +739,10 @@ Stream g_streams[16];
 uint32_t g_textures[32];                                   // guest texture per sampler
 std::atomic<uint32_t> g_clear_color{0xFF000000u};
 uint32_t g_spec_bits = 2;
+// The current draw is a part of a model a pack's reflection mask draws without reflections
+// (<id>-reflect, HANDOVER 4dw), and those decisions by part (vertex layout, texture, pack).
+bool g_draw_matte = false;
+std::unordered_map<uint64_t, bool> g_reflect_parts;
 uint32_t g_vs_cb_bytes = 4096, g_ps_cb_bytes = 3584;  // what the current draw's shaders read  // shared c17.y: bit 0 R11G11B10 normals, bit 1 alpha test
 
 std::wstring exe_dir() {
@@ -1425,30 +1511,33 @@ bool ensure_device() {
     g.upload_used = 0;
   }
   for (uint32_t i = 0; i < kTextureSlots; ++i) g.textures->setTexture(i, g.white.get(), RenderTextureLayout::SHADER_READ);
-  {
-    g.white_cube = g.device->createTexture(RenderTextureDesc::Texture(RenderTextureDimension::TEXTURE_2D, 1, 1, 1, 1, 6,
-                                                                      RenderFormat::R8G8B8A8_UNORM, RenderTextureFlag::CUBE));
+  // A 1x1 white cube map: a cube sampler with no cube texture.
+  const auto make_cube = [](std::unique_ptr<RenderTexture>& tex, std::unique_ptr<RenderTextureView>& view,
+                            uint32_t& slot, uint8_t value) {
+    tex = g.device->createTexture(RenderTextureDesc::Texture(RenderTextureDimension::TEXTURE_2D, 1, 1, 1, 1, 6,
+                                                             RenderFormat::R8G8B8A8_UNORM, RenderTextureFlag::CUBE));
     RenderTextureViewDesc vd = RenderTextureViewDesc::TextureCube(RenderFormat::R8G8B8A8_UNORM);
     vd.arraySize = 6;
     vd.mipLevels = 1;
-    g.white_cube_view = g.white_cube->createTextureView(vd);
+    view = tex->createTextureView(vd);
     const uint64_t off = upload_alloc(256, 512);
-    std::memset(g.upload_ptr + off, 0xFF, 4);
+    std::memset(g.upload_ptr + off, value, 4);
     g.cmd->begin();
-    g.cmd->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(g.white_cube.get(), RenderTextureLayout::COPY_DEST));
+    g.cmd->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(tex.get(), RenderTextureLayout::COPY_DEST));
     for (uint32_t face = 0; face < 6; ++face)
       g.cmd->copyTextureRegion(
-          RenderTextureCopyLocation::Subresource(g.white_cube.get(), 0, face),
+          RenderTextureCopyLocation::Subresource(tex.get(), 0, face),
           RenderTextureCopyLocation::PlacedFootprint(g.upload.get(), RenderFormat::R8G8B8A8_UNORM, 1, 1, 1, 64, off));
-    g.cmd->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(g.white_cube.get(), RenderTextureLayout::SHADER_READ));
+    g.cmd->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(tex.get(), RenderTextureLayout::SHADER_READ));
     g.cmd->end();
     const RenderCommandList* l = g.cmd;
     g.queue->executeCommandLists(&l, 1, nullptr, 0, nullptr, 0, g.fence);
     g.queue->waitForCommandFence(g.fence);
     g.upload_used = 0;
-    g.white_cube_slot = alloc_texture_slot();
-    g.textures->setTexture(g.white_cube_slot, g.white_cube.get(), RenderTextureLayout::SHADER_READ, g.white_cube_view.get());
-  }
+    slot = alloc_texture_slot();
+    g.textures->setTexture(slot, tex.get(), RenderTextureLayout::SHADER_READ, view.get());
+  };
+  make_cube(g.white_cube, g.white_cube_view, g.white_cube_slot, 0xFF);
 
   REXKRNL_INFO("PDNATIVE {} device up, frames go to the SDK presenter", g_vulkan ? "Vulkan" : "D3D12");
   std::thread(warm_pipelines).detach();
@@ -2373,6 +2462,7 @@ uint32_t commit_texture(ResolvedTexture& t, const PreparedTexture& p) {
   if (!p.ok || p.levels.empty()) { t.slot = UINT32_MAX; return 0; }
   uint64_t total = 0;
   for (const auto& lv : p.levels) total += uint64_t(lv.row_pitch) * lv.rows + 512;
+  t.bytes = total;
   ensure_room(total);
   const uint32_t mips = uint32_t(p.levels.size()) / p.faces;
   t.texture = g.device->createTexture(
@@ -2412,6 +2502,12 @@ struct TextureJob {
   // Other work for the worker (a pack picture's decode, a texture dump):
   // run instead of preparing the guest texture.
   std::function<void(PreparedTexture&)> make;
+  // A pack picture: once decoded, created and uploaded on the pack uploader's own queue
+  // (PackUploader, HANDOVER 4dp); `texture` is then ready to sample (`done` set after), and
+  // the game thread only gives it a descriptor slot (adopt_texture).
+  bool upload = false;
+  std::unique_ptr<RenderTexture> texture;
+  uint64_t bytes = 0;  // what the uploader copied
 };
 
 struct TextureWorker {
@@ -2448,6 +2544,340 @@ struct TextureWorker {
   }
 };
 TextureWorker g_texture_worker;
+
+// Texture pack pictures are created and uploaded off the frame (HANDOVER 4dp): on a thread
+// and a command queue of their own (a second direct queue: no queue-family hand-over on
+// Vulkan, the layout set there), each batch waited for on that thread. Before, the game
+// thread created each picture and recorded its copy into the frame: a frame that took one of
+// Ultimate's 12 MB pictures waited 25-45 ms for its GPU fence (the driver making the new
+// memory resident), though its own GPU work was 0.3-6 ms (4do). Now that wait is the
+// uploader's; the frame only gives a finished picture a descriptor (adopt_texture).
+// pd_texture_pack_async_upload false: the old way (committed in the frame).
+// Direct3D 12: a pack picture's memory created not resident and made resident by
+// EnqueueMakeResident, which signals a fence of ours that only the uploader's queue waits for
+// (pd_texture_pack_not_resident). Memory made resident as it is created is paging work that the
+// next submissions wait for, the frames' and the presenter's too: with Ultimate's 48 MB
+// pictures that was frames of 50-80 ms while a pack was applied (HANDOVER 4dp).
+struct OwnedD3D12Texture : D3D12Texture {
+  ~OwnedD3D12Texture() override {
+    if (d3d) d3d->Release();
+    d3d = nullptr;
+  }
+};
+
+struct PackUploader {
+  std::mutex mutex;
+  ID3D12Fence* resident_fence = nullptr;
+  uint64_t resident_value = 0;
+
+  // An RGBA8 2D picture not resident yet (EnqueueMakeResident below); nullptr: make it the usual way.
+  std::unique_ptr<RenderTexture> create_not_resident(const PreparedTexture& p, uint32_t mips) {
+    if (g_vulkan || !REXCVAR_GET(pd_texture_pack_not_resident) || p.faces != 1 ||
+        p.format != RenderFormat::R8G8B8A8_UNORM)
+      return nullptr;
+    auto* dev = static_cast<D3D12Device*>(g.device.get());
+    if (!resident_fence && FAILED(dev->d3d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&resident_fence))))
+      return nullptr;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = p.width;
+    rd.Height = p.height;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = UINT16(mips);
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    ID3D12Resource* res = nullptr;
+    // (not zeroed: every level is copied over at once)
+    HRESULT hr = dev->d3d->CreateCommittedResource(
+        &hp, D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &rd, D3D12_RESOURCE_STATE_COMMON,
+        nullptr, IID_PPV_ARGS(&res));
+    if (FAILED(hr))
+      hr = dev->d3d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                             nullptr, IID_PPV_ARGS(&res));
+    if (FAILED(hr)) return nullptr;
+    ID3D12Device3* d3 = nullptr;
+    ID3D12Pageable* pageable = res;
+    if (FAILED(dev->d3d->QueryInterface(IID_PPV_ARGS(&d3))) ||
+        FAILED(d3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, &pageable, resident_fence, resident_value + 1))) {
+      if (d3) d3->Release();
+      res->Release();
+      return nullptr;
+    }
+    d3->Release();
+    ++resident_value;
+    auto t = std::make_unique<OwnedD3D12Texture>();
+    t->d3d = res;
+    t->device = dev;
+    t->desc = RenderTextureDesc::Texture2D(p.width, p.height, mips, p.format);
+    t->resourceStates = D3D12_RESOURCE_STATE_COMMON;
+    t->layout = RenderTextureLayout::UNKNOWN;
+    return t;
+  }
+  std::condition_variable cv;
+  std::deque<std::weak_ptr<TextureJob>> queue;
+  bool started = false;
+  std::atomic<bool> failed{false};
+  bool copy_queue = false;
+  std::unique_ptr<RenderCommandQueue> q;
+  std::unique_ptr<RenderCommandList> list;
+  std::unique_ptr<RenderCommandFence> fence;
+  std::unique_ptr<RenderBuffer> staging;
+  uint64_t staging_size = 0;
+  uint8_t* staging_ptr = nullptr;
+  std::atomic<uint64_t> uploaded_bytes{0}, batches{0};
+  double wait_ms_max = 0;
+
+  static uint64_t bytes_of(const PreparedTexture& p) {
+    uint64_t total = 0;
+    for (const auto& lv : p.levels) total += ((uint64_t(lv.row_pitch) * lv.rows) + 511) & ~511ull;
+    return total;
+  }
+
+  // False: the job is to be committed in the frame (no uploader).
+  bool push(const std::shared_ptr<TextureJob>& job) {
+    if (failed.load() || !REXCVAR_GET(pd_texture_pack_async_upload)) return false;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!started) {
+        started = true;
+        // Direct3D 12: a copy queue (the GPU's copy engine, beside the frames' work; the
+        // picture decays to the common state after it and is sampled from there). Vulkan: a
+        // second graphics queue (a copy-only family would need the image handed over).
+        copy_queue = !g_vulkan && REXCVAR_GET(pd_texture_pack_copy_queue);
+        q = g.device->createCommandQueue(copy_queue ? RenderCommandListType::COPY : RenderCommandListType::DIRECT);
+        if (q) list = q->createCommandList();
+        fence = g.device->createCommandFence();
+        if (!q || !list || !fence) {
+          failed = true;
+          REXKRNL_WARN("[texpack] no upload queue: pack pictures are uploaded in the frame");
+          return false;
+        }
+        std::thread([this] { run(); }).detach();
+        // (Vulkan: Plume gives the second queue a hardware queue of its own when the graphics
+        // family has more than one, as NVIDIA's; else it shares the frames' one, submissions in turn)
+        const bool shared = g_vulkan && static_cast<VulkanCommandQueue*>(q.get())->queue ==
+                                            static_cast<VulkanCommandQueue*>(g.queue.get())->queue;
+        REXKRNL_INFO("[texpack] pack pictures uploaded on a {} queue of their own{}", copy_queue ? "copy" : "graphics",
+                     shared ? " (Vulkan: sharing the frames' hardware queue)" : "");
+      }
+      queue.push_back(job);
+    }
+    cv.notify_one();
+    return true;
+  }
+
+  void run() {
+    SetThreadDescription(GetCurrentThread(), L"PD pack uploads");
+    for (;;) {
+      std::vector<std::shared_ptr<TextureJob>> batch;
+      uint64_t bytes = 0;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!cv.wait_for(lock, std::chrono::seconds(5), [this] { return !queue.empty(); })) {
+          // Idle: the staging memory (up to the biggest picture, ~60 MB) is given back.
+          staging.reset();
+          staging_ptr = nullptr;
+          staging_size = 0;
+          continue;
+        }
+        // A batch of up to 32 MB (or one bigger picture), one submission.
+        while (!queue.empty()) {
+          std::shared_ptr<TextureJob> job = queue.front().lock();
+          if (!job) { queue.pop_front(); continue; }
+          const uint64_t b = bytes_of(job->result);
+          if (!batch.empty() && bytes + b > (32ull << 20)) break;
+          queue.pop_front();
+          bytes += b;
+          batch.push_back(std::move(job));
+        }
+      }
+      if (batch.empty()) continue;
+      if (bytes > staging_size) {
+        staging.reset();
+        staging_size = std::max<uint64_t>(bytes, 32ull << 20);
+        staging = g.device->createBuffer(RenderBufferDesc::UploadBuffer(staging_size));
+        staging_ptr = staging ? static_cast<uint8_t*>(staging->map()) : nullptr;
+        if (!staging_ptr) {
+          staging.reset();
+          staging_size = 0;
+          failed = true;
+          REXKRNL_WARN("[texpack] no staging memory for pack pictures ({} MB): uploaded in the frame", bytes >> 20);
+          for (auto& job : batch) job->done.store(true, std::memory_order_release);  // (committed in the frame)
+          continue;
+        }
+      }
+      const double t0 = now_ms();
+      list->begin();
+      uint64_t off = 0;
+      for (auto& job : batch) {
+        const PreparedTexture& p = job->result;
+        const uint32_t mips = uint32_t(p.levels.size()) / p.faces;
+        job->texture = create_not_resident(p, mips);
+        if (!job->texture)
+          job->texture = g.device->createTexture(RenderTextureDesc::Texture2D(p.width, p.height, mips, p.format));
+        if (!job->texture) continue;
+        job->bytes = bytes_of(p);
+        list->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(job->texture.get(), RenderTextureLayout::COPY_DEST));
+        for (uint32_t l = 0; l < p.levels.size(); ++l) {
+          const auto& lv = p.levels[l];
+          const uint64_t n = uint64_t(lv.row_pitch) * lv.rows;
+          std::memcpy(staging_ptr + off, p.data.data() + lv.offset, n);
+          list->copyTextureRegion(RenderTextureCopyLocation::Subresource(job->texture.get(), l % mips, l / mips),
+                                  RenderTextureCopyLocation::PlacedFootprint(staging.get(), p.format, lv.w, lv.h, 1,
+                                                                             lv.row_pitch / p.block_bytes * p.block, off));
+          off += (n + 511) & ~511ull;
+        }
+        if (!copy_queue)
+          list->barriers(RenderBarrierStage::GRAPHICS,
+                         RenderTextureBarrier(job->texture.get(), RenderTextureLayout::SHADER_READ));
+      }
+      list->end();
+      const RenderCommandList* l = list.get();
+      // (the copies wait on the GPU for the memory made resident; the frames don't)
+      if (resident_fence && resident_value)
+        static_cast<D3D12CommandQueue*>(q.get())->d3d->Wait(resident_fence, resident_value);
+      q->executeCommandLists(&l, 1, nullptr, 0, nullptr, 0, fence.get());
+      q->waitForCommandFence(fence.get());
+      const double ms = now_ms() - t0;
+      wait_ms_max = std::max(wait_ms_max, ms);
+      uploaded_bytes += bytes;
+      ++batches;
+      if (REXCVAR_GET(pd_texture_pack_trace))
+        REXKRNL_INFO("[texpack] upload batch: {} pictures, {:.1f} MB, {:.1f} ms", batch.size(),
+                     double(bytes) / double(1 << 20), ms);
+      for (auto& job : batch) {
+        if (job->texture) {  // (the decoded copy: the GPU has it now; kept if it couldn't be made, for the frame)
+          job->result.data.clear();
+          job->result.data.shrink_to_fit();
+        }
+        job->done.store(true, std::memory_order_release);
+      }
+    }
+  }
+};
+PackUploader g_pack_uploader;
+
+// Textures no frame uses any more (their descriptor slots already free), destroyed on a thread
+// of their own, one at a time (HANDOVER 4dp): releasing GPU memory costs about a millisecond a
+// big picture, and a pack replaced by another drops 40-50 of them at once.
+struct TextureReaper {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::vector<std::unique_ptr<RenderTexture>> queue;
+  bool started = false;
+
+  void push(std::vector<std::unique_ptr<RenderTexture>>& textures) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      for (auto& t : textures) queue.push_back(std::move(t));
+      if (!started) {
+        started = true;
+        std::thread([this] {
+          SetThreadDescription(GetCurrentThread(), L"PD texture release");
+          SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+          run();
+        }).detach();
+      }
+    }
+    textures.clear();
+    cv.notify_one();
+  }
+
+  void run() {
+    for (;;) {
+      std::unique_ptr<RenderTexture> t;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [this] { return !queue.empty(); });
+        t = std::move(queue.back());
+        queue.pop_back();
+      }
+      t.reset();
+    }
+  }
+};
+TextureReaper g_texture_reaper;
+
+// Texture pack pictures are decoded on two threads of their own (a PNG of 2048x2048 is
+// ~60 ms; a pack shown in the middle of a level has 15-25 on screen in the Carrington
+// Institute), at the lowest priority so the game's frames don't wait for them (4 threads,
+// or 1, gave more long frames while a pack was prepared: HANDOVER 4do). The queue holds weak
+// references: a picture no longer wanted (another pack chosen, a new stage) isn't decoded.
+struct PackWorkers {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<std::weak_ptr<TextureJob>> queue;
+  bool started = false;
+
+  void push(const std::shared_ptr<TextureJob>& job) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      queue.push_back(job);
+      if (!started) {
+        started = true;
+        const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+        const int want = REXCVAR_GET(pd_texture_pack_threads);
+        const int n = want > 0 ? std::min(want, 8) : int(std::min(cores, 2u));
+        const int priority = REXCVAR_GET(pd_texture_pack_thread_priority);
+        for (int i = 0; i < n; ++i)
+          std::thread([this, priority] {
+            SetThreadPriority(GetCurrentThread(), priority);
+            run();
+          }).detach();
+        REXKRNL_INFO("[texpack] {} threads decode pack pictures (priority {})", n, priority);
+      }
+    }
+    cv.notify_one();
+  }
+
+  void run() {
+    for (;;) {
+      std::shared_ptr<TextureJob> job;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [this] { return !queue.empty(); });
+        job = queue.front().lock();
+        queue.pop_front();
+      }
+      if (!job) continue;  // (dropped meanwhile)
+      if (job->make) job->make(job->result);
+      // (a usable picture goes on to the uploader, which sets `done` once it is on the GPU)
+      if (job->upload && job->result.ok && !job->result.levels.empty() && g_pack_uploader.push(job)) continue;
+      job->done.store(true, std::memory_order_release);
+    }
+  }
+};
+PackWorkers g_pack_workers;
+
+// A pack picture the uploader made (TextureJob::texture): a descriptor slot, nothing to record.
+uint32_t adopt_texture(ResolvedTexture& t, std::unique_ptr<RenderTexture> texture) {
+  t.texture = std::move(texture);
+  t.view.reset();
+  t.slot = alloc_texture_slot();
+  g.textures->setTexture(t.slot, t.texture.get(), RenderTextureLayout::SHADER_READ, nullptr);
+  return t.slot;
+}
+
+bool pack_commit_fits(const ResolvedTexture& t);
+
+// A finished pack picture job taken into `t`: adopted if the uploader made it, else committed
+// in the frame (within pack_commit_fits' budget; false = not yet, try next frame).
+bool take_pack_job(ResolvedTexture& t) {
+  if (t.job->texture) {
+    const std::shared_ptr<TextureJob> job = std::move(t.job);
+    adopt_texture(t, std::move(job->texture));
+    t.bytes = job->bytes;
+    ++g.pack_commit_n;
+    return true;
+  }
+  if (!pack_commit_fits(t)) return false;
+  const std::shared_ptr<TextureJob> job = std::move(t.job);
+  commit_texture(t, job->result);
+  return true;
+}
 
 // Host texture slot for a guest texture object (0 = white when unsupported or
 // still being prepared). may_commit: the caller is at the start of a draw,
@@ -2486,6 +2916,29 @@ uint32_t resolved_slot(uint32_t tex, ResolvedTexture& r) {
 // file's 52-byte D3DTexture headers, +2876 a copy of them.
 constexpr uint32_t kTexBank = 0x82655BE0u;
 
+// A bank texture's remastered size, if a pack picture can stand in for it (a 2D
+// texture with plain RGBA, as plain_rgba_2d): for pd_texture_packs.h's look
+// decision (which look draws more of a pack's pictures), on its thread. False
+// before the bank is loaded.
+bool remastered_texture_size(int id, uint32_t* w, uint32_t* h) {
+  if (!rex::system::kernel_state() || !rex::system::kernel_state()->memory()) return false;
+  const uint32_t count = g32(kTexBank + 2860), table = g32(kTexBank + 2872);
+  if (!count || count > 8192 || !table || id < 0 || uint32_t(id) >= count) return false;
+  const uint32_t f = table + uint32_t(id) * 52u + 28u;
+  const uint32_t f2 = g32(f + 8), f3 = g32(f + 12), f5 = g32(f + 20);
+  const uint32_t dim = (f5 >> 9) & 3, swizzle = (f3 >> 1) & 0xFFF;
+  if (dim != 1 || (swizzle != 0x60A && swizzle != 0x688)) return false;
+  *w = (f2 & 0x1FFF) + 1;
+  *h = ((f2 >> 13) & 0x1FFF) + 1;
+  return true;
+}
+bool remastered_bank_ready() {
+  return rex::system::kernel_state() && rex::system::kernel_state()->memory() && g32(kTexBank + 2860) != 0 &&
+         g32(kTexBank + 2872) != 0;
+}
+const bool kRemasteredSizesRegistered =
+    (pd::texpack::SetRemasteredSizeSource(&remastered_texture_size, &remastered_bank_ready), true);
+
 // The Textures.raw id of a guest texture object (-1 if it isn't one of the
 // bank's headers); `which` = 0 for the +2876 array, 1 for +2872.
 int bank_texture_id(uint32_t tex, int* which = nullptr) {
@@ -2521,19 +2974,17 @@ int bank_texture_id(uint32_t tex, int* which = nullptr) {
 // Found in play: 123/534/539 (Defection's skyline), 2210 (Villa's cliff tops).
 // While the level rooms are drawn from the ROM (pd_n64_rooms.cpp) that geometry
 // isn't drawn, and these ids get their N64 pictures too.
-bool remaster_only_id(int id) {
-  if (pd::n64tex::RoomsDrawing()) return false;
-  static constexpr int16_t kIds[] = {123,  165,  169,  170,  212,  497,  498,  511,  534,  535,  537,
-                                     538,  539,  545,  546,  547,  548,  550,  551,  559,  560,  1784,
-                                     2206, 2207, 2210, 2211, 2220, 2221, 2232, 2235, 2239, 2240, 2241,
-                                     2243, 2359, 2464, 2504, 2553, 2554, 2587, 2708, 2901, 2966, 3323};
-  return std::binary_search(std::begin(kIds), std::end(kIds), int16_t(id));
-}
+// (The list: pd_texture_packs.cpp RemasterReusedId, which also counts a pack's pictures.)
+bool remaster_reused_id(int id) { return pd::texpack::RemasterReusedId(id); }
 
-int classic_id(uint32_t tex, const uint32_t* f) {
-  if (!pd::n64tex::Active()) return -1;
+bool remaster_only_id(int id) { return !pd::n64tex::RoomsDrawing() && remaster_reused_id(id); }
+
+// `n64_on`: the N64 pictures drawn (this frame's look, or a look being prepared);
+// `rooms`: the level rooms drawn from the ROM then.
+int classic_id_for(uint32_t tex, const uint32_t* f, bool n64_on, bool rooms) {
+  if (!n64_on) return -1;
   const int id = bank_texture_id(tex);
-  if (id < 0 || remaster_only_id(id)) return -1;
+  if (id < 0 || (!rooms && remaster_reused_id(id))) return -1;
   if (id >= pd::n64tex::kTextureCount && !pd::n64tex::IsModelTexture(id)) return -1;
   const uint32_t dim = (f[5] >> 9) & 3, swizzle = (f[3] >> 1) & 0xFFF;
   if (dim != 1 || (swizzle != 0x60A && swizzle != 0x688)) return -1;
@@ -2551,6 +3002,10 @@ int classic_id(uint32_t tex, const uint32_t* f) {
     if (id < lo || id > hi) return -1;
   }
   return pd::n64tex::Get(id) ? id : -1;
+}
+
+int classic_id(uint32_t tex, const uint32_t* f) {
+  return classic_id_for(tex, f, g.n64_on, pd::n64tex::RoomsDrawing());
 }
 
 // The slot of id's N64 picture, made at the start of a draw (may_commit); its
@@ -2620,53 +3075,193 @@ bool plain_rgba_2d(const uint32_t* f) {
   return dim == 1 && (swizzle == 0x60A || swizzle == 0x688);
 }
 
-// The pack's id for `tex`, or -1 (no pack, not a bank texture, or the pack hasn't it).
-int pack_id(uint32_t tex, const uint32_t* f) {
-  if (!g.pack_index || g.pack_index->by_id.empty()) return -1;
+// Which pack picture stands in for a texture: its id, the folder it comes from
+// (0 top, 1 xbla\), the base it is drawn over (N64 or remastered picture) and that
+// base's size; `key` names its slot in g.pack.
+struct PackChoice {
+  int id = -1;
+  int source = 0;
+  bool n64_base = false;
+  uint32_t base_w = 0, base_h = 0;
+  uint32_t key = 0;
+  // The N64 detail texture drawn into the picture (pd_texture_packs.h DetailLayer), or -1.
+  int detail = -1;
+};
+// id: 14 bits; source: 2 (0 top, 1 xbla\, 2 an <id>-xbla picture).
+constexpr uint32_t pack_key(int id, int source, bool n64_base, bool detail = false) {
+  return uint32_t(id) | uint32_t(source) << 14 | uint32_t(n64_base) << 16 | uint32_t(detail) << 17;
+}
+constexpr const char* pack_source_name(int source) { return source == 1 ? "xbla:" : source == 2 ? "-xbla:" : "top:"; }
+
+// The pack picture for `tex` (false: no pack, not a bank texture, or none of the
+// pack's pictures for it can be used). Over an N64 picture the top folder's comes
+// first, over a remastered one xbla\'s (pd_texture_packs.h Index). Skipped:
+// - an N64 emulator pack's picture (a redraw of the N64 texture) over a remastered
+//   one (the remastered textures of these ids are other pictures, 44 ids reused);
+// - a PC-port pack's top-folder picture (made for the N64 texture) over a remastered
+//   picture the remaster made a different surface (remaster_reused_id);
+// - a picture already found unusable (damaged, or of another shape than the texture
+//   it would replace: pack_slot), so the other folder's gets its turn.
+// (For `index` in the look n64_on / rooms, the pictures found unusable looked up in `map`:
+// the pack shown, g.pack, or the one being prepared, g.pack_next.)
+bool pack_choice_in(const std::shared_ptr<const pd::texpack::Index>& index, bool n64_on, bool rooms,
+                    const std::unordered_map<uint32_t, ResolvedTexture>& map, uint32_t tex, const uint32_t* f,
+                    PackChoice* out) {
+  if (!index || (index->by_id.empty() && index->xbla_by_id.empty() && index->remastered_by_id.empty())) return false;
   const int id = bank_texture_id(tex);
-  if (id < 0 || !g.pack_index->Has(id) || !plain_rgba_2d(f)) return -1;
-  // An N64 emulator pack's picture is a redraw of the N64 texture: N64 mode only (the
-  // remastered textures of these ids are other pictures, and 44 ids are reused).
-  if (g.pack_index->N64Only(id) && (!pd::n64tex::Active() || remaster_only_id(id))) return -1;
-  return id;
+  if (id < 0 || !index->Has(id) || !plain_rgba_2d(f)) return false;
+  const bool n64_base = classic_id_for(tex, f, n64_on, rooms) >= 0;
+  // Over the remastered look an <id>-xbla picture first (made for this game; HANDOVER 4dw),
+  // then xbla\'s, then the top folder's; over the N64 look the top folder's, then xbla\'s.
+  static constexpr int kRemOrder[3] = {2, 1, 0}, kN64Order[2] = {0, 1};
+  const int* order = n64_base ? kN64Order : kRemOrder;
+  const int order_n = n64_base ? 2 : 3;
+  for (int k = 0; k < order_n; ++k) {
+    const int source = order[k];
+    if (!index->Picture(source, id)) continue;
+    if (source == 0 && !n64_base && index->N64Only(id)) continue;
+    if (source == 0 && !n64_base && index->pc_port && remaster_reused_id(id)) continue;
+    // A PC-port picture over the remastered look for a surface the N64 drew with a detail
+    // texture: the pack's detail picture drawn into it (pd_texture_packs.h DetailLayer).
+    int detail = -1;
+    if (source == 0 && !n64_base && index->pc_port && REXCVAR_GET(pd_texture_pack_detail))
+      if (const pd::texpack::DetailLayer* d = pd::texpack::DetailLayerFor(id);
+          d && index->Picture(0, d->detail) && !index->N64Only(d->detail))
+        detail = d->detail;
+    const uint32_t key = pack_key(id, source, n64_base, detail >= 0);
+    const auto it = map.find(key);
+    if (it != map.end() && !it->second.texture && !it->second.job && it->second.slot == UINT32_MAX) continue;
+    out->id = id;
+    out->source = source;
+    out->n64_base = n64_base;
+    out->key = key;
+    out->detail = detail;
+    if (n64_base) {
+      const pd::n64dec::Image* im = pd::n64tex::Get(id);
+      out->base_w = im ? im->w : 0;
+      out->base_h = im ? im->h : 0;
+    } else {
+      out->base_w = (f[2] & 0x1FFF) + 1;
+      out->base_h = ((f[2] >> 13) & 0x1FFF) + 1;
+    }
+    return true;
+  }
+  return false;
 }
 
-// The slot of id's pack picture. Decoded on the texture worker; until it is
-// ready (or if it can't be used) UINT32_MAX: the base picture is drawn
-// meanwhile, so a pack never makes a draw wait.
-uint32_t pack_slot(int id, bool may_commit) {
-  ResolvedTexture& t = g.pack[uint32_t(id)];
+bool pack_choice(uint32_t tex, const uint32_t* f, PackChoice* out) {
+  if (g.pack_hold) return false;
+  return pack_choice_in(g.pack_index, g.n64_on, pd::n64tex::RoomsDrawing(), g.pack, tex, f, out);
+}
+
+// Pack pictures left out this stage because their shape doesn't fit (logged at the
+// stage's end; the first few by name as they happen).
+std::atomic<int> g_pack_wrong_shape{0};
+
+// At most ~16 MB of pack pictures uploaded a frame (at least one): a pack chosen in
+// the middle of a level has hundreds ready at once (Ultimate's 3072x1536 font atlases
+// among them), which uploaded together made one frame of 345 ms. The rest wait a frame
+// or two. Not on a level's loading frames.
+bool pack_commit_fits(const ResolvedTexture& t) {
+  const uint64_t kPackCommitBudget = uint64_t(std::max(1, REXCVAR_GET(pd_texture_pack_upload_mb))) << 20;
+  const uint64_t bytes = t.job->result.data.size();
+  // (While a frame is held for pictures, HANDOVER 4dv, nothing is on screen to stutter.)
+  if (g.pack_commit_bytes > 0 && g.pack_commit_bytes + bytes > kPackCommitBudget && g.tex_requests <= 24 &&
+      g.hold_since == 0)
+    return false;
+  g.pack_commit_bytes += bytes;
+  ++g.pack_commit_n;
+  return true;
+}
+
+// The slot of a pack picture (`map` / `index`: the pack shown, or the one being prepared).
+// Decoded on the pack workers; until it is ready (or if it can't be used) UINT32_MAX:
+// the base picture is drawn meanwhile, so a pack never makes a draw wait.
+uint32_t pack_slot_in(std::unordered_map<uint32_t, ResolvedTexture>& map, const pd::texpack::Index& index,
+                      const PackChoice& c, bool may_commit) {
+  ResolvedTexture& t = map[c.key];
+  const bool shown = &map == &g.pack;
   if (t.texture) return t.slot;
   if (t.job) {
-    if (!may_commit || !t.job->done.load(std::memory_order_acquire)) return UINT32_MAX;
-    const std::shared_ptr<TextureJob> job = std::move(t.job);
-    const uint32_t slot = commit_texture(t, job->result);
-    return t.texture ? slot : UINT32_MAX;
+    if (!may_commit || !t.job->done.load(std::memory_order_acquire)) {
+      if (shown) ++g.pack_waiting;
+      return UINT32_MAX;
+    }
+    if (!take_pack_job(t)) {
+      if (shown) ++g.pack_waiting;
+      return UINT32_MAX;
+    }
+    return t.texture ? t.slot : UINT32_MAX;
   }
   if (t.slot == UINT32_MAX || !may_commit) return UINT32_MAX;
+  if (shown) ++g.pack_waiting, ++g.pack_started;
   auto job = std::make_shared<TextureJob>();
-  const std::filesystem::path path = g.pack_index->by_id[size_t(id)];
-  job->make = [path, id](PreparedTexture& p) {
+  job->upload = true;
+  const std::filesystem::path path = *index.Picture(c.source, c.id);
+  const bool flip = index.pc_port && !index.N64Only(c.id) && !pd::texpack::FontAtlas(c.id);
+  std::filesystem::path detail_path;
+  if (c.detail >= 0)
+    if (const std::filesystem::path* dp = index.Picture(0, c.detail)) detail_path = *dp;
+  job->make = [path, c, flip, detail_path](PreparedTexture& p) {
     std::vector<uint8_t> rgba;
     uint32_t w = 0, h = 0;
     std::string error;
-    if (!pd::texpack::LoadPicture(path, rgba, w, h, &error)) {
-      REXKRNL_WARN("[texpack] {} (texture {}) not used: {}", path.filename().string(), id, error);
+    bool wrong_shape = false;
+    if (!pd::texpack::LoadPicture(path, rgba, w, h, &error, flip, c.base_w, c.base_h, &wrong_shape)) {
+      const int n = wrong_shape ? g_pack_wrong_shape.fetch_add(1) : 0;
+      if (!wrong_shape)
+        REXKRNL_WARN("[texpack] {} (texture {}) not used: {}", path.filename().string(), c.id, error);
+      else if (n < 8)
+        REXKRNL_INFO("[texpack] {}{} (texture {}) not used over the {} picture: {}", c.source == 1 ? "xbla\\" : "",
+                     path.filename().string(), c.id, c.n64_base ? "N64" : "remastered", error);
       return;  // p.ok stays false: committed as unusable, the base picture stays
+    }
+    if (!detail_path.empty()) {
+      const pd::texpack::DetailLayer* d = pd::texpack::DetailLayerFor(c.id);
+      std::vector<uint8_t> det;
+      uint32_t dw = 0, dh = 0;
+      std::string derr;
+      if (d && pd::texpack::LoadPicture(detail_path, det, dw, dh, &derr, flip)) {
+        const uint32_t w0 = w, h0 = h;
+        pd::texpack::BakeDetail(rgba, w, h, det, dw, dh, *d);
+        REXKRNL_INFO("[texpack] {} (texture {}): the N64's detail texture {} ({}, {}x{}) drawn in, {}x{} repeats, "
+                     "{:.0f}% close up ({}x{} -> {}x{})",
+                     path.filename().string(), c.id, c.detail, detail_path.filename().string(), dw, dh, d->repeat_s,
+                     d->repeat_t, d->weight * 100.f, w0, h0, w, h);
+      } else {
+        REXKRNL_WARN("[texpack] {} (detail texture {} for {}) not used: {}", detail_path.filename().string(),
+                     c.detail, c.id, derr);
+      }
     }
     uint32_t levels = 1;
     while ((std::max(w, h) >> levels) != 0) ++levels;
     fill_rgba_levels(p, std::move(rgba), w, h, levels);
   };
   t.job = job;
-  g_texture_worker.push(std::move(job));
+  g_pack_workers.push(job);
   return UINT32_MAX;
 }
 
+uint32_t pack_slot(const PackChoice& c, bool may_commit) { return pack_slot_in(g.pack, *g.pack_index, c, may_commit); }
+
+// A texture drawn while a pack is being prepared: its picture in the look being prepared
+// is started (decoded on the pack workers, uploaded at the start of a frame).
+void prep_touch(uint32_t tex, const uint32_t* f) {
+  const bool n64 = g.prep.n64 && pd::n64tex::GetStatus() == pd::n64tex::Status::kReady;
+  const bool rooms = n64 == g.n64_on ? pd::n64tex::RoomsDrawing() : (n64 && pd::n64tex::RoomsWanted());
+  PackChoice c;
+  if (!pack_choice_in(g.prep.index, n64, rooms, g.pack_next, tex, f, &c)) return;
+  const auto it = g.pack_next.find(c.key);
+  if (it != g.pack_next.end()) return;  // (started, done, or found unusable)
+  ++g.prep_new;
+  pack_slot_in(g.pack_next, *g.prep.index, c, true);
+}
+
 // The texture dump (pd_texture_dump): each bank texture a pack can replace is
-// written once a session as resources\userdata\texture-dump\remastered\<id>.png
+// written once a session as resources\userdata\texture-dump\ext_tex\xbla\<id>.png
 // (the base level, as the game's own data has it), and while N64 textures are
-// on, its N64 picture as drawn in ...\n64\<id>.png. Written on the worker.
+// on, its N64 picture as drawn in ...\ext_tex\<id>.png: the PC-port pack layout
+// (hex ids, right way up; pd_texture_packs.h DumpSubfolder). Written on the worker.
 void dump_texture_once(uint32_t tex, const uint32_t* f) {
   const int id = bank_texture_id(tex);
   if (id < 0 || !plain_rgba_2d(f)) return;
@@ -2698,9 +3293,7 @@ void dump_texture_once(uint32_t tex, const uint32_t* f) {
   std::array<uint32_t, 6> fc;
   std::memcpy(fc.data(), f, sizeof(uint32_t) * 6);
   job->make = [fc, addr, id, want_remastered, n64_rgba = std::move(n64_rgba), n64_w, n64_h](PreparedTexture&) {
-    char name[16];
-    std::snprintf(name, sizeof(name), "%04d.png", id);
-    const std::filesystem::path folder = pd::texpack::DumpFolder();
+    const std::string name = pd::texpack::DumpName(id);
     if (want_remastered) {
       const uint32_t fmt = fc[1] & 0x3F, endian = (fc[1] >> 6) & 3;
       const bool tiled = (fc[0] >> 31) & 1;
@@ -2712,11 +3305,109 @@ void dump_texture_once(uint32_t tex, const uint32_t* f) {
       packed_base_offset(fc.data(), w, h, std::max(1u, tf.block), ox, oy);
       std::vector<uint8_t> rgba(size_t(w) * h * 4);
       if (decode_texture_seh(addr, fmt, endian, tiled, w, h, std::max(pitch, w), swizzle, rgba.data(), w * 4, ox, oy))
-        pd::texpack::WritePng(folder / "remastered" / name, rgba.data(), w, h);
+        pd::texpack::WriteDumpPng(pd::texpack::DumpSubfolder(false) / name, rgba.data(), w, h);
     }
-    if (!n64_rgba.empty()) pd::texpack::WritePng(folder / "n64" / name, n64_rgba.data(), n64_w, n64_h);
+    if (!n64_rgba.empty())
+      pd::texpack::WriteDumpPng(pd::texpack::DumpSubfolder(true) / name, n64_rgba.data(), n64_w, n64_h);
   };
   g_texture_worker.push(std::move(job));  // (nobody waits for it)
+}
+
+// Sets `t` up for the guest texture of fetch constant `f`: where its data is, whether the
+// game may rewrite it (dynamic) and its content hash. False (t.slot = UINT32_MAX) for a
+// format or size not uploaded, or memory that can't be read.
+bool fetch_begin(ResolvedTexture& t, const uint32_t* f) {
+  const uint32_t fmt = f[1] & 0x3F, dim = (f[5] >> 9) & 3;
+  const bool tiled = (f[0] >> 31) & 1;
+  const uint32_t width = (f[2] & 0x1FFF) + 1, height = ((f[2] >> 13) & 0x1FFF) + 1;
+  const uint32_t pitch = ((f[0] >> 22) & 0x1FF) * 32;
+  const uint32_t phys = f[1] & 0xFFFFF000u;
+  TexFormat tf;
+  if ((dim != 1 && dim != 3) || !tex_format(fmt, tf) || width > 4096 || height > 4096) {
+    t.slot = UINT32_MAX;
+    static uint64_t logged = 0;
+    if (fmt < 64 && !(logged & (1ull << fmt))) {
+      logged |= 1ull << fmt;
+      REXKRNL_WARN("PDNATIVE texture format {} dim {} {}x{} not uploaded yet", fmt, dim, width, height);
+    }
+    return false;
+  }
+  const uint32_t bh = (height + tf.block - 1) / tf.block, pitch_blocks = std::max<uint32_t>(pitch, width) / tf.block;
+  const uint32_t span = dim == 3 ? cube_face_stride(f) * 6
+                        : tiled ? ((pitch_blocks + 31) & ~31u) * ((bh + 31) & ~31u) * tf.bpb : pitch_blocks * bh * tf.bpb;
+  // Base addresses stored in the 0xE0000000 range (CAFF-loaded textures) are
+  // read 4 KB on, like shader microcode (tested: the title logo only decodes
+  // there); true physical addresses go through the mapped alias.
+  const uint32_t addr = phys >= 0xE0000000u ? gpu_view(phys) : cpu_view_of_physical(phys & 0x1FFFFFFFu, span);
+  if (!addr) { t.slot = UINT32_MAX; return false; }
+  t.dynamic = phys < 0xE0000000u;
+  t.addr = addr;
+  t.span = span;
+  if (t.dynamic) {
+    hash_bytes_seh(addr, span, &t.content);
+    t.checked_frame = g.frames + 1;
+  } else if (!REXCVAR_GET(gpu_native_stage_textures)) {
+    hash_bytes_seh(addr, span, &t.content);  // (test: kept to count stale ones in begin_frame)
+  }
+  return true;
+}
+
+// The pack map the standby's pictures go in: the shown pack's or the one being prepared when
+// it is that pack (one copy of each picture), else pack_alt. nullptr: no pack in the standby.
+std::unordered_map<uint32_t, ResolvedTexture>* sb_map() {
+  if (!g.sb_active || !g.sb.index || g.sb.index->name.empty()) return nullptr;
+  const auto same = [](const std::shared_ptr<const pd::texpack::Index>& a,
+                       const std::shared_ptr<const pd::texpack::Index>& b) {
+    return a && b && a->name == b->name && a->version == b->version;
+  };
+  if (same(g.sb.index, g.pack_index)) return &g.pack;
+  if (same(g.sb.index, g.prep.index)) return &g.pack_next;
+  return &g.pack_alt;
+}
+
+// A texture drawn while the other slot's look is kept ready (HANDOVER 4dp): its picture in
+// that look started, so G can show it in the next frame: the pack's picture (decoded and
+// uploaded off the frame), else the base: the N64 picture (made here, a few a frame) or the
+// remastered texture (prepared on the texture worker, committed at the start of a frame).
+void standby_touch(uint32_t tex, const uint32_t* f) {
+  if (!g.sb_seen.insert(tex).second) return;  // (once a frame)
+  const bool n64 = g.sb.n64 && pd::n64tex::GetStatus() == pd::n64tex::Status::kReady;
+  const bool rooms = n64 == g.n64_on ? pd::n64tex::RoomsDrawing() : (n64 && pd::n64tex::RoomsWanted());
+  if (auto* map = sb_map()) {
+    PackChoice c;
+    if (pack_choice_in(g.sb.index, n64, rooms, *map, tex, f, &c)) {
+      if (map->find(c.key) == map->end()) {
+        ++g.sb_new;
+        pack_slot_in(*map, *g.sb.index, c, true);
+      }
+      return;
+    }
+  }
+  if (const int id = classic_id_for(tex, f, n64, rooms); id >= 0) {
+    const auto it = g.classic.find(uint32_t(id));
+    if (it != g.classic.end() && (it->second.texture || it->second.slot == UINT32_MAX)) return;
+    ++g.sb_new;
+    if (g.sb_classic_left == 0) return;  // (next frame)
+    --g.sb_classic_left;
+    classic_slot(id, f, true);
+    return;
+  }
+  const uint64_t key = fnv1a(reinterpret_cast<const uint8_t*>(f), sizeof(uint32_t) * 6);
+  if (g.textures_by_fetch.count(key)) return;  // (made, being made, or not uploadable)
+  ResolvedTexture& t = g.textures_by_fetch[key];
+  ++g.sb_new;
+  if (!fetch_begin(t, f)) return;
+  // (on the pack workers, at their low priority: the texture worker stays free for the
+  // textures the look shown is waiting for)
+  auto job = std::make_shared<TextureJob>();
+  std::memcpy(job->f, f, sizeof(uint32_t) * 6);
+  job->addr = t.addr;
+  job->tex = tex;
+  job->make = [job_f = std::array<uint32_t, 6>{f[0], f[1], f[2], f[3], f[4], f[5]}, addr = t.addr,
+               tex](PreparedTexture& p) { prepare_texture(job_f.data(), addr, tex, p); };
+  t.job = job;
+  g_pack_workers.push(job);
+  g.sb_base_pending.push_back(key);
 }
 
 uint32_t texture_slot(uint32_t tex, bool may_commit = false) {
@@ -2745,10 +3436,13 @@ uint32_t texture_slot(uint32_t tex, bool may_commit = false) {
     if (rr != g.resolved.end() && rr->second.texture) return resolved_slot(tex, rr->second);
   }
   if (may_commit && pd::texpack::Dumping()) dump_texture_once(tex, f);
+  if (may_commit && g.prep.index && !g.prep_done) prep_touch(tex, f);
+  // (The other slot's pictures wait while frames are held for the shown pack's: 4dv.)
+  if (may_commit && g.sb_active && g.hold_since == 0 && !g.stage_window) standby_touch(tex, f);
   // A texture pack's picture first (over the N64 or the remastered one), then
   // the N64 picture, then the game's own.
-  if (const int id = pack_id(tex, f); id >= 0) {
-    const uint32_t s = pack_slot(id, may_commit);
+  if (PackChoice c; pack_choice(tex, f, &c)) {
+    const uint32_t s = pack_slot(c, may_commit);
     if (s != UINT32_MAX) return s;
   }
   if (const int id = classic_id(tex, f); id >= 0) {
@@ -2780,38 +3474,8 @@ uint32_t texture_slot(uint32_t tex, bool may_commit = false) {
     double t0 = now_ms();
     ~Timer() { g.tex_ms += now_ms() - t0; ++g.tex_n; }
   } timer;
-  const uint32_t fmt = f[1] & 0x3F, dim = (f[5] >> 9) & 3;
-  const bool tiled = (f[0] >> 31) & 1;
-  const uint32_t width = (f[2] & 0x1FFF) + 1, height = ((f[2] >> 13) & 0x1FFF) + 1;
-  const uint32_t pitch = ((f[0] >> 22) & 0x1FF) * 32;
-  const uint32_t phys = f[1] & 0xFFFFF000u;
-  TexFormat tf;
-  if ((dim != 1 && dim != 3) || !tex_format(fmt, tf) || width > 4096 || height > 4096) {
-    t.slot = UINT32_MAX;
-    static uint64_t logged = 0;
-    if (fmt < 64 && !(logged & (1ull << fmt))) {
-      logged |= 1ull << fmt;
-      REXKRNL_WARN("PDNATIVE texture format {} dim {} {}x{} not uploaded yet", fmt, dim, width, height);
-    }
-    return 0;
-  }
-  const uint32_t bh = (height + tf.block - 1) / tf.block, pitch_blocks = std::max<uint32_t>(pitch, width) / tf.block;
-  const uint32_t span = dim == 3 ? cube_face_stride(f) * 6
-                        : tiled ? ((pitch_blocks + 31) & ~31u) * ((bh + 31) & ~31u) * tf.bpb : pitch_blocks * bh * tf.bpb;
-  // Base addresses stored in the 0xE0000000 range (CAFF-loaded textures) are
-  // read 4 KB on, like shader microcode (tested: the title logo only decodes
-  // there); true physical addresses go through the mapped alias.
-  const uint32_t addr = phys >= 0xE0000000u ? gpu_view(phys) : cpu_view_of_physical(phys & 0x1FFFFFFFu, span);
-  if (!addr) { t.slot = UINT32_MAX; return 0; }
-  t.dynamic = phys < 0xE0000000u;
-  t.addr = addr;
-  t.span = span;
-  if (t.dynamic) {
-    hash_bytes_seh(addr, span, &t.content);
-    t.checked_frame = g.frames + 1;
-  } else if (!REXCVAR_GET(gpu_native_stage_textures)) {
-    hash_bytes_seh(addr, span, &t.content);  // (test: kept to count stale ones in begin_frame)
-  }
+  if (!fetch_begin(t, f)) return 0;
+  const uint32_t addr = t.addr;
   // In level, a burst of new textures (new objects coming into view) used to
   // cost a 25 ms frame: past ~1 ms of texture work in a frame they go to the
   // worker, and the draws using them wait a frame or two. Frames that ask for
@@ -2847,8 +3511,8 @@ bool texture_pending(uint32_t tex) {
   // A texture pack's picture that is ready: drawn with it, whatever the base
   // picture (whose upload, started while the pack's was decoding, is never
   // collected and would keep the draw waiting) is doing.
-  if (const int id = pack_id(tex, f); id >= 0) {
-    const auto p = g.pack.find(uint32_t(id));
+  if (PackChoice c; pack_choice(tex, f, &c)) {
+    const auto p = g.pack.find(c.key);
     if (p != g.pack.end() && p->second.texture) return false;
   }
   if (const int id = classic_id(tex, f); id >= 0) {  // the N64 picture is made in the draw: never waits
@@ -3114,6 +3778,12 @@ void begin_frame() {
     g.depth_pass_failed = false;
     REXKRNL_INFO("PDNATIVE anti-aliasing: {}x MSAA", uint32_t(want));
   }
+  // A new stage: its first frames held until the shown pack's pictures are ready
+  // (hold_this_frame, HANDOVER 4dv).
+  if (g32(kStageNum) != g.textures_stage) {
+    g.stage_window = true;
+    g.hold_open_until = now_ms() + 3000.0;
+  }
   // A new stage (a level, or the front end) loads its textures where the last
   // one's were: the same fetch constants can then name a different picture
   // (Cradle after a run of levels showed red from an earlier one), and the
@@ -3153,21 +3823,196 @@ void begin_frame() {
       ++packed;
     }
     g.pack.clear();  // (a picture still on the worker is dropped with its job)
+    for (auto& [id, t] : g.pack_next)
+      if (t.texture) g.retired_textures.push_back({g.frames, std::move(t.texture), t.slot});
+    g.pack_next.clear();  // (a pack being prepared: its pictures for the new stage's textures)
+    g.prep_frames = 0;
+    for (auto& [id, t] : g.pack_alt)
+      if (t.texture) g.retired_textures.push_back({g.frames, std::move(t.texture), t.slot});
+    g.pack_alt.clear();  // (the standby: made again for the new stage's textures)
+    g.sb_base_pending.clear();
+    g.sb_frames = 0;
+    if (const int skipped = g_pack_wrong_shape.exchange(0))
+      REXKRNL_INFO("[texpack] stage {}: {} pack pictures not used (their shape doesn't fit the texture)", stage,
+                   skipped);
     if (n) REXKRNL_INFO("PDNATIVE stage {}: {} textures from the last stage released{}{}", stage, n,
                         n64 ? fmt::format(" (and {} N64 ones)", n64) : std::string(),
                         packed ? fmt::format(" (and {} from the texture pack)", packed) : std::string());
   }
-  // Texture packs: another pack chosen (or none) since the last frame: its
-  // pictures go, the new one's come as they're drawn.
+  // Texture packs (HANDOVER 4do, 4dp): the look (the pack and the base) and the standby (the
+  // other Texture Pack slot's look), read together, as of this frame. Another pack chosen
+  // since the last frame: the standby's pictures take over if it is that pack (G), or the
+  // ones prepared for it (its pictures for what is on screen are in already); the same pack's
+  // index made again once the ROM loaded keeps the pictures whose file is the same; otherwise
+  // the new one's come as they're drawn. The old pack's pictures become the standby's if it
+  // is that pack now (G back is at once too), else they go.
+  const auto retire_all = [](std::unordered_map<uint32_t, ResolvedTexture>& map) {
+    for (auto& [id, t] : map)
+      if (t.texture) g.retired_textures.push_back({g.frames, std::move(t.texture), t.slot});
+    map.clear();
+  };
+  const auto same_pack = [](const std::shared_ptr<const pd::texpack::Index>& a,
+                            const std::shared_ptr<const pd::texpack::Index>& b) {
+    return a && b && a->name == b->name && a->version == b->version;
+  };
+  // Pictures of `from` kept for index `to` (the same pack indexed again): those whose file is the same.
+  const auto keep_same_files = [](std::unordered_map<uint32_t, ResolvedTexture>& map,
+                                  const pd::texpack::Index& from, const pd::texpack::Index& to) {
+    size_t kept = 0;
+    for (auto it = map.begin(); it != map.end();) {
+      const int id = int(it->first & 0x3FFF), source = int((it->first >> 14) & 3);
+      const std::filesystem::path* was = from.Picture(source, id);
+      const std::filesystem::path* now = to.Picture(source, id);
+      if (was && now && *was == *now) {
+        ++kept;
+        ++it;
+        continue;
+      }
+      if (it->second.texture) g.retired_textures.push_back({g.frames, std::move(it->second.texture), it->second.slot});
+      it = map.erase(it);
+    }
+    return kept;
+  };
+  const double packs_t0 = now_ms();
+  const pd::texpack::Looks looks = pd::texpack::CurrentLooks();
+  const pd::texpack::Standby& sb = looks.standby;
+  const bool standby_on = REXCVAR_GET(pd_texture_standby);
   {
-    std::shared_ptr<const pd::texpack::Index> index = pd::texpack::CurrentIndex();
-    if (!g.pack_index || index->version != g.pack_index->version) {
-      for (auto& [id, t] : g.pack)
-        if (t.texture) g.retired_textures.push_back({g.frames, std::move(t.texture), t.slot});
-      g.pack.clear();
+    const pd::texpack::Look& look = looks.look;
+    const bool rom_ready = pd::n64tex::GetStatus() == pd::n64tex::Status::kReady;
+    g.n64_on = look.n64 && rom_ready;
+    g.pack_hold = look.n64 && !rom_ready;
+    std::shared_ptr<const pd::texpack::Index> index = look.index;
+    const bool changed = !g.pack_index || index->version != g.pack_index->version || index->name != g.pack_index->name;
+    // (the same pack over the other base look, e.g. after the ROM was imported, is a new look too)
+    const bool prep_match = g.prep.index && g.prep.index->version == index->version &&
+                            g.prep.index->name == index->name && g.prep.n64 == look.n64;
+    if (changed || (prep_match && g.prep_done)) {
+      std::unordered_map<uint32_t, ResolvedTexture> old;
+      old.swap(g.pack);
+      const std::shared_ptr<const pd::texpack::Index> old_index = g.pack_index;
+      if (changed && same_pack(index, g.alt_index)) {
+        size_t ready = 0;
+        for (const auto& [key, t] : g.pack_alt) ready += t.texture ? 1 : 0;
+        g.pack.swap(g.pack_alt);
+        g.alt_index.reset();
+        if (REXCVAR_GET(pd_texture_pack_trace)) g.pack_trace = 120;
+        REXKRNL_INFO("[texpack] \"{}\" shown ({} look) from the pictures kept ready: {}", index->name,
+                     look.n64 ? "N64" : "remastered", ready);
+      } else if (prep_match) {
+        size_t ready = 0;
+        for (const auto& [key, t] : g.pack_next) ready += t.texture ? 1 : 0;
+        g.pack.swap(g.pack_next);
+        if (REXCVAR_GET(pd_texture_pack_trace)) g.pack_trace = 120;
+        REXKRNL_INFO("[texpack] \"{}\" shown ({} look): {} pictures prepared, {:.0f} ms after it was asked for",
+                     index->name, look.n64 ? "N64" : "remastered", ready, now_ms() - g.prep_t0);
+        g.prep = {};
+        g.prep_done = false;
+      } else if (old_index && index->keep_from == old_index->version && index->name == old_index->name) {
+        const size_t kept = keep_same_files(old, *old_index, *index);
+        g.pack.swap(old);
+        REXKRNL_INFO("[texpack] \"{}\" indexed again: {} pictures kept", index->name, kept);
+      }
+      if (!old.empty()) {
+        if (same_pack(old_index, index)) {
+          // (the same pack over the other base: its pictures for this one are the same keys)
+          for (auto& [key, t] : old) {
+            if (!g.pack.count(key)) g.pack.emplace(key, std::move(t));
+            else if (t.texture) g.retired_textures.push_back({g.frames, std::move(t.texture), t.slot});
+          }
+          old.clear();
+        } else if (standby_on && sb.valid && same_pack(sb.index, old_index)) {
+          retire_all(g.pack_alt);
+          g.pack_alt.swap(old);
+          g.alt_index = old_index;
+        } else {
+          retire_all(old);
+        }
+      }
       g.pack_index = std::move(index);
     }
   }
+  // A pack to prepare (pd_texture_packs.h RequestPrepare): a new request starts afresh, from
+  // the standby's pictures if it is that pack (G pressed before they were all in).
+  bool prep_check = false;
+  uint32_t prep_new_last = 0;
+  {
+    const pd::texpack::Prepare req = pd::texpack::PendingPrepare();
+    if (req.serial != g.prep_serial) {
+      g.prep_serial = req.serial;
+      if (req.index && same_pack(req.index, g.alt_index)) {
+        retire_all(g.pack_next);
+        g.pack_next.swap(g.pack_alt);
+        g.alt_index.reset();
+      } else if (standby_on && sb.valid && same_pack(g.prep.index, sb.index) && !same_pack(sb.index, g.pack_index) &&
+                 !same_pack(req.index, g.prep.index)) {
+        retire_all(g.pack_alt);  // (the old request was the standby's pack: its pictures kept for it)
+        g.pack_alt.swap(g.pack_next);
+        g.alt_index = g.prep.index;
+      } else if (!same_pack(req.index, g.prep.index)) {
+        retire_all(g.pack_next);
+      }
+      g.prep = req;
+      g.prep_done = false;
+      g.prep_frames = 0;
+      g.prep_new = 0;
+      g.prep_t0 = now_ms();
+      if (REXCVAR_GET(pd_texture_pack_trace)) g.pack_trace = 120;
+      if (req.index && g.pack_index && req.index->version == g.pack_index->version &&
+          req.index->name == g.pack_index->name && req.n64 == pd::texpack::CurrentLook().n64) {
+        g.prep = {};  // (shown already: nothing to take over)
+        pd::texpack::MarkPrepared(req.serial);
+      }
+    }
+    if (g.prep.index && !g.prep_done) {
+      ++g.prep_frames;
+      prep_new_last = g.prep_new;
+      g.prep_new = 0;
+      prep_check = true;
+    }
+  }
+  // The standby (HANDOVER 4dp): kept only when it is valid and not the look shown (Texture
+  // Pack 2 None: nothing, no memory); pack_alt holds its pack's pictures when that is neither
+  // the pack shown nor the one being prepared (sb_map).
+  {
+    const bool same_look = sb.valid && same_pack(sb.index, g.pack_index) && sb.n64 == looks.look.n64;
+    const bool active = standby_on && sb.valid && !same_look;
+    if (sb.serial != g.sb.serial || active != g.sb_active) {
+      g.sb_frames = 0;
+      g.sb_base_pending.clear();
+    }
+    g.sb = sb;
+    g.sb_active = active;
+    const bool want_alt = active && sb.index && !sb.index->name.empty() && !same_pack(sb.index, g.pack_index) &&
+                          !same_pack(sb.index, g.prep.index);
+    if (!want_alt) {
+      if (g.alt_index || !g.pack_alt.empty()) {
+        retire_all(g.pack_alt);
+        g.alt_index.reset();
+      }
+    } else if (!same_pack(g.alt_index, sb.index)) {
+      if (g.alt_index && sb.index->keep_from == g.alt_index->version && sb.index->name == g.alt_index->name)
+        keep_same_files(g.pack_alt, *g.alt_index, *sb.index);
+      else
+        retire_all(g.pack_alt);
+      g.alt_index = sb.index;
+    }
+    if (!active && g.sb_marked) {
+      g.sb_marked = 0;
+    }
+    if (standby_on && sb.valid && same_look && g.sb_marked != sb.serial) {
+      // (the look shown is the standby: ready as it is)
+      g.sb_marked = sb.serial;
+      pd::texpack::MarkStandbyReady(sb.serial, true);
+    }
+    g.sb_seen.clear();
+    g.sb_new_last = g.sb_new;
+    g.sb_new = 0;
+    g.sb_classic_left = 8;
+    if (active) ++g.sb_frames;
+  }
+  if (const double ms = now_ms() - packs_t0; ms > 3.0)
+    REXKRNL_INFO("[texpack] the look's pictures sorted in {:.1f} ms", ms);
   g.cmd->begin();
   g.prof_active = g.prof_pool && REXCVAR_GET(gpu_native_profile_frame) > 0 &&
                   g.frames + 1 == uint64_t(REXCVAR_GET(gpu_native_profile_frame));
@@ -3185,12 +4030,107 @@ void begin_frame() {
   g.recording = true;
   g.draws = g.skipped = 0;
   std::memset(g.skip_reason, 0, sizeof(g.skip_reason));
+  // The pack being prepared: its decoded pictures uploaded (within the frame's budget),
+  // and once every picture the last frames drew is in (or after 20 s), it is ready. Here,
+  // with the frame recording (as a draw's own uploads): a picture that needs more room in the
+  // upload ring then submits the frame so far (flush_mid_frame); before `recording` it only
+  // reset the ring under copies already recorded, and a big picture (Ultimate's 3072x3510
+  // font atlas) overwrote the ones before it (garbled menu text, 4do).
+  if (prep_check) {
+    struct Took {
+      double t0 = now_ms();
+      ~Took() {
+        if (const double ms = now_ms() - t0; ms > 3.0) REXKRNL_INFO("[texpack] prepared pictures taken in {:.1f} ms", ms);
+      }
+    } took;
+    uint32_t outstanding = 0, ready = 0;
+    for (auto& [key, t] : g.pack_next) {
+      if (t.texture) {
+        ++ready;
+        continue;
+      }
+      if (!t.job) continue;  // (unusable)
+      if (!t.job->done.load(std::memory_order_acquire) || !take_pack_job(t)) {
+        ++outstanding;
+        continue;
+      }
+      ready += t.texture ? 1 : 0;
+    }
+    using pd::n64tex::Status;
+    const Status rs = pd::n64tex::GetStatus();
+    const bool rom_settled = !g.prep.n64 || (rs != Status::kLoading && rs != Status::kIdle);
+    const double waited = now_ms() - g.prep_t0;
+    if ((g.prep_frames >= 4 && outstanding == 0 && prep_new_last == 0 && rom_settled) || waited > 20000.0) {
+      g.prep_done = true;
+      pd::texpack::MarkPrepared(g.prep.serial);
+      REXKRNL_INFO("[texpack] \"{}\" prepared ({} look): {} pictures in {:.0f} ms, {} frames{}", g.prep.index->name,
+                   g.prep.n64 ? "N64" : "remastered", ready, waited, g.prep_frames,
+                   outstanding ? fmt::format(" ({} not ready: the 20 s limit)", outstanding) : std::string());
+    }
+  }
+  // The standby (HANDOVER 4dp): its finished pictures taken in (pack pictures the uploader
+  // made: a descriptor each; remastered textures from the worker: committed within the
+  // frame's budget), and it is ready for G once every picture the last frame drew is in.
+  if (g.sb_active) {
+    const double t0 = now_ms();
+    struct Took {
+      double t0;
+      ~Took() {
+        if (const double ms = now_ms() - t0; ms > 3.0) REXKRNL_INFO("[texpack] the standby's pictures taken in {:.1f} ms", ms);
+      }
+    } took{t0};
+    uint32_t outstanding = 0, ready = 0;
+    if (auto* map = sb_map()) {
+      for (auto& [key, t] : *map) {
+        if (t.texture) {
+          ++ready;
+          continue;
+        }
+        if (!t.job) continue;  // (unusable)
+        if (!t.job->done.load(std::memory_order_acquire) || !take_pack_job(t)) {
+          ++outstanding;
+          continue;
+        }
+        ready += t.texture ? 1 : 0;
+      }
+    }
+    std::erase_if(g.sb_base_pending, [&](uint64_t key) {
+      const auto it = g.textures_by_fetch.find(key);
+      if (it == g.textures_by_fetch.end()) return true;
+      ResolvedTexture& t = it->second;
+      if (!t.job) return true;  // (made, or not uploadable)
+      if (!t.job->done.load(std::memory_order_acquire) || !pack_commit_fits(t)) {
+        ++outstanding;
+        return false;
+      }
+      const std::shared_ptr<TextureJob> job = std::move(t.job);
+      commit_texture(t, job->result);
+      return true;
+    });
+    const bool is_ready = g.sb_frames >= 2 && outstanding == 0 && g.sb_new_last == 0;
+    if (is_ready != (g.sb_marked == g.sb.serial)) {
+      g.sb_marked = is_ready ? g.sb.serial : 0;
+      pd::texpack::MarkStandbyReady(g.sb.serial, is_ready);
+      if (is_ready && g.sb_logged != g.sb.serial && (g.sb_logged = g.sb.serial))
+        REXKRNL_INFO("[texpack] kept ready for G: {} ({} look), {} pack pictures, {} frames",
+                     g.sb.index && !g.sb.index->name.empty() ? "\"" + g.sb.index->name + "\"" : std::string("no pack"),
+                     g.sb.n64 ? "N64" : "remastered", ready, g.sb_frames);
+    }
+  }
 }
 
 void prof_mark(std::string label) {
   if (!g.prof_active || g.prof_labels.size() >= 4096) return;
   g.cmd->writeTimestamp(g.prof_pool.get(), uint32_t(g.prof_labels.size()));
   g.prof_labels.push_back(std::move(label));
+}
+
+// The draw samples an environment cube map: one of the remaster's reflective pixel shaders,
+// the only ones that read c38.x as the reflectivity (HANDOVER 4dq / 4dw).
+bool reflective_draw() {
+  for (uint32_t s = 0; s < 16; ++s)
+    if (g_textures[s] && !g.resolved.count(g_textures[s]) && ((g32(g_textures[s] + 48) >> 9) & 3) == 3) return true;
+  return false;
 }
 
 void set_common_state(uint32_t dev) {
@@ -3258,10 +4198,30 @@ void set_common_state(uint32_t dev) {
       std::memcpy(dst + i, &w, 4);
     }
   };
-  auto upload_block = [&](uint32_t src, uint32_t bytes) -> uint64_t {
+  // A texture whose pack picture the pack's pd-pack.txt draws without reflections
+  // (no_reflection, HANDOVER 4dq): the remaster's reflective pixel shaders (the 12 that
+  // sample an environment cube map) mix the lit colour towards the environment map's by
+  // pixel constant c38.x (lerp(lit, env, saturate(c38.x * 1.15)), plus a highlight scaled
+  // by it); c38.x = 0 for this draw leaves the lit colour alone. Only c38.x of those
+  // shaders reads it (dxc -dumpbin of the shader cache); no other shader reads c38.
+  // Only draws that sample an environment cube (the reflective shaders, the ones known to read
+  // c38.x as the reflectivity): a shader that doesn't is left alone whatever it reads there.
+  // A pack's reflection mask (<id>-reflect) decides by part instead (g_draw_matte, set by the draw).
+  bool no_reflection = g_draw_matte;
+  if (g.pack_index && g.pack_index->no_reflection_n && !g.pack_hold && !no_reflection && reflective_draw()) {
+    for (uint32_t s = 0; s < 16 && !no_reflection; ++s) {
+      if (!g_textures[s] || !g.pack_index->NoReflection(bank_texture_id(g_textures[s]))) continue;
+      uint32_t f[6];
+      for (int i = 0; i < 6; ++i) f[i] = g32(g_textures[s] + 28 + i * 4);
+      PackChoice c;
+      no_reflection = pack_choice(g_textures[s], f, &c);
+    }
+  }
+  auto upload_block = [&](uint32_t src, uint32_t bytes, bool zero_c38x = false) -> uint64_t {
     alignas(16) uint8_t tmp[4096];
     bytes = std::max<uint32_t>(16, std::min<uint32_t>(bytes, 4096));
     swap_copy(tmp, src, bytes);
+    if (zero_c38x && bytes >= 39 * 16) std::memset(tmp + 38 * 16, 0, 4);
     const uint64_t key = XXH3_64bits_withSeed(tmp, bytes, bytes);
     const auto it = g.const_dedup.find(key);
     if (it != g.const_dedup.end()) return it->second;
@@ -3270,7 +4230,7 @@ void set_common_state(uint32_t dev) {
     return off;
   };
   const uint64_t vs = upload_block(dev + kDevVsConsts, g_vs_cb_bytes);
-  const uint64_t ps = upload_block(dev + kDevPsConsts, g_ps_cb_bytes);
+  const uint64_t ps = upload_block(dev + kDevPsConsts, g_ps_cb_bytes, no_reflection);
   const uint64_t shared = const_alloc(512);
   if (vs == UINT64_MAX || ps == UINT64_MAX || shared == UINT64_MAX) return;
   alignas(16) uint32_t sh[128] = {};
@@ -3889,6 +4849,30 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
              (uint64_t(el.usage) << 8 | el.index | uint64_t(uint8_t(el.exp)) << 16 | uint64_t(el.swizzle) << 24) *
                  0xC2B2AE3D27D4EB4Full;
   layout ^= (uint64_t(lo) << 32 | vcount) * 0x9E3779B97F4A7C15ull;
+  // A pack's reflection mask (<id>-reflect, HANDOVER 4dw) for a texture this draw samples with
+  // an environment cube (the remaster's reflective shaders): whether this part of the model is
+  // drawn without reflections, decided once per part from its vertices' texture coordinates
+  // (which needs them decoded: a part not decided yet skips the vertex cache once).
+  g_draw_matte = false;
+  const pd::texpack::Index::ReflectMask* rmask = nullptr;
+  uint64_t rkey = 0;
+  if (g.pack_index && g.pack_index->reflect_n && !g.pack_hold && reflective_draw()) {
+    for (uint32_t s = 0; s < 16 && !rmask; ++s) {
+      if (!g_textures[s]) continue;
+      const int id = bank_texture_id(g_textures[s]);
+      const auto* m = g.pack_index->Reflect(id);
+      if (!m) continue;
+      uint32_t f[6];
+      for (int i = 0; i < 6; ++i) f[i] = g32(g_textures[s] + 28 + i * 4);
+      if (PackChoice c; pack_choice(g_textures[s], f, &c)) {
+        rmask = m;
+        rkey = layout ^ (uint64_t(id) * 0xA24BAED4963EE407ull) ^ (uint64_t(g.pack_index->version) * 0x9FB21C651E98DF25ull);
+      }
+    }
+  }
+  const auto rpart = rmask ? g_reflect_parts.find(rkey) : g_reflect_parts.end();
+  const bool need_uv = rmask && rpart == g_reflect_parts.end();
+  if (rmask && !need_uv) g_draw_matte = rpart->second;
   Native::VertexCacheEntry* entry = up_data || rects ? nullptr : &g.vertex_cache[layout];
   uint64_t content = 0;
   const double t_h = now_ms();
@@ -3898,7 +4882,7 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
     ++g.skipped; ++g.skip_reason[4]; return;
   }
   RenderBufferReference vref;
-  const bool hit = !tracing() && entry && entry->buffer && entry->content == content;
+  const bool hit = !tracing() && !need_uv && entry && entry->buffer && entry->content == content;
   if (entry) entry->last_frame = g.frames;
   if (hit) ++g.vcache_hits; else ++g.vcache_misses;
   const uint64_t voff = hit ? 0 : upload_alloc(vbytes, 16);
@@ -3916,6 +4900,27 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
                    up_data ? "UP" : from_shader ? "fetch" : "decl");
     ++g.skipped; ++g.skip_reason[4];
     return;
+  }
+  if (need_uv) {
+    // Each vertex's first texture coordinates on the mask: the part is matte when most of them
+    // lie on black (below half grey). Its vertices are the draw's range (one part of the model).
+    size_t uv = els.size();
+    for (size_t e = 0; e < els.size() && uv == els.size(); ++e)
+      if (els[e].usage == 5 && els[e].index == 0 && hfmts[e].kind != HostKind::kRaw && hfmts[e].size >= 8) uv = e;
+    uint32_t black = 0;
+    if (uv < els.size())
+      for (uint32_t i = 0; i < vcount; ++i) {
+        float t[2];
+        std::memcpy(t, g.upload_ptr + voff + uint64_t(i) * host_stride + hoffsets[uv], 8);
+        black += rmask->At(t[0], t[1], g.pack_index->pc_port) < 128 ? 1 : 0;
+      }
+    g_draw_matte = uv < els.size() && vcount && black * 2 > vcount;
+    if (g_reflect_parts.size() > 4096) g_reflect_parts.clear();
+    g_reflect_parts[rkey] = g_draw_matte;
+    static std::unordered_set<uint64_t> logged;
+    if (logged.size() < 64 && logged.insert(uint64_t(vcount) << 32 ^ std::hash<std::string>()(rmask->file) ^ g_draw_matte).second)
+      REXKRNL_INFO("[texpack] {}: a part of {} vertices ({} on black) drawn {}", rmask->file, vcount, black,
+                   g_draw_matte ? "without reflections" : "with its reflections");
   }
   size_t rect_pos = els.size();  // the position element (for the right-angle corner)
   for (size_t e = 0; e < els.size(); ++e)
@@ -4041,8 +5046,20 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
   if (tracing()) {
     const DrawState& st = g_draw_state;
     std::string tex;
-    for (uint32_t t = 0; t < 8; ++t)
-      if (g_textures[t]) tex += fmt::format(" s{}={:08X}->{} sign {:02X} fmt {}", t, g_textures[t], texture_slot(g_textures[t]), (g32(dev + 1152 + t * 24) >> 2) & 0xFF, g32(dev + 1152 + t * 24 + 4) & 0x3F);
+    for (uint32_t t = 0; t < 8; ++t) {
+      if (!g_textures[t]) continue;
+      tex += fmt::format(" s{}={:08X}->{} sign {:02X} fmt {}", t, g_textures[t], texture_slot(g_textures[t]), (g32(dev + 1152 + t * 24) >> 2) & 0xFF, g32(dev + 1152 + t * 24 + 4) & 0x3F);
+      // The bank texture's id, its size and swizzle, and the pack picture standing in for it.
+      uint32_t f[6];
+      for (int i = 0; i < 6; ++i) f[i] = g32(g_textures[t] + 28 + i * 4);
+      const int id = bank_texture_id(g_textures[t]);
+      if (id >= 0)
+        tex += fmt::format(" id {} {}x{} swz {:03X}", id, (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1, (f[3] >> 1) & 0xFFF);
+      if (PackChoice c; pack_choice(g_textures[t], f, &c)) {
+        tex += fmt::format(" pack {}{}", pack_source_name(c.source), c.id);
+        if (c.detail >= 0) tex += fmt::format("+detail:{}", c.detail);
+      }
+    }
     NTRACE("draw#{} prim {} n {} verts {} vs {:016X} ps {:016X} z {}{} f{} cull {} blend {} {}/{}/{} mask {:X} at {} {}{}",
            g.draws, prim, count, vcount, g.shaders[vs_obj].hash, g.shaders[g32(dev + kDevPixelShader)].hash,
            st.z_enable, st.z_write ? "w" : "", st.z_func, st.cull, st.blend, st.src, st.dst, st.op, st.write_mask,
@@ -4087,6 +5104,35 @@ void native_draw(uint32_t dev, uint32_t prim, uint32_t count, const uint32_t* in
         std::string is;
         for (uint32_t i : idx) is += fmt::format(" {}", i);
         NTRACE("  allidx lo {}:{}", lo, is);
+      }
+    }
+    // gpu_native_trace_uv_id: a draw sampling that bank texture writes its triangles' first
+    // texture coordinates to logs\uv-draw<N>.txt ("u0 v0 u1 v1 u2 v2" a line), to see which
+    // part of a texture atlas each draw covers (HANDOVER 4dw: Joanna's suit, texture 4774).
+    if (const int uv_id = REXCVAR_GET(gpu_native_trace_uv_id); uv_id > 0 && !idx.empty() && !hoffsets.empty()) {
+      bool samples = false;
+      for (uint32_t t = 0; t < 16 && !samples; ++t) samples = g_textures[t] && bank_texture_id(g_textures[t]) == uv_id;
+      size_t uv = els.size();
+      for (size_t e = 0; e < els.size() && uv == els.size(); ++e)
+        if (els[e].usage == 5 && els[e].index == 0) uv = e;
+      if (samples && uv < els.size() && uv < hoffsets.size()) {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        const auto path = std::filesystem::path(exe).parent_path() / "logs" / fmt::format("uv-draw{}.txt", g.draws);
+        if (FILE* f = _wfopen(path.c_str(), L"w")) {
+          for (size_t i = 0; i + 2 < idx.size(); i += 3) {
+            for (int k = 0; k < 3; ++k) {
+              const int64_t vi = int64_t(idx[i + k]) + base_vertex - lo;  // the uploaded vertices start at lo
+              if (vi < 0 || vi >= int64_t(vcount)) { std::fprintf(f, "%snan nan", k ? " " : ""); continue; }
+              const float* v = reinterpret_cast<const float*>(g.upload_ptr + voff + uint64_t(vi) * host_stride +
+                                                              hoffsets[uv]);
+              std::fprintf(f, "%s%.5f %.5f", k ? " " : "", v[0], v[1]);
+            }
+            std::fprintf(f, "\n");
+          }
+          std::fclose(f);
+          NTRACE("  uv dump {} ({} triangles)", path.string(), idx.size() / 3);
+        }
       }
     }
     std::string raw;
@@ -4229,8 +5275,49 @@ void note_present() {
   // counter; Perfect Dark's are in the pd_frame_stats line.)
 }
 
+// Whether this frame is held back (not shown; the last one stays on screen) because the
+// shown pack's pictures for it aren't ready (HANDOVER 4dv): at a new stage's start any
+// picture not ready holds; during a cutscene and 1.5 s after it, a burst of new ones (a cut,
+// or the skip to play). A hold lasts until a frame has them all, 2.5 s at most. Over the
+// N64 look's wait for the ROM (pack_hold) nothing is held.
+bool hold_this_frame() {
+  const double now = now_ms();
+  const bool cutscene = g32(kInCutsceneFlag) != 0;
+  if (cutscene || g.was_cutscene) g.hold_open_until = std::max(g.hold_open_until, now + 1500.0);
+  g.was_cutscene = cutscene;
+  if (!REXCVAR_GET(pd_texture_pack_hold) || g.pack_hold) {
+    g.stage_window = false;
+    g.hold_since = 0;
+    return false;
+  }
+  bool hold = false;
+  if (g.pack_waiting > 0) {
+    if (g.hold_since > 0) {
+      hold = now - g.hold_since < 2500.0;
+    } else if (now < g.hold_open_until && (g.stage_window || g.pack_started >= 4)) {
+      hold = true;
+      g.hold_since = now;
+      g.hold_frames = 0;
+    }
+  }
+  if (hold) {
+    ++g.hold_frames;
+    return true;
+  }
+  if (g.hold_since > 0) {
+    REXKRNL_INFO("[texpack] {} frames held ({:.0f} ms) for the pack's pictures{}{}", g.hold_frames, now - g.hold_since,
+                 g.stage_window ? " at the stage's start" : " at a cut", g.pack_waiting ? " (gave up: 2.5 s)" : "");
+    g.hold_since = 0;
+    g.stage_window = false;  // (one hold at a stage's start; later cuts by their bursts)
+  }
+  if (now >= g.hold_open_until) g.stage_window = false;
+  return false;
+}
+
 void present_frame() {
   if (!ensure_device()) return;
+  const bool held = hold_this_frame();
+  g.pack_waiting = g.pack_started = 0;
   NTRACE("---- end of frame {} ({} draws)", g.frames + 1, g.draws);
   if (REXCVAR_GET(gpu_native_trace_frame) == -1)  // the test pipe's TRACE: the next frame
     rex::cvar::SetFlagByName("gpu_native_trace_frame", std::to_string(g.frames + 2));
@@ -4248,7 +5335,7 @@ void present_frame() {
     // The presenter's device reads the shared frame once this frame's GPU work
     // is done: a worker waits for that (present_to_presenter_vk), not the game
     // thread.
-    vk_frame = copy_to_presenter_vk();
+    vk_frame = held ? UINT32_MAX : copy_to_presenter_vk();
     have_image = vk_frame != UINT32_MAX;
     close_open_query();
     if (g.timestamps) g.cmd->writeTimestamp(g.timestamps.get(), g.slot * 2 + 1);
@@ -4259,7 +5346,7 @@ void present_frame() {
     p3 = now_ms();
   } else {
     const uint32_t k = g.out.next;
-    have_image = copy_to_presenter_texture(k);
+    have_image = !held && copy_to_presenter_texture(k);
     close_open_query();
     if (g.timestamps) g.cmd->writeTimestamp(g.timestamps.get(), g.slot * 2 + 1);
     g.cmd->end();
@@ -4323,6 +5410,8 @@ void present_frame() {
   // Next frame records into the next slot once the GPU is done with the frame
   // that used it last (kFrames frames ago): the game thread doesn't wait for
   // this frame's GPU work, nor for one GPU clock stall.
+  g.slot_pack_bytes[g.slot] = g.pack_commit_bytes;
+  g.slot_pack_n[g.slot] = g.pack_commit_n;
   g.slot = (g.slot + 1) % kFrames;
   g.cmd = g.cmds[g.slot].get();
   g.fence = g.fences[g.slot].get();
@@ -4345,6 +5434,11 @@ void present_frame() {
     g.copy_ms_sum += ts[0] > copy_start && ts[0] - copy_start < 100000000ull ? double(ts[0] - copy_start) / 1e6 : 0.0;
     g.gpu_ms_sum += ms;
     g.gpu_ms_max = std::max(g.gpu_ms_max, ms);
+    if (g.pack_trace) {
+      --g.pack_trace;
+      REXKRNL_INFO("[texpack] trace: gpu {:.2f} ms, {} pack pictures uploaded ({:.1f} MB), frame {:.1f} ms", ms,
+                   g.slot_pack_n[g.slot], double(g.slot_pack_bytes[g.slot]) / double(1 << 20), g.present_ms[3]);
+    }
     if (++g.gpu_frames >= 600) {
       REXKRNL_INFO("PDNATIVE gpu time per frame: {:.2f} ms (max {:.2f}) + constants copy {:.2f} ms",
                    g.gpu_ms_sum / g.gpu_frames, g.gpu_ms_max, g.copy_ms_sum / g.gpu_frames);
@@ -4359,11 +5453,22 @@ void present_frame() {
   g.last_tex_decode_ms = g.tex_decode_ms; g.last_tex_mip_ms = g.tex_mip_ms; g.tex_decode_ms = g.tex_mip_ms = 0;
   g.last_vcache_hits = g.vcache_hits; g.last_vcache_misses = g.vcache_misses; g.vcache_hits = g.vcache_misses = 0;
   // Buffers dropped two or more frames ago are no longer used by the GPU.
-  std::erase_if(g.retired_textures, [](const auto& r) {
-    if (r.frame + kFrames > g.frames) return false;
-    if (r.slot) g.free_slots.push_back(r.slot);
-    return true;
-  });
+  {
+    const double t0 = now_ms();
+    size_t freed = 0;
+    std::erase_if(g.retired_textures, [&](auto& r) {
+      if (r.frame + kFrames > g.frames) return false;
+      if (r.slot) g.free_slots.push_back(r.slot);
+      if (r.texture) g.graveyard.push_back(std::move(r.texture));
+      return true;
+    });
+    // Destroyed on a thread of their own (TextureReaper): a pack's not-resident pictures cost
+    // about 1 ms each to release, 7-16 ms for a pack's 40-50 at once on the game thread.
+    freed = g.graveyard.size();
+    if (freed) g_texture_reaper.push(g.graveyard);
+    if (const double ms = now_ms() - t0; ms > 3.0)
+      REXKRNL_INFO("[texpack] {} textures released in {:.1f} ms", freed, ms);
+  }
   std::erase_if(g.retired, [](const auto& r) {
     if (r.frame + kFrames > g.frames) return false;
     r.pool->free_lists[r.alloc.size_class].push_back(r.alloc);
@@ -4382,7 +5487,31 @@ void present_frame() {
       it = g.index_cache.erase(it);
     }
   g.last_pipe_ms = g.pipe_ms; g.last_tex_ms = g.tex_ms; g.last_pipe_n = g.pipe_n; g.last_tex_n = g.tex_n;
-  g.pipe_ms = g.tex_ms = 0; g.pipe_n = g.tex_n = 0; g.tex_requests = 0;
+  g.pipe_ms = g.tex_ms = 0; g.pipe_n = g.tex_n = 0; g.tex_requests = 0; g.pack_commit_bytes = 0; g.pack_commit_n = 0;
+  if ((g.frames % 600) == 299 && (!g.pack.empty() || !g.pack_alt.empty() || !g.pack_next.empty() || !g.classic.empty())) {
+    // Texture memory (HANDOVER 4dp): what the pack shown, the standby (the other Texture
+    // Pack slot kept ready), a pack being prepared, the N64 pictures and the game's own
+    // textures hold; with Direct3D 12 also the process's video memory in use.
+    const auto mb = [](const auto& map) {
+      uint64_t b = 0;
+      for (const auto& [k, t] : map) b += t.texture ? t.bytes : 0;
+      return double(b) / double(1 << 20);
+    };
+    std::string local;
+    if (!g_vulkan) {
+      IDXGIAdapter3* a3 = nullptr;
+      IDXGIAdapter1* a1 = static_cast<D3D12Device*>(g.device.get())->adapter;
+      DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+      if (a1 && SUCCEEDED(a1->QueryInterface(IID_PPV_ARGS(&a3)))) {
+        if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+          local = fmt::format("; video memory in use {:.0f} MB", double(info.CurrentUsage) / double(1 << 20));
+        a3->Release();
+      }
+    }
+    REXKRNL_INFO("[texpack] memory: pack shown {:.1f} MB ({}), kept ready {:.1f} MB ({}), being prepared {:.1f} MB, "
+                 "N64 {:.1f} MB, game textures {:.1f} MB{}", mb(g.pack), g.pack.size(), mb(g.pack_alt), g.pack_alt.size(),
+                 mb(g.pack_next), mb(g.classic), mb(g.textures_by_fetch), local);
+  }
   if ((g.frames % 600) == 599) {
     auto used = [](const BufferPool& p) {
       uint64_t free_bytes = 0;
